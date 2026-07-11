@@ -1,255 +1,197 @@
 # Research decisions
 
-This document converts the supplied Android proxy research, repository inspection and code-graph review into explicit engineering decisions for VPN Hotspot.
+This document converts the supplied Android proxy research, repository inspection, Graphify review and two structural review rounds into explicit decisions.
 
-## Context correction
+## Context
 
-Most Android proxy/VPN designs assume the application owns a `VpnService`, reads a TUN device and forwards traffic through tun2socks or a userspace stack.
+Proxy-only does not create another Android `VpnService` or TUN stack. Ordinary system tethering remains the direct path; selected laptop applications use an explicit SOCKS5 endpoint whose outbound sockets target an already active Android VPN `Network`.
 
-VPN Hotspot is different:
+The supplied Graphify snapshot reports 2,464 nodes and 6,088 edges. `SessionConfig` and `IptablesRule` are highly connected abstractions, supporting two decisions:
 
-- Proxy-only does not create another TUN interface;
-- it observes an already active Android VPN network;
-- ordinary system tethering remains the direct path;
-- the SOCKS endpoint is explicit and used only by selected laptop applications;
-- outbound sockets must target the existing VPN `Network`, not bypass it with `VpnService.protect()`.
+- keep proxy firewall lifecycle separate from `SessionConfig`;
+- reuse `IptablesRule` and deterministic firewall cleanup.
 
-The routing-loop analysis is still useful: no proxy socket may select an unintended route. Here the required route is a validated Android VPN network.
+## Candidate decision
 
-## Code-graph evidence
+| Candidate | Result |
+| --- | --- |
+| HevSocks5Server | selected for gated Phase 0; small fork/hook required |
+| Kotlin/dataproxy-derived | primary fallback if Hev feasibility fails |
+| Rust `fast-socks5`/custom backend | strong long-term fallback |
+| sing-box/shadowsocks stacks | rejected for MVP scope/size/maintenance |
+| TPROXY | deferred; unnecessary for FlClash process rules |
 
-The supplied Graphify snapshot reports 2,464 nodes and 6,088 edges for VPNHotspot. Two highly connected abstractions are notable:
+## Decision 1 — explicit SOCKS5
 
-- `SessionConfig`: 90 edges;
-- `IptablesRule`: 44 edges.
+FlClash performs application selection. VPN Hotspot exposes an authenticated SOCKS5 endpoint. Transparent interception is not part of the MVP.
 
-These metrics do not replace source review, but they support two design choices:
+## Decision 2 — Hev is a feasibility candidate, not an assumed solution
 
-1. keep proxy firewall lifecycle separate from `SessionConfig` rather than increasing its responsibility;
-2. reuse `IptablesRule` and existing cleanup machinery instead of creating a second firewall representation.
+Every outbound FD must pass a testable prepare hook and Android `android_setsocknetwork()` before connect/send. Host CI uses an injected shim. If complete socket/resolver coverage requires an unmaintainable fork, Hev is rejected.
 
-The graph also confirms that `Routing.kt` consumes `Upstreams.primary` and forwards its `networkHandle` to the daemon. This is acceptable for configurable routing mode, but Proxy-only makes a stronger VPN-only claim and must validate capabilities separately.
+## Decision 3 — `ProxyService` is the sole data-plane owner
 
-## Candidate comparison
-
-| Candidate | TCP | UDP ASSOCIATE | Android network binding | Prototype fit | Main concern |
-| --- | ---: | ---: | --- | --- | --- |
-| HevSocks5Server | Yes | Yes | Small fork/hook required | Selected for Phase 0 | audit every socket and resolver path |
-| Kotlin/dataproxy-derived | Yes | Research indicates yes | natural `Network.bindSocket()` APIs | primary fallback | allocations/GC and third-party audit |
-| Rust `fast-socks5` | Yes | verify pinned release | custom socket factory can call NDK API | strong long-term fallback | larger integration effort |
-| larger sing-box/shadowsocks stacks | Yes | Yes | possible | rejected for MVP | excessive scope/size/licensing complexity |
-| TPROXY | N/A | N/A | kernel dependent | deferred | unnecessary for FlClash process rules |
-
-## Decision 1 — explicit SOCKS5, not transparent interception
-
-Selected:
+The data plane runs in the app process, but ownership is precise:
 
 ```text
-FlClash process rule -> explicit authenticated SOCKS5 endpoint
+ProxyOnlyController -> ProxyServiceClient -> ProxyService -> ProxyBackend
 ```
 
-Rejected for MVP:
-
-```text
-iptables TPROXY/REDIRECT -> transparent proxy
-```
-
-Reasons: FlClash already performs application selection, UDP semantics remain explicit, device-specific TPROXY support is unnecessary, and failure testing is simpler.
-
-## Decision 2 — Hev only as a gated prototype
-
-Hev is selected for Phase 0 because it provides `CONNECT`, `UDP ASSOCIATE`, authentication, Android NDK build support and MIT licensing.
-
-The stock `bind-interface` and static mark options do not prove Android VPN network binding. The fork invariant is:
-
-```text
-Every outbound FD
-  -> testable prepare hook
-  -> android_setsocknetwork(validatedVpnHandle, fd)
-  -> only then connect/send
-```
-
-The fork must have a Linux host shim so hook coverage is enforced in CI. If DNS or socket coverage cannot be made complete with a small patch, reject Hev and use the backend abstraction to switch implementation.
-
-## Decision 3 — data plane in app process
-
-The SOCKS data plane runs inside the VPN Hotspot app process as a native backend.
+`ProxyService` owns native handles, listener, sessions and backend statistics. The controller owns desired-state reconciliation and never invokes `ProxyBackend` directly.
 
 Reasons:
 
-- lifecycle and user-visible status remain in Android code;
-- credentials/config stay app-private;
-- payload forwarding does not run as UID 0;
-- per-app VPN policy errors are attributable to the app UID;
-- a Kotlin replacement remains possible without changing UI/root policy.
+- native lifecycle remains inside the FGS boundary;
+- emergency listener closure remains possible when controller operations fail;
+- credentials/config remain app-private;
+- payload forwarding does not run as root;
+- backends remain replaceable.
 
-## Decision 4 — root daemon owns policy and reuses existing firewall ledger
+## Decision 4 — root daemon owns policy using existing ledger
 
-The daemon owns:
+The daemon owns deny-first exposure, iface+IPv4+MAC ACL, IPv6 deny, counters and Clean.
 
-- downstream exposure;
-- deny-first policy;
-- interface + IPv4 + MAC ACLs;
-- IPv6 deny rules for the MVP;
-- per-client kernel counters;
-- deterministic cleanup.
+Implementation reuses:
 
-Implementation must reuse:
+- `routing/iptables.rs::IptablesRule`/`IptablesChain`;
+- idempotent insert/delete and `delete_repeated()`;
+- `routing/firewall_cleanup.rs::clean()`;
+- IPv4/IPv6 target abstraction.
 
-- `routing/iptables.rs::IptablesRule` and `IptablesChain`;
-- idempotent insertion and `delete_repeated()` cleanup;
-- `routing/firewall_cleanup.rs::clean()` for proxy jumps/chains;
-- existing IPv4/IPv6 target abstraction.
+The lifecycle is a separate long-lived command, not `SessionConfig` growth.
 
-The proxy firewall has an independent long-lived command/runtime and does not extend `SessionConfig`.
+## Decision 5 — VPN-only selection and ambiguity handling
 
-## Decision 5 — VPN-only selection, not `Upstreams.primary` trust
+`Upstreams.primary` may be physical. Proxy-only requires fresh `TRANSPORT_VPN` validation and app-UID usability.
 
-`Upstreams.primary` is configurable and may emit a physical interface. Proxy-only therefore uses `Upstreams.vpn` or performs fresh `TRANSPORT_VPN` validation before startup.
+Selection policy:
 
-When no validated VPN exists:
+- zero usable VPNs: waiting/fail-closed;
+- one usable VPN: selected;
+- multiple usable VPNs: `MultipleVpnCandidates` fail-closed.
 
-```text
-reject and close proxy traffic
-```
+Transient network-handle sorting is not user-intent policy. A future explicit selector requires stable user-facing identity.
 
-The controller never uses `Upstreams.fallback`, process-default routing or a physical primary override.
+## Decision 6 — app-policy permission is readiness
 
-Existing routing mode remains unchanged and may keep using the user-selected primary upstream.
+If the VPN excludes VPN Hotspot, binding failure is a distinct user-visible configuration error. It never triggers physical fallback.
 
-## Decision 6 — app-UID VPN permission is part of readiness
+## Decision 7 — service stays alive through recovery
 
-Binding can fail when the user's VPN app excludes VPN Hotspot from its allowed-app policy.
+After an Android-permitted user foreground start, `ProxyService` remains alive while Proxy-only is enabled, including waiting and fail-closed states. The listener is closed in those states.
 
-`Running` requires a successful app-owned probe. Exclusion produces a distinct fail-closed state with user guidance. It is not treated as a transient network timeout and never triggers direct fallback.
+This avoids an Android 12+ background FGS start when VPN or daemon connectivity returns. Automatic resurrection after process death is not assumed.
 
-## Decision 7 — network-aware, non-blocking DNS boundary
+## Decision 8 — exception-safe serialized reconciliation
 
-Domain targets resolve through the validated VPN network only.
+A conflated channel feeds one worker. Non-cancellable transactions solve cancellation only; the worker also needs:
 
-A synchronous network-aware resolver may block Hev workers. Phase 0 must test blackholed DNS and select either:
+- per-iteration exception boundary;
+- fail-closed recovery after fast-path or rollback failures;
+- safe publication;
+- cleanup that attempts every step;
+- aggregated cleanup errors;
+- terminal `stopApplied()` in worker `finally`.
 
-- bounded dedicated resolver workers with timeout/cancellation; or
-- an asynchronous Android network-aware resolver path.
+Silent `runCatching` cleanup is rejected.
 
-Ordinary `getaddrinfo()`/process-default Java DNS is rejected.
+## Decision 9 — full backend restart on VPN generation change
 
-## Decision 8 — standard UDP with explicit relay range
-
-The MVP supports RFC 1928 `UDP ASSOCIATE`.
-
-Requirements:
-
-- control TCP owns association lifetime;
-- source peer validation;
-- bounded associations and idle timeout;
-- `FRAG != 0` dropped;
-- every Internet-facing UDP FD passes the VPN hook;
-- Hev relay ports constrained to a configured range;
-- proto/firewall carry range start/end unless Phase 0 proves one shared fixed port.
-
-Hev's non-standard `FWD UDP` extension is not required.
-
-## Decision 9 — IPv4-only proxy for MVP, explicit IPv6 denial
-
-Hev may support IPv6, but a partially implemented dual-stack firewall is unsafe.
-
-MVP policy:
-
-- listener and relay are IPv4-only;
-- no IPv6 endpoints are published;
-- ip6tables rejects the TCP port and complete UDP range;
-- full IPv6 relay is deferred until mirrored ACL/DNS/counter tests exist.
-
-## Decision 10 — MAC is part of enforcement, not only reporting
-
-The public client identity is MAC. Allow rules match:
+No live `replaceNetwork()` in MVP:
 
 ```text
-input interface + source IPv4 + source MAC
+deny -> close listener/sessions -> stop backend -> validate new VPN -> start/probe -> allow
 ```
 
-IP-only fallback is rejected because DHCP/static-IP reuse can inherit another client's rule. Downstreams without reliable MAC identity are unsupported in the MVP.
+## Decision 10 — probes are outbound-only before allow commit
 
-## Decision 11 — global mode in UI, per-downstream model internally
+Deny-first startup makes a downstream listener probe contradictory. Pre-allow checks are:
 
-MVP UI exposes:
+- app-UID bind;
+- backend outbound TCP;
+- backend outbound UDP;
+- VPN-aware DNS;
+- internal listener bind/listen readiness.
 
-```kotlin
-VPN_ROUTING
-PROXY_ONLY
-```
+External client reachability is tested after allow rules commit.
 
-Internally each downstream has separate routing/proxy flags so later per-interface controls do not require data migration.
+## Decision 11 — VPN-aware bounded DNS
 
-`VPN_ROUTING_AND_PROXY` is deferred rather than shipping untested rule interaction.
+Domain targets use the selected VPN only. Phase 0 chooses bounded resolver workers or an asynchronous Android resolver. Process-default DNS and unbounded blocking inside Hev workers are rejected.
 
-## Decision 12 — restart backend on VPN generation change
+## Decision 12 — standard UDP with explicit topology gate
 
-The MVP has no live `replaceNetwork()` operation. A network identity/handle change causes:
+MVP uses RFC 1928 `UDP ASSOCIATE` with source validation, control-TCP lifetime, idle timeout, bounded state and `FRAG != 0` rejection.
+
+Before firewall rules are final, Phase 0 must determine:
+
+- client-facing versus Internet-facing FDs;
+- same-FD versus separate-FD behavior;
+- returned relay port mapping;
+- reply ingress interface;
+- conntrack state;
+- whether a narrow `ESTABLISHED/RELATED` rule is required.
+
+No broad VPN-interface allow is permitted.
+
+## Decision 13 — explicit UDP range and capacity
+
+The relay range is fixed/configured and never widened dynamically.
+
+If one port is consumed per association:
 
 ```text
-deny -> close sessions/listener -> stop backend -> validate new VPN -> start/probe -> allow
+effective capacity = min(configured association limit, usable relay ports)
 ```
 
-This matches the state machine and guarantees no old-generation association survives.
+Range exhaustion returns a controlled failure and metric.
 
-## Decision 13 — non-cancellable serialized reconciliation
+## Decision 14 — IPv4-only MVP
 
-Desired-state flows feed a conflated channel. One worker completes each apply/rollback transaction in non-cancellable context before processing the newest snapshot.
+Listener/relay are IPv4-only. ip6tables denies TCP listener port and full UDP range. Full IPv6 proxying is deferred.
 
-`collectLatest` is rejected for resource transactions because cancellation can leak firewall runtime or remove policy before listener shutdown.
+## Decision 15 — MAC is enforcement identity
 
-The runtime key includes ports/range, credentials version, VPN handle, sorted downstream set and backend version. Client updates perform replace only.
+Allow requires input interface + source IPv4 + source MAC. IP-only fallback is rejected. Downstreams without reliable MAC identity are unsupported.
 
-## Decision 14 — daemon loss closes listener
+## Decision 16 — daemon loss closes listener, not service
 
-iptables allow rules survive daemon death. Therefore daemon loss is not equivalent to deny state.
+iptables allow rules may survive daemon death. Unexpected daemon-channel completion causes `ProxyService` emergency listener closure. The service remains foreground fail-closed. Daemon recovery performs Clean/deny before backend restart.
 
-The long-lived firewall command/channel is a liveness signal. Unexpected completion immediately closes the app-process backend. On daemon recovery, Clean or explicit deny state completes before listener restart.
+## Decision 17 — global UI mode, per-downstream internal state
 
-## Decision 15 — initial downstream scope
+MVP UI exposes `VPN_ROUTING` and `PROXY_ONLY`. Internal flags remain per downstream. Mixed mode is deferred.
 
-First supported:
+## Decision 18 — FlClash owns process selection
 
-- system Wi-Fi tethering;
-- USB tethering when MAC identity is reliable;
-- Ethernet only after equivalent testing.
+VPN Hotspot cannot identify a macOS process after traffic reaches the phone. FlClash owns `PROCESS-NAME`/regex/path rules and `MATCH,DIRECT`. Optional WARP uses `dialer-proxy: PhoneVPN`.
 
-Deferred:
-
-- LocalOnlyHotspot;
-- Wi-Fi Direct repeater;
-- Bluetooth;
-- interfaces without reliable MAC+IPv4 identity.
-
-## Decision 16 — FlClash owns application selection
-
-VPN Hotspot cannot identify the originating macOS process. FlClash owns `PROCESS-NAME`, regex/path rules and `MATCH,DIRECT`.
-
-VPN Hotspot exposes `PhoneVPN`; optional WARP uses `dialer-proxy: PhoneVPN`.
-
-## Decision 17 — preserve backend replacement options
+## Decision 19 — preserve backend replacement
 
 ```kotlin
 interface ProxyBackend {
     suspend fun start(config: ProxyBackendConfig): ProxyBackendHandle
-    suspend fun probe(handle: ProxyBackendHandle)
     suspend fun replaceAcl(handle: ProxyBackendHandle, clients: List<AllowedClient>)
+    suspend fun runOutboundProbes(handle: ProxyBackendHandle): ProbeReport
     suspend fun stats(handle: ProxyBackendHandle): ProxyBackendStats
-    suspend fun stop(handle: ProxyBackendHandle)
+    suspend fun stop(handle: ProxyBackendHandle): CleanupReport
 }
 ```
 
-The first implementation is `HevProxyBackend`. Kotlin or Rust can replace it without redesigning settings, controller or root policy.
+The backend interface is owned by `ProxyService`. Hev is first; Kotlin/Rust remain possible.
 
-## Remaining gates before implementation
+## Phase 0 gates
 
-1. Exact Hev pin and complete socket-path audit.
-2. UDP relay-range behaviour on that pin.
-3. Resolver implementation after blackhole measurements.
-4. App-UID allowed/excluded VPN matrix on target Android versions.
-5. Exact foreground-service type and distribution-policy eligibility.
-6. Credential storage/direct-boot integration.
-7. Counter integration without double counting.
-8. Reliable MAC identity on each initial downstream type.
+1. Exact Hev pin and socket/resolver audit.
+2. Per-app VPN include/exclude matrix.
+3. Multiple-VPN selection behavior.
+4. UDP FD/port/interface/conntrack topology.
+5. Relay range and effective capacity.
+6. Bounded VPN-aware DNS.
+7. Outbound-only probe implementation.
+8. IPv6 denial.
+9. Host bind-shim CI.
+10. Exception-safe worker and service ownership contracts in fake implementations.
+11. FGS type, user start context and background recovery policy.
+
+Passing these gates approves later implementation phases; failing a security gate stops the Hev path.
