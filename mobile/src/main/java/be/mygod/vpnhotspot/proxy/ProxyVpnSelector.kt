@@ -28,18 +28,25 @@ class ProxyVpnSelector(
     private val connectivity: ConnectivityManager,
 ) {
     fun select(candidates: Collection<Upstream>): VpnSelection {
-        val usable = candidates.mapNotNull { candidate ->
-            val caps = connectivity.getNetworkCapabilities(candidate.network)
-                ?: return@mapNotNull null
-            if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
-                return@mapNotNull null
+        // Fix #13: deduplicate by stable network handle before applying zero/one/many policy.
+        // The same Android Network can appear more than once in the candidate list
+        // (e.g. multiple observations of the same object). We only reject genuinely
+        // distinct VPN networks, not duplicate observations of a single one.
+        val usable = candidates
+            .mapNotNull { candidate ->
+                val caps = connectivity.getNetworkCapabilities(candidate.network)
+                    ?: return@mapNotNull null
+                if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                    return@mapNotNull null
+                }
+                ProxyVpnUpstream(
+                    network = candidate.network,
+                    handle = candidate.network.networkHandle,
+                    interfaces = candidate.properties.allInterfaceNames.toSortedSet(),
+                )
             }
-            ProxyVpnUpstream(
-                network = candidate.network,
-                handle = candidate.network.networkHandle,
-                interfaces = candidate.properties.allInterfaceNames.toSortedSet(),
-            )
-        }
+            .distinctBy { it.handle }   // deduplicate by stable network handle
+
         return when (usable.size) {
             0 -> VpnSelection.None
             1 -> VpnSelection.One(usable.single())

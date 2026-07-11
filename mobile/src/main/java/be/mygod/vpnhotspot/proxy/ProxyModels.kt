@@ -6,9 +6,21 @@ import java.util.UUID
 // ---------------------------------------------------------------------------
 // Step 1 — Settings, state, activation and desired-state models
 // Sketch: docs/proxy-only/sketches/01-models-and-state.md
+// Fix #10: credentials isolated in ProxyCredentials with redacted toString
 // ---------------------------------------------------------------------------
 
 enum class SharingMode { VPN_ROUTING, PROXY_ONLY }
+
+/**
+ * Credential pair with a redacted [toString] so username/password never
+ * appear in logs, crash breadcrumbs or state dumps.
+ */
+data class ProxyCredentials(
+    val username: String,
+    val password: String,
+) {
+    override fun toString(): String = "ProxyCredentials(username=<redacted>)"
+}
 
 data class ProxyOnlySettings(
     val enabled: Boolean,
@@ -17,8 +29,7 @@ data class ProxyOnlySettings(
     val udpPortRange: IntRange,
     val maxUdpAssociations: Int,
     val credentialsVersion: Long,
-    val username: String,
-    val password: String,
+    // Credentials are NOT included here; passed separately at backend start.
 )
 
 enum class ActivationSource {
@@ -47,7 +58,8 @@ data class RuntimeKey(
     val udpPortRange: IntRange?,
     val credentialsVersion: Long,
     val vpnNetworkHandle: Long,
-    val downstreams: List<Pair<String, String>>,
+    /** Sorted list of (interfaceName, sortedIpv4Addresses) pairs for stable equality. */
+    val downstreams: List<Pair<String, List<String>>>,
     val backendVersion: Int,
 )
 
@@ -94,9 +106,17 @@ data class DesiredProxyState(
     val daemonHealthy: Boolean,
     val daemonGeneration: Long?,
 ) {
-    /** Normalise to prevent irrelevant churn from creating new runtime keys. */
+    /**
+     * Normalise to prevent irrelevant churn from creating new runtime keys.
+     * Fix #12: canonicalize downstreams, client IPv4 lists and client order.
+     */
     fun normalized(): DesiredProxyState = copy(
-        allowedClients = allowedClients.sortedWith(compareBy { it.mac }),
+        downstreams = downstreams
+            .map { it.copy(ipv4Address = it.ipv4Address) }
+            .sortedBy { it.interfaceName },
+        allowedClients = allowedClients
+            .map { it.copy(ipv4Addresses = it.ipv4Addresses.sorted()) }
+            .sortedBy { it.mac },
     )
 }
 
