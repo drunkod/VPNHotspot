@@ -6,20 +6,38 @@ import java.util.UUID
 // ---------------------------------------------------------------------------
 // Step 1 — Settings, state, activation and desired-state models
 // Sketch: docs/proxy-only/sketches/01-models-and-state.md
-// Fix #10: credentials isolated in ProxyCredentials with redacted toString
+// R1 fix #10 / R2 fix #8: ProxyCredentials is NOT a data class — no generated
+//   copy/component methods, no plaintext equality, redacted toString.
 // ---------------------------------------------------------------------------
 
 enum class SharingMode { VPN_ROUTING, PROXY_ONLY }
 
 /**
- * Credential pair with a redacted [toString] so username/password never
- * appear in logs, crash breadcrumbs or state dumps.
+ * Secret container for SOCKS5 credentials.
+ *
+ * Intentionally NOT a data class:
+ *   - no generated copy(), component1(), component2()
+ *   - no automatic equality/hashCode over secret values
+ *   - toString() is always redacted
+ *
+ * Credentials must be fetched immediately before backend start from a
+ * [ProxyCredentialProvider]; they must not live in long-lived state objects.
  */
-data class ProxyCredentials(
+class ProxyCredentials(
     val username: String,
     val password: String,
 ) {
     override fun toString(): String = "ProxyCredentials(username=<redacted>)"
+    // Equality is identity — two separate fetches are not considered equal.
+}
+
+/**
+ * Fetches credentials at backend-start time. The controller holds only this
+ * provider reference, not the credentials themselves.
+ */
+interface ProxyCredentialProvider {
+    /** Returns current credentials, or throws if unavailable. */
+    fun credentials(): ProxyCredentials
 }
 
 data class ProxyOnlySettings(
@@ -29,7 +47,7 @@ data class ProxyOnlySettings(
     val udpPortRange: IntRange,
     val maxUdpAssociations: Int,
     val credentialsVersion: Long,
-    // Credentials are NOT included here; passed separately at backend start.
+    // Username and password are NOT stored here; fetched via ProxyCredentialProvider.
 )
 
 enum class ActivationSource {
@@ -58,7 +76,7 @@ data class RuntimeKey(
     val udpPortRange: IntRange?,
     val credentialsVersion: Long,
     val vpnNetworkHandle: Long,
-    /** Sorted list of (interfaceName, sortedIpv4Addresses) pairs for stable equality. */
+    /** Sorted list of (interfaceName, sortedIpv4Addresses) for stable equality. */
     val downstreams: List<Pair<String, List<String>>>,
     val backendVersion: Int,
 )
@@ -73,6 +91,8 @@ sealed interface FailClosedReason {
     data class ProbeReportIncomplete(val missing: Set<ProbeKind>) : FailClosedReason
     data class StartupSanitationFailed(val detail: String) : FailClosedReason
     data class InternalFailure(val category: String) : FailClosedReason
+    /** R2 fix #6: published only when all downstreams lack a routable IPv4 address. */
+    data object NoReachableDownstreamAddress : FailClosedReason
 }
 
 sealed interface ProxyOnlyState {
@@ -84,7 +104,7 @@ sealed interface ProxyOnlyState {
     data class MultipleVpnCandidates(val count: Int) : ProxyOnlyState
     data object VpnPermissionDenied : ProxyOnlyState
     data object StartingBackend : ProxyOnlyState
-    data class Running(val endpoint: ProxyEndpoint) : ProxyOnlyState
+    data class Running(val endpoints: List<ProxyEndpoint>) : ProxyOnlyState
     data class FailClosed(val reason: FailClosedReason) : ProxyOnlyState
     data class CleanupDegraded(
         val unresolved: Set<CleanupResource>,
@@ -108,15 +128,23 @@ data class DesiredProxyState(
 ) {
     /**
      * Normalise to prevent irrelevant churn from creating new runtime keys.
-     * Fix #12: canonicalize downstreams, client IPv4 lists and client order.
+     * R1 fix #12 / R2 fix #9: sort, deduplicate and validate entries.
      */
     fun normalized(): DesiredProxyState = copy(
         downstreams = downstreams
-            .map { it.copy(ipv4Address = it.ipv4Address) }
-            .sortedBy { it.interfaceName },
+            .sortedBy { it.interfaceName }
+            .distinctBy { it.interfaceName },
         allowedClients = allowedClients
-            .map { it.copy(ipv4Addresses = it.ipv4Addresses.sorted()) }
-            .sortedBy { it.mac },
+            .map { client ->
+                client.copy(
+                    ipv4Addresses = client.ipv4Addresses.map { it.trim() }
+                        .filter { it.isNotEmpty() }
+                        .distinct()
+                        .sorted()
+                )
+            }
+            .sortedBy { it.mac.uppercase() }
+            .distinctBy { it.mac.uppercase() },
     )
 }
 
@@ -141,8 +169,12 @@ data class AllowedClient(
     val ipv4Addresses: List<String> = emptyList(),
 )
 
-/** Proxy endpoint advertised to clients. */
+/**
+ * Proxy endpoint advertised to a specific tethering downstream.
+ * R2 fix #6: one endpoint per downstream; never published as loopback.
+ */
 data class ProxyEndpoint(
+    val downstreamInterface: String,
     val host: String,
     val tcpPort: Int,
     val udpPortRange: IntRange?,

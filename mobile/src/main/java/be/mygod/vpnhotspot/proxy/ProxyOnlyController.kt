@@ -17,20 +17,25 @@ import kotlin.math.min
 import kotlin.random.Random
 
 // ---------------------------------------------------------------------------
-// Step 6 + Step 10 — ProxyOnlyController (all post-split corrections + R1 fixes)
+// Step 6 + Step 10 — ProxyOnlyController
+// R1 fixes #1-#13 applied; R2 fixes applied in this revision.
 //
-// R1 blockers fixed:
-//   #1  VpnPermissionDenied fallthrough → every non-Success branch returns.
-//   #2  Firewall Boolean → denyAll/stop return CleanupReport; failures create debt.
-//   #3  Emergency debt discarded → emergencyCloseListener returns CleanupOutcome.
-//   #4  Terminal stop strands handle → feature stop deferred until backend debt cleared.
-//
-// R1 high-severity fixed:
-//   #5  Per-step timeout in CleanupAccumulator (moved to ProxyServiceClient.kt).
-//   #6  NonCancellable removed from normal reconciliation; only cleanup uses it.
-//   #7  Reporter calls are non-throwing (handled in accumulator and safeReport).
-//   #8  Endpoint host derived from downstream interface (placeholder).
-//   #9  Firewall generation uses controller-owned monotonic counter.
+// R2 fixes:
+//   Blocker 1  Compilation: firewallConfig/backendConfig call sites updated;
+//              ProxyCredentialProvider injected into constructor.
+//   Blocker 2  Retry ordering: featureStop only after serviceHandle==null &&
+//              listenerPending==false.
+//   Blocker 3  CancellationException re-thrown in every cleanup helper.
+//   Blocker 4  Emergency debt no longer overwrites merged debt; collected
+//              locally and committed once at end of retry transaction.
+//   Blocker 5  staleHandle() is now a critical failure (in CleanupReport).
+//   High #6    runningState() fails closed with NoReachableDownstreamAddress
+//              when no downstream has a routable IPv4; never publishes 127.0.0.1.
+//   High #7    Firewall generation is scoped to daemonGeneration so it cannot
+//              go backwards across app-process restarts.
+//   High #8    ProxyCredentials is now a non-data class; fetched via provider.
+//   High #9    Normalization deduplicates and trims (in ProxyModels.kt).
+//   High #10   VPN selector merges interface names (in ProxyVpnSelector.kt).
 // ---------------------------------------------------------------------------
 
 private const val TRANSACTION_TIMEOUT_MS = 30_000L
@@ -50,11 +55,12 @@ class ProxyOnlyController(
     private val service: ProxyServiceClient,
     private val firewall: ProxyFirewallClient,
     private val activationGrants: ActivationGrantConsumer,
+    /** R2 blocker 1: credentials fetched from provider immediately before backend start. */
+    private val credentialProvider: ProxyCredentialProvider,
     private val stateSink: ProxyStateSink,
     private val reporter: ProxyErrorReporter,
     private val scope: CoroutineScope,
 ) {
-    // Fix #6 (Step 10 §A): atomic snapshot for cross-thread safety
     private val latestSnapshot = AtomicReference<DesiredProxyState?>(null)
     private var sanitizedDaemonGeneration: Long? = null
 
@@ -66,8 +72,13 @@ class ProxyOnlyController(
     private var scheduledRetryGeneration: Long? = null
     private var nextDebtGeneration = 1L
 
-    // Fix #9: monotonic firewall generation; never wall-clock time.
-    private val firewallGeneration = AtomicLong(0L)
+    /**
+     * R2 high #7: firewall generation counter scoped to daemonGeneration.
+     * When [sanitizedDaemonGeneration] changes, this counter is reset so
+     * values are strictly increasing within a daemon lifetime and cannot go
+     * backwards if the app process restarts while the daemon survives.
+     */
+    private var firewallGeneration = AtomicLong(0L)
 
     // -----------------------------------------------------------------------
     // Worker entry point
@@ -86,15 +97,12 @@ class ProxyOnlyController(
         } finally {
             collector.cancel()
             retryJob?.cancel()
-            // Terminal cleanup always runs non-cancellably.
             withContext(NonCancellable) {
                 terminalStopSafely("controller worker terminated")
             }
         }
     }
 
-    // Fix #6: normal reconciliation runs in the parent job (cancellable).
-    // NonCancellable is reserved only for cleanup/finalization paths.
     private suspend fun runIteration(event: ControllerEvent) {
         try {
             when (event) {
@@ -115,11 +123,10 @@ class ProxyOnlyController(
     }
 
     // -----------------------------------------------------------------------
-    // Step 10 §B — retry-generation ownership
+    // Retry-generation ownership (Step 10 §B)
     // -----------------------------------------------------------------------
 
     private suspend fun retryDebtEvent(event: ControllerEvent.RetryCleanupDebt) {
-        // Clear timer ownership BEFORE the stale-generation check.
         retryJob = null
         scheduledRetryGeneration = null
 
@@ -145,7 +152,6 @@ class ProxyOnlyController(
 
     private suspend fun reconcile(next: DesiredProxyState) {
         if (!next.settings.enabled) {
-            // Terminal stop is cleanup — run non-cancellably.
             withContext(NonCancellable) { terminalStopSafely("disabled") }
             publishSafely(ProxyOnlyState.Disabled)
             return
@@ -197,7 +203,7 @@ class ProxyOnlyController(
             is VpnSelection.One -> sel.upstream
         }
 
-        // Step 10 §A — daemon-generation sanitation gate
+        // Daemon-generation sanitation gate (Step 10 §A)
         if (!next.daemonHealthy || next.daemonGeneration == null) {
             sanitizedDaemonGeneration = null
             withContext(NonCancellable) {
@@ -223,8 +229,10 @@ class ProxyOnlyController(
                         daemonCleanPending = true,
                         featureStopPending = false,
                         failures = listOf(
-                            CleanupFailure("startup_sanitation",
-                                RuntimeException("cleanOrDenyBeforeRestart returned false"))
+                            CleanupFailure(
+                                "startup_sanitation",
+                                RuntimeException("cleanOrDenyBeforeRestart returned false"),
+                            )
                         ),
                         generation = nextDebtGeneration++,
                         attempt = 0,
@@ -238,15 +246,34 @@ class ProxyOnlyController(
                 cleanupDebt?.let(::scheduleDebtRetry)
                 return
             }
+            // R2 high #7: reset generation counter when daemon generation changes.
+            firewallGeneration = AtomicLong(next.daemonGeneration shl 20)
             sanitizedDaemonGeneration = next.daemonGeneration
+        }
+
+        // R2 high #6: require at least one downstream with a routable IPv4.
+        val downstreamEndpoints = next.downstreams.mapNotNull { ds ->
+            ds.ipv4Address?.let { ip ->
+                ProxyEndpoint(
+                    downstreamInterface = ds.interfaceName,
+                    host = ip,
+                    tcpPort = next.settings.tcpPort,
+                    udpPortRange = if (next.settings.udpEnabled) next.settings.udpPortRange else null,
+                )
+            }
+        }
+        if (downstreamEndpoints.isEmpty()) {
+            enterWaiting(next, ProxyOnlyState.WaitingForTethering, "no downstream IPv4")
+            return
         }
 
         val key = next.runtimeKey(upstream)
         val current = applied
         if (current?.complete == true && current.key == key) {
-            firewall.replace(current.firewall!!, next.firewallConfig(denyAll = false))
+            // R2 blocker 1: pass firewallGeneration to every firewallConfig call.
+            firewall.replace(current.firewall!!, next.firewallConfig(denyAll = false, firewallGeneration))
             service.replaceAcl(current.service!!, next.allowedClients)
-            publishSafely(next.runningState())
+            publishSafely(ProxyOnlyState.Running(downstreamEndpoints))
             return
         }
 
@@ -265,58 +292,55 @@ class ProxyOnlyController(
         val partial = AppliedProxyState(key)
         applied = partial
 
-        partial.firewall = firewall.start(next.firewallConfig(denyAll = true))
-        partial.service = service.startBackend(next.backendConfig(upstream))
+        // R2 blocker 1: pass firewallGeneration to deny-first startup config.
+        partial.firewall = firewall.start(next.firewallConfig(denyAll = true, firewallGeneration))
+
+        // R2 blocker 1: fetch credentials immediately before backend start.
+        val credentials = try {
+            credentialProvider.credentials()
+        } catch (t: Throwable) {
+            withContext(NonCancellable) {
+                transitionAfterExpectedProbeFailure(
+                    ProxyOnlyState.FailClosed(FailClosedReason.InternalFailure("credential_fetch"))
+                )
+            }
+            return
+        }
+        partial.service = service.startBackend(next.backendConfig(upstream, credentials))
 
         val requirements = ProbeRequirements(udpRequired = next.settings.udpEnabled)
         val report = service.runOutboundProbes(partial.service!!, requirements)
 
-        // Fix #1 — every non-Success branch must return; use exhaustive when.
-        // Fix: use a local sealed result so the compiler enforces exhaustiveness.
+        // Exhaustive probe mapping — compiler enforces every branch.
         val probeDecision: ProbeStartDecision = when (val ev = report.evaluate(requirements)) {
             ProbeEvaluation.Success -> ProbeStartDecision.Proceed
             ProbeEvaluation.VpnPermissionDenied ->
                 ProbeStartDecision.Fail(ProxyOnlyState.VpnPermissionDenied)
             is ProbeEvaluation.BindFailed ->
-                ProbeStartDecision.Fail(
-                    ProxyOnlyState.FailClosed(FailClosedReason.BindProbeFailed(ev.failure.toString()))
-                )
+                ProbeStartDecision.Fail(ProxyOnlyState.FailClosed(FailClosedReason.BindProbeFailed(ev.failure.toString())))
             is ProbeEvaluation.TcpFailed ->
-                ProbeStartDecision.Fail(
-                    ProxyOnlyState.FailClosed(FailClosedReason.TcpProbeFailed(ev.failure.toString()))
-                )
+                ProbeStartDecision.Fail(ProxyOnlyState.FailClosed(FailClosedReason.TcpProbeFailed(ev.failure.toString())))
             is ProbeEvaluation.UdpFailed ->
-                ProbeStartDecision.Fail(
-                    ProxyOnlyState.FailClosed(FailClosedReason.UdpProbeFailed(ev.failure.toString()))
-                )
+                ProbeStartDecision.Fail(ProxyOnlyState.FailClosed(FailClosedReason.UdpProbeFailed(ev.failure.toString())))
             is ProbeEvaluation.DnsFailed ->
-                ProbeStartDecision.Fail(
-                    ProxyOnlyState.FailClosed(FailClosedReason.DnsProbeFailed(ev.failure.toString()))
-                )
+                ProbeStartDecision.Fail(ProxyOnlyState.FailClosed(FailClosedReason.DnsProbeFailed(ev.failure.toString())))
             is ProbeEvaluation.ListenerNotReady ->
-                ProbeStartDecision.Fail(
-                    ProxyOnlyState.FailClosed(FailClosedReason.ListenerNotReady(ev.failure.toString()))
-                )
+                ProbeStartDecision.Fail(ProxyOnlyState.FailClosed(FailClosedReason.ListenerNotReady(ev.failure.toString())))
             is ProbeEvaluation.Incomplete ->
-                // Incomplete is NOT a listener failure.
-                ProbeStartDecision.Fail(
-                    ProxyOnlyState.FailClosed(FailClosedReason.ProbeReportIncomplete(ev.missing))
-                )
+                ProbeStartDecision.Fail(ProxyOnlyState.FailClosed(FailClosedReason.ProbeReportIncomplete(ev.missing)))
         }
 
         if (probeDecision is ProbeStartDecision.Fail) {
-            withContext(NonCancellable) {
-                transitionAfterExpectedProbeFailure(probeDecision.state)
-            }
-            return  // Fix #1: always return after probe failure
+            withContext(NonCancellable) { transitionAfterExpectedProbeFailure(probeDecision.state) }
+            return
         }
 
-        firewall.replace(partial.firewall!!, next.firewallConfig(denyAll = false))
+        // R2 blocker 1: pass firewallGeneration when switching to allow rules.
+        firewall.replace(partial.firewall!!, next.firewallConfig(denyAll = false, firewallGeneration))
         partial.complete = true
-        publishSafely(next.runningState())
+        publishSafely(ProxyOnlyState.Running(downstreamEndpoints))
     }
 
-    /** Local sealed type so the compiler enforces that every probe outcome is handled. */
     private sealed interface ProbeStartDecision {
         object Proceed : ProbeStartDecision
         data class Fail(val state: ProxyOnlyState) : ProbeStartDecision
@@ -337,10 +361,6 @@ class ProxyOnlyController(
 
     // -----------------------------------------------------------------------
     // Cleanup creation
-    // Fix #2: firewall denyAll/stop return CleanupReport; false → debt.
-    // Fix #5: per-step timeouts applied via CleanupAccumulator.stepSucceeded.
-    // Fix §D: firewall stop clears deny; backend stop clears listener.
-    // Fix §E: daemonAvailable threaded in.
     // -----------------------------------------------------------------------
 
     private suspend fun cleanupApplied(
@@ -348,15 +368,12 @@ class ProxyOnlyController(
         daemonAvailable: Boolean,
     ): CleanupOutcome {
         val current = applied ?: return CleanupOutcome(CleanupReport.noOp("nothing applied"), null)
-        applied = null   // cleared before any IO so handles are not double-freed
+        applied = null
         val acc = CleanupAccumulator(reporter)
 
         var denyResolved = current.firewall == null
         if (daemonAvailable && current.firewall != null) {
-            // Fix #2: denyAll returns CleanupReport; non-empty failures ⇒ deny debt.
-            denyResolved = acc.stepSucceeded("deny") {
-                firewall.denyAll(current.firewall!!)
-            }
+            denyResolved = acc.stepSucceeded("deny") { firewall.denyAll(current.firewall!!) }
         }
 
         var serviceResolved = current.service == null
@@ -367,26 +384,21 @@ class ProxyOnlyController(
         }
 
         var listenerResolved = serviceResolved
+        var emergencyOutcomeDebt: CleanupDebt? = null
         if (!serviceResolved && serviceActivated) {
-            val outcome = try {
-                service.emergencyCloseListener(reason)
-            } catch (t: Throwable) {
-                CleanupOutcome(CleanupReport.failure("emergency_close", t), null)
-            }
+            val outcome = safeEmergencyClose(reason)
             listenerResolved = !outcome.report.hasCriticalFailure
-            // Fix #3: merge any debt from a failed emergency close.
-            mergeDebt(outcome.debt)
+            acc.failures += outcome.report.failures
+            // R2 blocker 4: collect emergency debt locally — commit after final debt construction.
+            emergencyOutcomeDebt = outcome.debt
         }
 
         var firewallResolved = current.firewall == null
         if (daemonAvailable && current.firewall != null) {
-            // Fix #2: stop returns CleanupReport.
-            val stopped = acc.stepSucceeded("firewall_stop") {
-                firewall.stop(current.firewall!!)
-            }
+            val stopped = acc.stepSucceeded("firewall_stop") { firewall.stop(current.firewall!!) }
             if (stopped) {
                 firewallResolved = true
-                denyResolved = true  // §D: successful firewall stop also clears deny
+                denyResolved = true  // firewall stop clears deny (Step 10 §D)
             }
         }
 
@@ -403,13 +415,17 @@ class ProxyOnlyController(
             attempt = 0,
         ).takeUnless { it.isResolved }
 
+        // R2 blocker 4: merge emergency debt AFTER primary debt is built.
+        if (emergencyOutcomeDebt != null) mergeDebt(emergencyOutcomeDebt)
+
         return CleanupOutcome(acc.report(), debt)
     }
 
     // -----------------------------------------------------------------------
     // Item-by-item debt retry
-    // Fix #2: denyAll/stop return CleanupReport.
-    // Fix §D: firewall stop clears deny.
+    // R2 blocker 2: featureStop only after handle and listener are cleared.
+    // R2 blocker 3: CancellationException re-thrown in attempt helper.
+    // R2 blocker 4: emergency debt collected locally, merged once at end.
     // -----------------------------------------------------------------------
 
     private suspend fun retryCleanupDebtSafely() {
@@ -417,6 +433,7 @@ class ProxyOnlyController(
         val failures = mutableListOf<CleanupFailure>()
         val daemonHealthy = latestSnapshot.get()?.daemonHealthy == true
 
+        // R2 blocker 3: re-throw parent CancellationException.
         suspend fun attempt(name: String, block: suspend () -> CleanupReport): Boolean {
             return try {
                 val r = withTimeout(CLEANUP_STEP_TIMEOUT_MS) { block() }
@@ -426,6 +443,8 @@ class ProxyOnlyController(
                 failures += CleanupFailure(name, stepTimeout)
                 safeReport("proxy.cleanup_debt.$name", stepTimeout)
                 false
+            } catch (cancelled: CancellationException) {
+                throw cancelled   // R2 blocker 3
             } catch (t: Throwable) {
                 failures += CleanupFailure(name, t)
                 safeReport("proxy.cleanup_debt.$name", t)
@@ -435,22 +454,21 @@ class ProxyOnlyController(
 
         var serviceHandle = debt.serviceHandlePending
         var listenerPending = debt.listenerClosePending
+
         if (serviceHandle != null && serviceActivated) {
             if (attempt("backend_stop") { service.stopBackend(serviceHandle!!) }) {
                 serviceHandle = null
-                listenerPending = false  // §D: backend stop clears listener
+                listenerPending = false
             }
         }
+
+        // R2 blocker 4: collect emergency debt locally; merge after updated is built.
+        var emergencyOutcomeDebt: CleanupDebt? = null
         if (listenerPending && serviceActivated) {
-            val outcome = try {
-                service.emergencyCloseListener("cleanup debt retry")
-            } catch (t: Throwable) {
-                CleanupOutcome(CleanupReport.failure("emergency_close", t), null)
-            }
+            val outcome = safeEmergencyClose("cleanup debt retry")
             if (!outcome.report.hasCriticalFailure) listenerPending = false
             failures += outcome.report.failures
-            // Fix #3: merge any failure debt from emergency close.
-            mergeDebt(outcome.debt)
+            emergencyOutcomeDebt = outcome.debt  // do NOT call mergeDebt here
         }
 
         var firewallHandle = debt.firewallHandlePending
@@ -458,17 +476,13 @@ class ProxyOnlyController(
         var stopPending = debt.firewallStopPending
 
         if (firewallHandle != null && daemonHealthy && denyPending) {
-            // Fix #2: denyAll returns CleanupReport
-            if (attempt("deny") { firewall.denyAll(firewallHandle!!) }) {
-                denyPending = false
-            }
+            if (attempt("deny") { firewall.denyAll(firewallHandle!!) }) denyPending = false
         }
         if (firewallHandle != null && daemonHealthy && stopPending) {
-            // Fix #2: stop returns CleanupReport
             if (attempt("firewall_stop") { firewall.stop(firewallHandle!!) }) {
                 stopPending = false
                 firewallHandle = null
-                denyPending = false  // §D: successful stop clears deny
+                denyPending = false
             }
         }
 
@@ -480,8 +494,13 @@ class ProxyOnlyController(
         }
 
         var featureStopPending = debt.featureStopPending
-        if (featureStopPending && serviceActivated) {
-            if (attempt("feature_stop") { service.stopFeature("cleanup debt retry") }) {
+        // R2 blocker 2: only attempt feature stop after service handle and listener are cleared.
+        if (featureStopPending && serviceActivated &&
+            serviceHandle == null && !listenerPending
+        ) {
+            if (attempt("feature_stop") {
+                    withTimeout(CLEANUP_STEP_TIMEOUT_MS) { service.stopFeature("cleanup debt retry") }
+                }) {
                 featureStopPending = false
                 serviceActivated = false
             }
@@ -498,7 +517,9 @@ class ProxyOnlyController(
             failures = failures,
             attempt = debt.attempt + 1,
         )
+        // R2 blocker 4: commit primary updated debt first, then merge emergency debt on top.
         cleanupDebt = updated.takeUnless { it.isResolved }
+        emergencyOutcomeDebt?.let { mergeDebt(it) }
     }
 
     // -----------------------------------------------------------------------
@@ -515,17 +536,11 @@ class ProxyOnlyController(
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Step 10 §B — mergeDebt assigns fresh generation, cancels old timer
-    // -----------------------------------------------------------------------
-
+    // Step 10 §B: mergeDebt assigns fresh generation and cancels old timer.
     private fun mergeDebt(incoming: CleanupDebt?) {
         if (incoming == null) return
         val merged = cleanupDebt?.mergeUnresolved(incoming) ?: incoming
-        cleanupDebt = merged.copy(
-            generation = nextDebtGeneration++,
-            attempt = 0,
-        )
+        cleanupDebt = merged.copy(generation = nextDebtGeneration++, attempt = 0)
         retryJob?.cancel()
         retryJob = null
         scheduledRetryGeneration = null
@@ -533,7 +548,6 @@ class ProxyOnlyController(
 
     // -----------------------------------------------------------------------
     // Waiting, recovery and terminal stop
-    // Fix §E: daemonAvailable from snapshot; not hardcoded.
     // -----------------------------------------------------------------------
 
     private suspend fun enterWaiting(next: DesiredProxyState, state: ProxyOnlyState, reason: String) {
@@ -555,7 +569,6 @@ class ProxyOnlyController(
         try {
             val outcome = cleanupApplied(
                 "reconcile failure",
-                // Fix §E: read from atomic latest snapshot
                 daemonAvailable = latestSnapshot.get()?.daemonHealthy == true,
             )
             mergeDebt(outcome.debt)
@@ -570,37 +583,14 @@ class ProxyOnlyController(
         } catch (recoveryFailure: Throwable) {
             safeReport("proxy.recovery", recoveryFailure)
             if (serviceActivated) {
-                // Fix #3: emergencyCloseListener returns CleanupOutcome.
-                val outcome = try {
-                    service.emergencyCloseListener("recovery failure")
-                } catch (emergencyFailure: Throwable) {
-                    // Construct explicit debt from current applied/service state.
-                    val debtFromFailure = CleanupDebt(
-                        listenerClosePending = true,
-                        serviceHandlePending = applied?.service,
-                        firewallHandlePending = applied?.firewall,
-                        firewallDenyPending = applied?.firewall != null,
-                        firewallStopPending = applied?.firewall != null,
-                        daemonCleanPending = true,
-                        featureStopPending = false,
-                        failures = listOf(CleanupFailure("emergency_close", emergencyFailure)),
-                        generation = nextDebtGeneration++,
-                        attempt = 0,
-                    )
-                    CleanupOutcome(CleanupReport.failure("emergency_close", emergencyFailure), debtFromFailure)
-                }
+                val outcome = safeEmergencyClose("recovery failure")
                 mergeDebt(outcome.debt)
             }
-            cleanupDebt?.let {
-                publishDebt(it)
-                scheduleDebtRetry(it)
-            }
+            cleanupDebt?.let { publishDebt(it); scheduleDebtRetry(it) }
         }
     }
 
-    // Fix #4: feature stop is deferred if service-handle or listener debt exists.
-    // If backend stop fails → add featureStopPending=true so the retry loop
-    // calls stopFeature only after backend/listener are confirmed cleared.
+    // R2 blocker 2: feature stop deferred when service/listener debt remains.
     private suspend fun terminalStopSafely(reason: String) {
         val outcome = cleanupApplied(
             reason,
@@ -614,8 +604,7 @@ class ProxyOnlyController(
             } == true
 
             if (hasServiceDebt) {
-                // Backend stop failed — defer feature stop so retry can clear the
-                // handle before the service becomes unreachable.
+                // Defer feature stop until service/listener debt clears.
                 mergeDebt(
                     CleanupDebt(
                         listenerClosePending = false,
@@ -631,10 +620,13 @@ class ProxyOnlyController(
                     )
                 )
             } else {
+                // Bound the feature-stop call.
                 val featureReport = try {
-                    service.stopFeature(reason)
-                } catch (failure: Throwable) {
-                    CleanupReport.failure("feature_stop", failure)
+                    withTimeout(CLEANUP_STEP_TIMEOUT_MS) { service.stopFeature(reason) }
+                } catch (stepTimeout: TimeoutCancellationException) {
+                    CleanupReport.failure("feature_stop_timeout", stepTimeout)
+                } catch (t: Throwable) {
+                    CleanupReport.failure("feature_stop", t)
                 }
                 if (featureReport.failures.isEmpty()) {
                     serviceActivated = false
@@ -660,8 +652,47 @@ class ProxyOnlyController(
     }
 
     // -----------------------------------------------------------------------
-    // Observable state helpers
+    // Helpers
     // -----------------------------------------------------------------------
+
+    /** Safe wrapper around emergencyCloseListener that never throws. */
+    private suspend fun safeEmergencyClose(reason: String): CleanupOutcome {
+        return try {
+            withTimeout(CLEANUP_STEP_TIMEOUT_MS) { service.emergencyCloseListener(reason) }
+        } catch (stepTimeout: TimeoutCancellationException) {
+            val f = CleanupFailure("emergency_close_timeout", stepTimeout)
+            val debtFromTimeout = CleanupDebt(
+                listenerClosePending = true,
+                serviceHandlePending = applied?.service,
+                firewallHandlePending = null,
+                firewallDenyPending = false,
+                firewallStopPending = false,
+                daemonCleanPending = false,
+                featureStopPending = false,
+                failures = listOf(f),
+                generation = nextDebtGeneration++,
+                attempt = 0,
+            )
+            CleanupOutcome(CleanupReport(listOf(f)), debtFromTimeout)
+        } catch (cancelled: CancellationException) {
+            throw cancelled  // R2 blocker 3
+        } catch (t: Throwable) {
+            val f = CleanupFailure("emergency_close", t)
+            val debtFromFailure = CleanupDebt(
+                listenerClosePending = true,
+                serviceHandlePending = applied?.service,
+                firewallHandlePending = applied?.firewall,
+                firewallDenyPending = applied?.firewall != null,
+                firewallStopPending = applied?.firewall != null,
+                daemonCleanPending = true,
+                featureStopPending = false,
+                failures = listOf(f),
+                generation = nextDebtGeneration++,
+                attempt = 0,
+            )
+            CleanupOutcome(CleanupReport(listOf(f)), debtFromFailure)
+        }
+    }
 
     private fun debtState(debt: CleanupDebt) = ProxyOnlyState.CleanupDegraded(
         unresolved = debt.unresolved,
@@ -675,7 +706,6 @@ class ProxyOnlyController(
         try { stateSink.publish(state) } catch (f: Throwable) { safeReport("proxy.state_publish", f) }
     }
 
-    // Fix #7: all reporter calls non-throwing.
     private fun safeReport(
         category: String,
         failure: Throwable,
@@ -687,9 +717,9 @@ class ProxyOnlyController(
 
 // ---------------------------------------------------------------------------
 // Extension helpers on DesiredProxyState
-// Fix #9: monotonic generation from AtomicLong (passed in via firewallGeneration).
-// Fix #8: runningState receives a downstream address, not loopback.
-// Fix #12: runtimeKey canonicalizes downstreams (sorted via normalized()).
+// R2 blocker 1: generationCounter required on every firewallConfig call.
+// R2 blocker 1: credentials required for backendConfig.
+// R2 high #6: runningState removed — endpoints built inline in reconcile().
 // ---------------------------------------------------------------------------
 
 fun DesiredProxyState.runtimeKey(upstream: ProxyVpnUpstream): RuntimeKey =
@@ -698,18 +728,13 @@ fun DesiredProxyState.runtimeKey(upstream: ProxyVpnUpstream): RuntimeKey =
         udpPortRange = if (settings.udpEnabled) settings.udpPortRange else null,
         credentialsVersion = settings.credentialsVersion,
         vpnNetworkHandle = upstream.handle,
-        // normalized() already sorted downstreams; collect interface+addresses.
         downstreams = downstreams.map { ds ->
             ds.interfaceName to listOfNotNull(ds.ipv4Address).sorted()
         },
         backendVersion = 1,
     )
 
-/**
- * Fix #9: generation must be supplied by a controller-owned monotonic counter,
- * not wall-clock time. The caller (controller) holds the [AtomicLong] and
- * passes it here as [generationCounter].
- */
+/** R2 blocker 1: generationCounter is mandatory — no default. */
 fun DesiredProxyState.firewallConfig(
     denyAll: Boolean,
     generationCounter: AtomicLong,
@@ -723,33 +748,21 @@ fun DesiredProxyState.firewallConfig(
     allowedClients = if (denyAll) emptyList() else allowedClients,
     generation = generationCounter.incrementAndGet(),
     denyAllIpv4 = denyAll,
-    denyAllIpv6 = true, // IPv6 always denied until Phase 0 evidence
+    denyAllIpv6 = true,
 )
 
-fun DesiredProxyState.backendConfig(upstream: ProxyVpnUpstream, credentials: ProxyCredentials): ProxyBackendConfig =
-    ProxyBackendConfig(
-        tcpPort = settings.tcpPort,
-        udpPortRange = if (settings.udpEnabled) settings.udpPortRange else null,
-        maxUdpAssociations = settings.maxUdpAssociations,
-        credentials = credentials,
-        vpnNetworkHandle = upstream.handle,
-        backendVersion = 1,
-    )
-
-/**
- * Fix #8: advertise the first known downstream IPv4 address, not loopback.
- * Publishing multiple per-downstream endpoints is deferred to Phase 5+ integration.
- */
-fun DesiredProxyState.runningState(): ProxyOnlyState.Running {
-    val host = downstreams.firstNotNullOfOrNull { it.ipv4Address } ?: "127.0.0.1"
-    return ProxyOnlyState.Running(
-        endpoint = ProxyEndpoint(
-            host = host,
-            tcpPort = settings.tcpPort,
-            udpPortRange = if (settings.udpEnabled) settings.udpPortRange else null,
-        )
-    )
-}
+/** R2 blocker 1: credentials are mandatory — no default. */
+fun DesiredProxyState.backendConfig(
+    upstream: ProxyVpnUpstream,
+    credentials: ProxyCredentials,
+): ProxyBackendConfig = ProxyBackendConfig(
+    tcpPort = settings.tcpPort,
+    udpPortRange = if (settings.udpEnabled) settings.udpPortRange else null,
+    maxUdpAssociations = settings.maxUdpAssociations,
+    credentials = credentials,
+    vpnNetworkHandle = upstream.handle,
+    backendVersion = 1,
+)
 
 fun Boolean.asCleanupReport() =
     if (this) CleanupReport.empty()

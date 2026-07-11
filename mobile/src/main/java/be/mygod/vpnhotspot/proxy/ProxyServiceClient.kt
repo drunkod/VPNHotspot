@@ -46,7 +46,19 @@ data class CleanupReport(
         fun empty() = CleanupReport()
         fun failure(step: String, cause: Throwable) =
             CleanupReport(failures = listOf(CleanupFailure(step, cause)))
-        fun staleHandle(id: Long) = CleanupReport(context = "stale handle $id")
+
+        /**
+         * R2 fix #5: a mismatched/stale handle is a CRITICAL unresolved failure, not
+         * a context-only success. Debt must not be cleared while another backend lives.
+         */
+        fun staleHandle(id: Long) = CleanupReport(
+            failures = listOf(
+                CleanupFailure(
+                    "stale_handle",
+                    IllegalStateException("mismatched backend handle id=$id — backend may still be active"),
+                )
+            )
+        )
     }
 }
 
@@ -170,8 +182,11 @@ class CleanupAccumulator(private val reporter: ProxyErrorReporter? = null) {
     val failures = mutableListOf<CleanupFailure>()
 
     /**
-     * Run [block] with a per-step timeout. Parent [kotlinx.coroutines.CancellationException]
-     * is re-thrown; only step-level [TimeoutCancellationException] is treated as failure.
+     * Run [block] with a per-step timeout.
+     *
+     * R2 fix #3: catch order is TimeoutCancellationException → CancellationException (re-throw)
+     * → Throwable. A parent coroutine cancellation must propagate; only a step-level timeout
+     * is classified as a cleanup failure.
      */
     suspend fun stepSucceeded(name: String, block: suspend () -> CleanupReport): Boolean {
         return try {
@@ -179,14 +194,15 @@ class CleanupAccumulator(private val reporter: ProxyErrorReporter? = null) {
             failures += r.failures
             r.failures.isEmpty()
         } catch (stepTimeout: TimeoutCancellationException) {
-            // Step-level timeout: record as failure, continue accumulating.
-            val f = CleanupFailure(name, stepTimeout)
-            failures += f
+            // Step-level timeout: record failure, keep accumulating other steps.
+            failures += CleanupFailure(name, stepTimeout)
             safeReport("proxy.cleanup.$name", stepTimeout)
             false
+        } catch (cancelled: CancellationException) {
+            // R2 fix #3: parent cancellation must not be swallowed.
+            throw cancelled
         } catch (t: Throwable) {
-            val f = CleanupFailure(name, t)
-            failures += f
+            failures += CleanupFailure(name, t)
             safeReport("proxy.cleanup.$name", t)
             false
         }
