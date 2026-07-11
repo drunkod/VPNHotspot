@@ -48,6 +48,7 @@ data class ProbeReport(val results: Map<ProbeKind, ProbeResult>)
 sealed interface ProbeEvaluation {
     data object Success : ProbeEvaluation
     data object VpnPermissionDenied : ProbeEvaluation
+    data class BindFailed(val failure: ProbeFailure) : ProbeEvaluation
     data class TcpFailed(val failure: ProbeFailure) : ProbeEvaluation
     data class UdpFailed(val failure: ProbeFailure) : ProbeEvaluation
     data class DnsFailed(val failure: ProbeFailure) : ProbeEvaluation
@@ -63,7 +64,7 @@ fun ProbeReport.evaluate(requirements: ProbeRequirements): ProbeEvaluation {
     if (bind is ProbeResult.Failed && bind.failure is ProbeFailure.PermissionDenied) {
         return ProbeEvaluation.VpnPermissionDenied
     }
-    if (bind is ProbeResult.Failed) return ProbeEvaluation.Incomplete(setOf(ProbeKind.APP_UID_BIND))
+    if (bind is ProbeResult.Failed) return ProbeEvaluation.BindFailed(bind.failure)
 
     fun failure(kind: ProbeKind): ProbeFailure? =
         (results.getValue(kind) as? ProbeResult.Failed)?.failure
@@ -81,3 +82,7 @@ fun ProbeReport.evaluate(requirements: ProbeRequirements): ProbeEvaluation {
 ```
 
 UDP is not required when `settings.udpEnabled == false`.
+
+`Incomplete` means a required result is absent; it is not a synonym for listener
+failure. Non-permission bind failures map to `BindFailed`, while only
+`PermissionDenied` maps to `VpnPermissionDenied`.
