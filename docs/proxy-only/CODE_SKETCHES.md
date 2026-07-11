@@ -22,8 +22,9 @@ are the native and daemon boundaries.
 
 ## Contract summary
 
-Invariants the steps implement together; each is normative and tested per
-[TEST_PLAN.md](TEST_PLAN.md):
+Invariants the steps implement together; each is normative. Existing suites live in
+[TEST_PLAN.md](TEST_PLAN.md); addendum-specific Phase 0 cases are listed in the
+[mandatory controller addendum](sketches/10-post-split-corrections.md):
 
 - `ProxyOnlyController` never owns a backend/native handle; `ProxyService` is the sole
   backend owner (Step 3). Pre-activation service calls return structured no-op reports.
