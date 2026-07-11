@@ -85,6 +85,7 @@ No outbound socket may be used unless that call succeeds when fail-closed is ena
 
 ## Documents
 
+- [Research decisions](RESEARCH_DECISIONS.md)
 - [Architecture](ARCHITECTURE.md)
 - [Implementation plan](IMPLEMENTATION_PLAN.md)
 - [Code sketches](CODE_SKETCHES.md)
