@@ -1,102 +1,85 @@
 # Proxy-only architecture
 
-## 1. Existing components and the upstream distinction
+## 1. Existing components and security boundaries
 
-The implementation extends the current architecture instead of introducing a second full routing stack.
+Proxy-only extends the current application; it does not create a second Android `VpnService` or transparent routing stack.
 
-### `Upstreams.vpn` versus `Upstreams.primary`
+### VPN-only selection
 
-`Upstreams.kt` exposes a flow that specifically requests `NetworkCapabilities.TRANSPORT_VPN`. It also exposes `Upstreams.primary`, which defaults to that VPN flow but can be replaced by the user's `service.upstream` interface-regex preference.
+`Upstreams.primary` is not a security boundary. It defaults to the VPN flow but can be overridden to a physical interface for the existing routing mode.
 
-That distinction is security-critical:
+Proxy-only must:
 
-- existing routing mode may intentionally route through a user-selected physical interface;
-- proxy-only promises that the SOCKS egress is a VPN path;
-- therefore proxy-only must not trust `Upstreams.primary` without validation.
+1. enumerate or consume VPN-specific candidates;
+2. read fresh `NetworkCapabilities`;
+3. require `TRANSPORT_VPN`;
+4. verify the VPN Hotspot app UID can bind a socket to the candidate;
+5. reject physical, stale or unusable candidates.
 
-The controller shall use one of these equivalent approaches:
+If exactly one usable VPN candidate exists, it may be selected. If none exist, enter `WaitingForVpn`/fail-closed. If more than one usable candidate exists, enter `MultipleVpnCandidates`; the MVP does not choose by transient network-handle ordering.
 
-1. consume `Upstreams.vpn` directly; or
-2. consume a selected upstream and reject it unless fresh `ConnectivityManager.getNetworkCapabilities(network)` includes `TRANSPORT_VPN`.
+The current routing path may continue to honor a user-selected physical `Upstreams.primary`. Proxy-only makes a stronger VPN-only promise and cannot inherit that permissive behavior.
 
-The validation is repeated immediately before native startup and before publishing `Running`. A missing capability, missing network or permission error is fail-closed.
+### System tethering
 
-The existing `Routing.kt` path already collects `Upstreams.primary` and places its `networkHandle` into `SessionConfig`. That remains valid for routing mode because the selected upstream is user policy, not a VPN-security assertion.
+Android system tethering owns DHCP, NAT and the direct Internet path. Proxy-only observes tethered interfaces and client identity only to expose the SOCKS listener safely.
 
-### System tethering lifecycle
-
-`TetheringService` observes Android tethered interfaces and currently creates `RoutingManager` instances for downstreams managed by VPN forwarding.
-
-Proxy-only introduces a separate downstream concern:
-
-```text
-The interface remains under ordinary Android tethering,
-but it is eligible to reach the app-process SOCKS listener.
-```
-
-Android keeps responsibility for DHCP, system NAT and the direct path. VPN Hotspot observes interface/client lifecycle only to reconcile listener exposure and ACLs.
+A pure Proxy-only downstream must not create the existing full VPN-forwarding `RoutingManager`, otherwise laptop `DIRECT` traffic would still pass through the phone VPN.
 
 ### Root daemon conventions
 
-The current daemon owns firewall/routing reconciliation, neighbour identity, traffic counters and deterministic cleanup. Proxy firewall code must reuse the existing mutation model:
+The daemon already owns firewall mutation, neighbour identity, counters and deterministic cleanup. The proxy firewall must reuse:
 
-- `routing/iptables.rs::IptablesRule` for rule identity and idempotent `-I`/`-D` operations;
-- `delete_repeated()` for duplicate-safe cleanup;
-- `routing/firewall_cleanup.rs::clean()` for deterministic removal of app-owned jumps/chains;
-- existing `IptablesTarget::Ipv4`/`Ipv6` selection.
+- `routing/iptables.rs::IptablesRule`;
+- idempotent insertion/deletion and `delete_repeated()`;
+- `routing/firewall_cleanup.rs::clean()`;
+- `IptablesTarget::Ipv4` and `Ipv6`.
 
-`SessionConfig` remains unchanged. The proxy firewall has an independent long-lived command/runtime because it has different ownership and failure semantics. This also avoids adding more responsibility to one of the daemon's most connected abstractions.
+The proxy firewall has an independent long-lived command/runtime. `SessionConfig` is not extended.
 
-## 2. Component model
+## 2. Ownership model
 
 ```text
 ┌──────────────────────── Android app process ──────────────────────────┐
 │                                                                       │
-│  Tethering state / UI                                                 │
-│          │                                                            │
-│          ▼                                                            │
+│  Tethering/UI/settings flows                                          │
+│             │                                                         │
+│             ▼                                                         │
 │  ProxyOnlyController                                                  │
-│    ├── observes settings                                              │
-│    ├── observes VPN-only candidate                                    │
-│    ├── validates TRANSPORT_VPN and app-UID usability                  │
-│    ├── observes tethered interfaces + neighbour identities            │
-│    ├── serializes desired states through one worker                   │
-│    └── treats firewall-channel loss as immediate stop                 │
-│          │                                                            │
-│          ├───────────────┐                                            │
-│          ▼               ▼                                            │
-│  ProxyService       ProxyFirewallClient                               │
-│    ├── FGS lifecycle      │ long-lived daemon command                 │
-│    ├── ProxyBackend       │ deny/allow/replace/stop                   │
-│    ├── native listener    │                                           │
-│    └── status/stats       │                                           │
-│          │               │                                            │
-│          ▼               │                                            │
-│  HevProxyBackend         │                                            │
-│    ├── CONNECT           │                                            │
-│    ├── UDP ASSOCIATE     │                                            │
-│    ├── auth              │                                            │
-│    ├── VPN-aware DNS     │                                            │
-│    └── per-FD hook       │                                            │
-└──────────┬───────────────┼────────────────────────────────────────────┘
-           │               │
-           │ listener      ▼
-           │       ┌──────────────── root daemon ──────────────────────┐
-           │       │ ProxyFirewallRuntime                             │
-           │       │  ├── IptablesRule ledger                        │
-           │       │  ├── IPv4 iface+IP+MAC allow rules              │
-           │       │  ├── IPv4 default reject                        │
-           │       │  ├── IPv6 deny for listener/range               │
-           │       │  ├── counters                                   │
-           │       │  └── firewall_cleanup integration               │
-           │       └──────────────────────────────────────────────────┘
-           ▼
- validated Android VPN Network
+│    ├── builds immutable desired states                                │
+│    ├── validates VPN candidates                                       │
+│    ├── serializes reconciliation                                      │
+│    ├── owns ProxyFirewallClient                                       │
+│    └── talks to ProxyServiceClient                                    │
+│             │                           │                             │
+│             │ service commands          │ long-lived daemon call      │
+│             ▼                           ▼                             │
+│  ProxyService                    ProxyFirewallRuntime                  │
+│    ├── foreground lifecycle       (root daemon)                        │
+│    ├── sole ProxyBackend owner    ├── IptablesRule ledger             │
+│    ├── native instance handles    ├── iface+IPv4+MAC ACL              │
+│    ├── listener/sessions          ├── IPv4 reject / IPv6 deny         │
+│    ├── backend stats              ├── counters                        │
+│    └── emergency listener close   └── deterministic Clean             │
+│             │                                                         │
+│             ▼                                                         │
+│  HevProxyBackend                                                      │
+│    ├── CONNECT                                                        │
+│    ├── UDP ASSOCIATE                                                  │
+│    ├── authentication                                                 │
+│    ├── VPN-aware DNS                                                  │
+│    └── per-FD network hook                                            │
+│             │                                                         │
+└─────────────┼─────────────────────────────────────────────────────────┘
+              ▼
+      validated Android VPN Network
 ```
 
-## 3. Product mode and internal downstream model
+`ProxyOnlyController` must not hold a `ProxyBackend` directly. `ProxyService` is the single owner of native lifecycle so it can close the listener even if controller reconciliation or state publication fails.
 
-The MVP UI has a global mode:
+## 3. Product mode and downstream model
+
+MVP UI:
 
 ```kotlin
 enum class SharingMode {
@@ -105,252 +88,278 @@ enum class SharingMode {
 }
 ```
 
-Existing users migrate to `VPN_ROUTING`.
-
-Internally, each observed interface is represented independently:
+Internal state remains per downstream:
 
 ```kotlin
 data class ManagedDownstream(
     val interfaceName: String,
+    val ipv4Addresses: Set<Inet4Address>,
     val vpnRoutingEnabled: Boolean,
     val proxyExposureEnabled: Boolean,
 )
 ```
 
-This keeps the data model extensible without exposing mixed per-interface controls in the MVP. `VPN_ROUTING_AND_PROXY` is deferred until interaction tests prove chain ordering and cleanup on the same downstream.
+`VPN_ROUTING_AND_PROXY` is deferred until chain-ordering and cleanup interaction tests exist.
 
-## 4. State machine
+## 4. Foreground-service lifecycle
+
+The service start must originate from a user action allowed by current Android foreground-service rules.
+
+Once Proxy-only is enabled, `ProxyService` remains alive through:
+
+- `WaitingForTethering`;
+- `WaitingForVpn`;
+- `FailClosed(VpnLost)`;
+- `FailClosed(DaemonUnavailable)`;
+- recovery while the UI is backgrounded.
+
+Waiting/fail-closed states keep the FGS and notification but have no active listener or sessions. This avoids attempting a new background FGS start when VPN or daemon service returns on Android 12+.
+
+The service stops only when:
+
+- the user disables Proxy-only;
+- the product explicitly abandons recovery;
+- the OS terminates the process.
+
+Automatic resurrection after process death is not assumed. Boot/background restoration requires a separate policy-compliant design.
+
+## 5. State machine
 
 ```text
 Disabled
-  └─ enable ─> WaitingForTethering
+  └─ user enable / valid FGS start ─> ServiceActive.WaitingForTethering
 
-WaitingForTethering
+ServiceActive.WaitingForTethering
   ├─ tethering available ─> WaitingForVpn
-  └─ disable ─> Disabled
+  └─ user disable ─> Disabled
 
-WaitingForVpn
-  ├─ validated VPN available ─> Starting
-  ├─ non-VPN selected ─> FailClosed(NonVpnUpstream)
-  ├─ VPN inaccessible to app UID ─> FailClosed(VpnPermissionDenied)
-  └─ disable ─> Disabled
+ServiceActive.WaitingForVpn
+  ├─ exactly one usable VPN ─> Starting
+  ├─ multiple usable VPNs ─> FailClosed(MultipleVpnCandidates)
+  ├─ app UID excluded ─> FailClosed(VpnPermissionDenied)
+  └─ user disable ─> Disabled
 
-Starting
-  ├─ deny rules + backend + probe + allows committed ─> Running
-  ├─ desired state changes ─> finish rollback, then reconcile newest snapshot
-  ├─ daemon channel lost ─> FailClosed(DaemonUnavailable)
-  └─ error ─> Error
+ServiceActive.Starting
+  ├─ deny + backend + outbound probes + allow ─> Running
+  ├─ transaction exception ─> recoverFailClosed()
+  └─ daemon/VPN loss ─> FailClosed
 
-Running
-  ├─ VPN Network identity changes ─> Stopping -> Starting
-  ├─ VPN lost/non-VPN ─> FailClosed
-  ├─ daemon channel lost ─> close listener -> FailClosed
-  ├─ downstream/client set changes ─> replace firewall/ACL only
-  ├─ downstream set becomes empty ─> Stopping -> WaitingForTethering
-  └─ disable ─> Stopping -> Disabled
+ServiceActive.Running
+  ├─ ACL/client change ─> replace policy only
+  ├─ VPN generation change ─> deny -> stop backend -> restart
+  ├─ daemon loss ─> emergency listener close -> FailClosed
+  ├─ tethering lost ─> stop backend -> WaitingForTethering
+  └─ user disable ─> terminal stop -> Disabled
+
+ServiceActive.FailClosed
+  ├─ dependency restored ─> reconcile without restarting FGS
+  └─ user disable ─> terminal stop -> Disabled
 ```
 
-The MVP restarts the backend on every VPN generation change. A live `replaceNetwork()` path is deferred behind the backend abstraction.
+## 6. Exception-safe reconciliation
 
-## 5. Serialized reconciliation
+Immutable desired snapshots are sent to `Channel.CONFLATED`. One worker applies them serially.
 
-Flow collection only publishes immutable desired snapshots into a `Channel.CONFLATED`. One dedicated worker performs complete apply/rollback transactions. New snapshots do not cancel an in-flight transaction.
+Required worker contract:
 
-Commit and rollback sections run in `NonCancellable` context. The worker records a partially applied resource immediately after creation so cleanup can always find it.
+1. New snapshots never cancel an in-flight transaction.
+2. Every iteration executes in `NonCancellable` context for resource commit/rollback.
+3. Every iteration has a `try/catch` boundary.
+4. Unexpected exceptions invoke fail-closed recovery.
+5. `publish` is isolated so observer failure cannot kill the resource worker.
+6. Cleanup attempts every step and aggregates failures.
+7. Worker `finally` invokes terminal `stopApplied()` in `NonCancellable` context.
 
-The runtime key is exactly:
+Fast-path operations (`firewall.replace`, service ACL replacement, state publication) are not trusted to be exception-free.
+
+### Cleanup ordering
+
+When daemon is healthy:
+
+1. request deny;
+2. close listener and sessions through `ProxyService`;
+3. stop firewall runtime;
+4. report all failures.
+
+When daemon is unavailable:
+
+1. close listener and sessions immediately through `ProxyService`;
+2. attempt firewall stop if possible;
+3. mark cleanup required for daemon recovery;
+4. report all failures.
+
+A failed deny must not skip listener closure. A failed backend stop must not skip firewall cleanup. Silent `runCatching` is not acceptable.
+
+## 7. Runtime key and replacement policy
+
+Backend restart key:
 
 ```text
-TCP listener port
-+ UDP relay range
+TCP port
++ UDP enabled/range
 + credentials version
 + validated VPN Network handle
-+ sorted downstream interface/address set
-+ backend feature flags
++ sorted downstream interface/IPv4 set
++ backend configuration version
 ```
 
-Client order, blocked-client changes and irrelevant `LinkProperties` churn are not part of the runtime key. They trigger replacement of firewall/native ACL state, not listener restart.
+Client ordering, block-list changes and irrelevant `LinkProperties` churn are excluded. They perform policy/ACL replacement only.
 
-VPN generation is derived in the serialized worker by comparing `Network` identity/handle with the last committed snapshot. No mutation occurs inside a `combine` transform.
+VPN generation changes use full backend restart. Live `replaceNetwork()` is deferred.
 
-## 6. VPN network selection and binding contract
-
-A candidate is acceptable only when all checks pass:
-
-1. `Network` is still present;
-2. capabilities include `TRANSPORT_VPN`;
-3. a probe socket can be bound by the VPN Hotspot app UID;
-4. the probe cannot fall back to the process default route;
-5. VPN-specific DNS succeeds or returns a controlled failure.
-
-Per-app VPN policy can cause `android_setsocknetwork()` to return `EPERM` when VPN Hotspot is excluded. This is a user-visible configuration error, not a reason to use a physical fallback.
+## 8. Network binding and probe contract
 
 Core invariant:
 
-> Every Internet-facing socket is bound to the validated VPN `Network` after `socket()` and before `connect()`, `sendto()` or any other packet-producing operation.
+> Every Internet-facing socket is bound to the selected VPN after `socket()` and before `connect()`, `sendto()` or any packet-producing operation.
 
 TCP:
 
 ```text
-socket()
-  -> prepare hook / android_setsocknetwork()
-  -> connect()
-  -> relay
+socket -> android_setsocknetwork -> connect -> relay
 ```
 
 UDP:
 
 ```text
-socket()
-  -> prepare hook / android_setsocknetwork()
-  -> connect()/sendto()
-  -> relay
+socket -> android_setsocknetwork -> connect/sendto -> relay
 ```
 
-All retry, happy-eyeballs, IPv4/IPv6 fallback and DNS-created socket paths must pass the same hook. In fail-closed mode a hook error closes the FD.
+All retries, resolver sockets and address-family fallback paths use the same hook. Hook failure closes the FD.
 
-## 7. DNS architecture
+### Outbound-only startup probes
 
-Domain-form SOCKS requests must resolve through the validated VPN network.
+Deny-first firewall state blocks client ingress, so startup probes are:
 
-Potential primitives include network-aware native resolver APIs or a Java/Kotlin `Network.getAllByName()` bridge. Both common synchronous approaches can block. Hev worker threads must not run an unbounded blocking resolver call.
+- app-UID bind probe;
+- backend-created outbound TCP probe;
+- backend-created outbound UDP probe;
+- VPN-aware DNS probe;
+- internal bind/listen readiness signal.
 
-Phase 0 must measure behaviour with a blackholed resolver and choose one of:
+The probe must not connect to the SOCKS endpoint through a tethered interface before allows are installed. External listener reachability is tested only after allow commit.
 
-- a bounded dedicated resolver thread pool with strict timeout/cancellation; or
-- an asynchronous Android resolver path such as `android_res_nsend` where supported by the chosen native boundary.
+## 9. DNS architecture
 
-The process-default resolver is forbidden in fail-closed mode.
+Domain-form requests use the validated VPN network only.
 
-## 8. VPN generation changes
+Phase 0 chooses between:
 
-A `Network` handle is not permanent. On identity/handle change:
+- bounded dedicated resolver workers using a network-aware API; or
+- asynchronous Android resolver integration.
 
-1. replace firewall allows with deny state;
-2. stop accepting clients;
-3. close all TCP sessions and UDP associations;
-4. stop the backend instance;
-5. validate the new VPN and app-UID binding;
-6. start a new backend instance;
-7. run TCP/UDP/DNS probes;
-8. commit current client allow rules;
-9. publish `Running`.
+Requirements:
 
-No session survives across generations in the MVP.
+- strict timeout and cancellation;
+- bounded queue and concurrency;
+- no process-default DNS fallback;
+- VPN generation loss cancels/invalidates results;
+- DNS blackhole does not stall unrelated sessions.
 
-## 9. Listener, UDP and address-family policy
+## 10. UDP topology and capacity gate
 
-### TCP
+The firewall policy cannot assume the client relay socket and Internet-facing socket are distinct.
 
-The SOCKS control listener uses the configured TCP port, initially `10808` unless changed by the user.
+Phase 0 must correlate:
 
-### UDP
+- Hev FD creation and prepare-hook calls;
+- control TCP connection;
+- returned SOCKS `BND.ADDR/BND.PORT`;
+- client-facing UDP relay FD/port;
+- upstream-facing UDP FD/port;
+- ingress interface for client packets and remote replies;
+- conntrack state for remote replies.
 
-SOCKS5 `UDP ASSOCIATE` may return an ephemeral relay port. The Hev pin must be configured to allocate only inside an explicit range. Phase 0 determines the exact supported configuration and reply behaviour.
+If remote replies arrive at a relay-range port through the VPN interface, rule ordering must explicitly allow only verified `ESTABLISHED/RELATED` reply traffic before terminal reject. No broad VPN-interface allow is permitted.
 
-The app and daemon exchange:
+The configured relay range never expands dynamically. If one port is consumed per association:
 
 ```text
-udp_port_range_start
-udp_port_range_end
+effectiveUdpCapacity = min(configuredAssociationLimit, relayRangeSize)
 ```
 
-A single `udp_port` field is not sufficient unless the pinned Hev implementation proves that all associations share one fixed port.
+Range exhaustion returns a controlled failure and metric.
 
-### IPv6 MVP policy
+## 11. Address-family policy
 
-The first release is IPv4-only:
+MVP is IPv4-only:
 
-- bind native listener/relay sockets as IPv4-only;
-- do not publish IPv6 endpoints;
-- install `ip6tables` reject rules for the TCP port and full UDP relay range on all interfaces;
-- verify that no dual-stack wildcard socket accepts IPv4-mapped or native IPv6 traffic unexpectedly.
+- listener and relay sockets are IPv4-only;
+- no IPv6 endpoint is published;
+- ip6tables rejects the TCP port and complete UDP range;
+- dual-stack wildcard and IPv4-mapped behavior are tested.
 
-Full IPv6 relay is a later feature requiring mirrored ACLs, DNS, counters and tests.
+Full IPv6 proxying is deferred.
 
-## 10. Firewall and ACL model
+## 12. Firewall and ACL model
 
-The proxy must never become an open proxy on upstream Wi-Fi, cellular, VPN, loopback or unrelated local interfaces.
-
-IPv4 desired policy:
+IPv4 input policy:
 
 ```text
-INPUT to TCP port or UDP relay range:
-  accept ESTABLISHED/RELATED where protocol semantics require it
-  for each allowed client:
-    match downstream input interface
+for TCP listener port and UDP relay range:
+  allow only verified return traffic required by the discovered UDP topology
+  for each permitted client:
+    match input interface
     match source IPv4
     match source MAC
-    count under MAC-facing identity
+    count by MAC/downstream
     accept
   reject
 ```
 
-The MAC match is mandatory wherever the downstream exposes L2 identity. IP-only matching permits DHCP/static-IP identity reuse and is not an MVP fallback. An interface without reliable MAC identity is unsupported until a safe policy is designed.
+The return-traffic rule is not approved until Phase 0 proves socket topology and conntrack behavior.
 
-IPv6 desired policy:
+IPv6 policy:
 
 ```text
-INPUT to TCP port or UDP relay range:
+for TCP listener port and UDP relay range:
   reject
 ```
 
-The proxy runtime reuses `IptablesRule` and maintains an applied ledger. Proxy jump rules and chains are added to `firewall_cleanup::clean()` so Clean removes them even after process/daemon failure.
+Interfaces without reliable MAC identity are unsupported in the MVP.
 
-## 11. Daemon liveness contract
+## 13. Daemon liveness
 
-iptables state survives daemon death. Existing allow rules may remain after `vpnhotspotd` exits.
+iptables state survives daemon death. Therefore:
 
-Therefore:
+- the long-lived firewall call/channel is a liveness signal;
+- channel loss triggers immediate `ProxyService` emergency listener closure;
+- the FGS remains alive in `FailClosed(DaemonUnavailable)`;
+- daemon recovery runs Clean or explicit deny reconciliation;
+- only then may a backend listener be started again.
 
-- the app owns a long-lived firewall call/channel;
-- channel completion or daemon disconnect immediately triggers native listener shutdown;
-- active sessions are closed before any restart attempt;
-- after daemon recovery, deterministic Clean or explicit deny reconciliation runs first;
-- the listener is started only after the new firewall runtime is live.
+A dead daemon plus closed listener is safe. A dead daemon plus live listener is forbidden.
 
-A dead daemon plus a closed listener is safe even if stale allow rules remain temporarily. A dead daemon plus a live listener is forbidden.
+## 14. Accounting
 
-## 12. Accounting
+Two layers:
 
-Two layers are retained:
+1. root firewall counters for listener ingress, keyed by MAC/downstream;
+2. backend counters for TCP/UDP payload, active sessions, hook failures, resolver queue and UDP range exhaustion.
 
-1. kernel counters on listener ingress, keyed publicly by MAC/downstream;
-2. backend protocol counters for TCP/UDP payload and active sessions.
+Firewall bytes include SOCKS framing and are not labelled application payload.
 
-Firewall counters include SOCKS framing and are not labelled as application payload.
-
-## 13. Service ownership and foreground-service gate
-
-- `TetheringService` publishes active system tethering interfaces;
-- `ProxyOnlyController` owns validation and serialized desired-state reconciliation;
-- `ProxyService` owns foreground/native lifecycle;
-- `ProxyBackend` hides Hev-specific implementation details;
-- `vpnhotspotd` owns firewall, ACL and kernel counters.
-
-The exact foreground-service type and store-policy eligibility are a Phase 2 release gate, not a late documentation question. The implementation must verify the repository's current target SDK and distribution requirements before merging the service declaration.
-
-## 14. Transaction ordering
+## 15. Transaction ordering
 
 Startup:
 
-1. obtain current tethered interfaces and MAC/IP identities;
-2. obtain and validate a VPN-only `Network`;
-3. verify app-UID binding policy with a probe;
-4. create a root firewall runtime in deny state for TCP and UDP range, IPv4 and IPv6;
-5. record the firewall runtime as partially applied;
-6. start the IPv4-only backend;
-7. run bound TCP, UDP and DNS probes;
-8. replace deny state with iface+IP+MAC allow rules;
-9. publish `Running`.
+1. ensure the user-started FGS is alive;
+2. obtain tethered interfaces and MAC/IP identity;
+3. select exactly one current usable VPN;
+4. run app-UID bind validation;
+5. start root firewall runtime in deny state for IPv4 and IPv6;
+6. record partial firewall state;
+7. start IPv4 backend through `ProxyService`;
+8. record partial backend state;
+9. run outbound TCP, UDP and DNS probes plus internal listener readiness;
+10. replace deny with verified allow rules;
+11. publish `Running` safely.
 
-Shutdown or any critical dependency loss:
+Critical failure or shutdown:
 
-1. request deny state when the daemon is alive;
-2. stop accepting clients immediately;
-3. close native sessions and listener;
-4. stop the firewall runtime when possible;
-5. run deterministic cleanup on later daemon recovery if needed;
-6. publish the final fail-closed/waiting/disabled state.
-
-This ordering prevents both an open-listener window and silent physical-network fallback.
+1. attempt deny when daemon is alive;
+2. close backend/listener through `ProxyService` regardless of deny result;
+3. stop firewall runtime regardless of backend-stop result;
+4. aggregate/report cleanup failures;
+5. remain in an active waiting/fail-closed FGS state unless user disabled;
+6. on worker/scope termination, run final `stopApplied()`.
