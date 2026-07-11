@@ -1,24 +1,18 @@
 # Proxy-only code sketches
 
-These snippets define contracts and sequencing. They are deliberately incomplete and must be adapted to current project APIs.
+These snippets define ownership and sequencing. They are not expected to compile unchanged.
 
-## 1. Settings, validated upstream and runtime key
+## 1. Settings, VPN candidate and runtime key
 
 ```kotlin
-package be.mygod.vpnhotspot.proxy
-
-import android.net.Network
-
-enum class SharingMode {
-    VPN_ROUTING,
-    PROXY_ONLY,
-}
+enum class SharingMode { VPN_ROUTING, PROXY_ONLY }
 
 data class ProxyOnlySettings(
     val enabled: Boolean,
     val tcpPort: Int,
     val udpEnabled: Boolean,
     val udpPortRange: IntRange,
+    val maxUdpAssociations: Int,
     val credentialsVersion: Long,
     val username: String,
     val password: String,
@@ -30,193 +24,297 @@ data class ProxyVpnUpstream(
     val interfaces: Set<String>,
 )
 
-data class ProxyEndpoint(
-    val interfaceName: String,
-    val ipv4: String,
-    val tcpPort: Int,
-    val udpPortRange: IntRange?,
-)
-
 data class RuntimeKey(
     val tcpPort: Int,
     val udpPortRange: IntRange?,
     val credentialsVersion: Long,
     val vpnNetworkHandle: Long,
-    val downstreams: List<Pair<String, String>>, // sorted iface/address pairs
+    val downstreams: List<Pair<String, String>>, // normalized/sorted
     val backendVersion: Int,
 )
 ```
 
-Client lists are intentionally absent from `RuntimeKey`; client updates replace ACL/firewall state without restarting the listener.
+Client lists are not part of `RuntimeKey`; they replace ACL state without restarting the listener.
 
-## 2. VPN-only selector
+## 2. Deterministic VPN-only selection
 
 ```kotlin
+sealed interface ProxyVpnSelection {
+    data object None : ProxyVpnSelection
+    data class Selected(val upstream: ProxyVpnUpstream) : ProxyVpnSelection
+    data class Rejected(val reason: ProxyVpnFailure) : ProxyVpnSelection
+}
+
+sealed interface ProxyVpnFailure {
+    data object NoVpn : ProxyVpnFailure
+    data object NonVpnCandidate : ProxyVpnFailure
+    data object VpnPermissionDenied : ProxyVpnFailure
+    data object MultipleVpnCandidates : ProxyVpnFailure
+}
+
 class ProxyVpnSelector(
     private val connectivity: ConnectivityManager,
+    private val bindProbe: AppUidBindProbe,
 ) {
-    fun validate(candidate: Upstream?): Result<ProxyVpnUpstream> = runCatching {
-        val upstream = candidate ?: throw ProxyStartException.NoVpn
-        val capabilities = connectivity.getNetworkCapabilities(upstream.network)
-            ?: throw ProxyStartException.NoVpn
-        if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
-            throw ProxyStartException.NonVpnUpstream
+    suspend fun select(candidates: List<Upstream>): ProxyVpnSelection {
+        val usable = candidates.mapNotNull { candidate ->
+            val capabilities = connectivity.getNetworkCapabilities(candidate.network)
+                ?: return@mapNotNull null
+            if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                return@mapNotNull null
+            }
+            if (!bindProbe.canUse(candidate.network)) return@mapNotNull null
+            ProxyVpnUpstream(
+                network = candidate.network,
+                handle = candidate.network.networkHandle,
+                interfaces = candidate.properties.allInterfaceNames.toSortedSet(),
+            )
         }
-        ProxyVpnUpstream(
-            network = upstream.network,
-            handle = upstream.network.networkHandle,
-            interfaces = upstream.properties.allInterfaceNames.toSortedSet(),
-        )
+        return when (usable.size) {
+            0 -> ProxyVpnSelection.None
+            1 -> ProxyVpnSelection.Selected(usable.single())
+            else -> ProxyVpnSelection.Rejected(ProxyVpnFailure.MultipleVpnCandidates)
+        }
     }
 }
 ```
 
-The input should normally be `Upstreams.vpn`. If another selector is used, the capability check remains mandatory. `Upstreams.primary` alone is not sufficient because it can be overridden to a physical interface.
+A production implementation should preserve why a candidate failed so app-policy denial can be distinguished from no VPN.
 
-A start probe must additionally distinguish an app-UID policy error:
+## 3. Service/backend ownership
 
 ```kotlin
-sealed class ProxyStartException(message: String) : Exception(message) {
-    data object NoVpn : ProxyStartException("No VPN network is available")
-    data object NonVpnUpstream : ProxyStartException("Selected upstream is not a VPN")
-    data object VpnPermissionDenied : ProxyStartException(
-        "VPN Hotspot is excluded from the selected VPN app policy"
-    )
+interface ProxyServiceClient {
+    suspend fun ensureServiceActive(): Unit
+    suspend fun startBackend(config: ProxyBackendConfig): ProxyServiceHandle
+    suspend fun replaceAcl(handle: ProxyServiceHandle, clients: List<AllowedClient>)
+    suspend fun runOutboundProbes(handle: ProxyServiceHandle): ProbeReport
+    suspend fun stopBackend(handle: ProxyServiceHandle): CleanupReport
+    suspend fun emergencyCloseListener(reason: String): CleanupReport
+    suspend fun readStats(handle: ProxyServiceHandle): ProxyBackendStats
+}
+
+interface ProxyBackend {
+    suspend fun start(config: ProxyBackendConfig): ProxyBackendHandle
+    suspend fun replaceAcl(handle: ProxyBackendHandle, clients: List<AllowedClient>)
+    suspend fun runOutboundProbes(handle: ProxyBackendHandle): ProbeReport
+    suspend fun stats(handle: ProxyBackendHandle): ProxyBackendStats
+    suspend fun stop(handle: ProxyBackendHandle): CleanupReport
 }
 ```
 
-## 3. Cancellation-safe desired-state worker
+`ProxyOnlyController` depends on `ProxyServiceClient`, not `ProxyBackend`. `ProxyService` is the only class that owns a backend handle.
 
-Do not use `collectLatest` around resource creation or teardown. New emissions must not cancel an in-flight transaction.
+## 4. Persistent foreground service
+
+```kotlin
+class ProxyService : Service(), CoroutineScope {
+    private var backendHandle: ProxyBackendHandle? = null
+    private lateinit var backend: ProxyBackend
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        ServiceNotification.startForeground(this, waitingNotification())
+        // The listener is started only by an explicit reconciler command.
+        return START_NOT_STICKY
+    }
+
+    suspend fun enterWaiting(state: ProxyOnlyState) {
+        stopBackendInternal("waiting: $state")
+        ServiceNotification.update(this, waitingNotification(state))
+        // Do not stopSelf(): VPN/daemon recovery may happen while UI is backgrounded.
+    }
+
+    suspend fun startBackend(config: ProxyBackendConfig): ProxyServiceHandle {
+        check(backendHandle == null)
+        val native = backend.start(config)
+        backendHandle = native
+        return ProxyServiceHandle(native.id)
+    }
+
+    suspend fun emergencyCloseListener(reason: String): CleanupReport =
+        stopBackendInternal("emergency: $reason")
+
+    private suspend fun stopBackendInternal(reason: String): CleanupReport {
+        val current = backendHandle ?: return CleanupReport.empty()
+        backendHandle = null
+        return backend.stop(current).withContext("ProxyService.stopBackend", reason)
+    }
+}
+```
+
+The service is initially started only from an Android-permitted user action. Once active, it remains alive without a listener in waiting/fail-closed states.
+
+## 5. Exception-safe desired-state worker
 
 ```kotlin
 class ProxyOnlyController(
-    private val backend: ProxyBackend,
+    private val service: ProxyServiceClient,
     private val firewall: ProxyFirewallClient,
+    private val stateSink: ProxyStateSink,
+    private val reporter: ProxyErrorReporter,
     private val scope: CoroutineScope,
 ) {
     private val desired = Channel<DesiredProxyState>(Channel.CONFLATED)
     private var applied: AppliedProxyState? = null
 
-    fun start(source: Flow<DesiredProxyState>) {
-        scope.launch {
-            source.collect { desired.trySend(it) }
+    fun start(source: Flow<DesiredProxyState>): Job = scope.launch {
+        val collector = launch {
+            source.collect { desired.send(it.normalized()) }
         }
-        scope.launch {
+        try {
             for (snapshot in desired) {
-                withContext(NonCancellable) {
-                    reconcile(snapshot.normalized())
+                try {
+                    withContext(NonCancellable) {
+                        withTimeout(TRANSACTION_TIMEOUT) { reconcile(snapshot) }
+                    }
+                } catch (t: Throwable) {
+                    withContext(NonCancellable) {
+                        recoverFromIterationFailure(t)
+                    }
                 }
+            }
+        } finally {
+            collector.cancel()
+            withContext(NonCancellable) {
+                stopApplied(reason = "controller worker terminated")
             }
         }
     }
 
     private suspend fun reconcile(next: DesiredProxyState) {
+        service.ensureServiceActive()
+
         if (!next.settings.enabled) {
-            stopApplied()
-            publish(ProxyOnlyState.Disabled)
+            stopApplied("disabled")
+            publishSafely(ProxyOnlyState.Disabled)
             return
         }
         if (next.downstreams.isEmpty()) {
-            stopApplied()
-            publish(ProxyOnlyState.WaitingForTethering)
+            stopApplied("no tethering")
+            publishSafely(ProxyOnlyState.WaitingForTethering)
             return
         }
         val upstream = next.validatedVpn ?: run {
-            stopApplied()
-            publish(ProxyOnlyState.FailClosed(next.vpnFailure))
+            stopApplied("VPN unavailable")
+            publishSafely(ProxyOnlyState.FailClosed(next.vpnFailure))
             return
         }
         if (!next.daemonHealthy) {
-            // Existing kernel allows may still exist, so listener closure is mandatory.
-            stopBackendFirst()
-            publish(ProxyOnlyState.FailClosed("Root daemon unavailable"))
+            stopApplied("daemon unavailable", daemonAvailable = false)
+            publishSafely(ProxyOnlyState.FailClosed("Root daemon unavailable"))
             return
         }
 
         val key = next.runtimeKey(upstream)
         val current = applied
-        if (current?.key == key) {
-            firewall.replace(current.firewallId, next.firewallConfig(denied = false))
-            backend.replaceAcl(current.backendHandle, next.allowedClients)
-            publish(current.runningState(next))
+        if (current?.isComplete == true && current.key == key) {
+            // Either call may throw; the outer iteration boundary performs fail-closed recovery.
+            firewall.replace(current.firewall!!, next.firewallConfig(denied = false))
+            service.replaceAcl(current.service!!, next.allowedClients)
+            publishSafely(current.runningState(next))
             return
         }
 
-        stopApplied()
-        publish(ProxyOnlyState.Starting)
+        stopApplied("runtime key changed")
+        publishSafely(ProxyOnlyState.Starting)
 
-        var partialFirewall: ProxyFirewallHandle? = null
-        var partialBackend: ProxyBackendHandle? = null
+        val partial = AppliedProxyState(key = key)
+        applied = partial
+
+        val firewallHandle = firewall.start(next.firewallConfig(denied = true))
+        partial.firewall = firewallHandle              // record immediately
+
+        val serviceHandle = service.startBackend(next.backendConfig(upstream))
+        partial.service = serviceHandle                // record immediately
+
+        val probes = service.runOutboundProbes(serviceHandle)
+        check(probes.allRequiredPassed)
+
+        firewall.replace(firewallHandle, next.firewallConfig(denied = false))
+        partial.isComplete = true
+        publishSafely(partial.runningState(next))
+    }
+
+    private suspend fun recoverFromIterationFailure(failure: Throwable) {
+        val cleanup = stopApplied("reconcile exception: ${failure::class.java.simpleName}")
+        reporter.report("proxy.reconcile", failure, cleanup.failures)
+        publishSafely(ProxyOnlyState.Error("Proxy stopped after internal failure", failure))
+    }
+
+    private suspend fun stopApplied(
+        reason: String,
+        daemonAvailable: Boolean = true,
+    ): CleanupReport {
+        val current = applied ?: return CleanupReport.empty()
+        applied = null
+        val failures = mutableListOf<CleanupFailure>()
+
+        suspend fun step(name: String, block: suspend () -> Unit) {
+            try {
+                withTimeout(CLEANUP_STEP_TIMEOUT) { block() }
+            } catch (t: Throwable) {
+                failures += CleanupFailure(name, t)
+                reporter.report("proxy.cleanup.$name", t)
+            }
+        }
+
+        if (daemonAvailable && current.firewall != null) {
+            step("deny") { firewall.denyAll(current.firewall!!) }
+        }
+        if (current.service != null) {
+            step("service_stop") { service.stopBackend(current.service!!).throwIfCritical() }
+        } else {
+            step("service_emergency_close") {
+                service.emergencyCloseListener(reason).throwIfCritical()
+            }
+        }
+        if (current.firewall != null) {
+            step("firewall_stop") { firewall.stop(current.firewall!!) }
+        }
+
+        return CleanupReport(failures)
+    }
+
+    private suspend fun publishSafely(state: ProxyOnlyState) {
         try {
-            partialFirewall = firewall.start(next.firewallConfig(denied = true))
-            partialBackend = backend.start(next.backendConfig(upstream))
-            backend.probe(partialBackend)
-            firewall.replace(partialFirewall, next.firewallConfig(denied = false))
-            applied = AppliedProxyState(key, partialBackend, partialFirewall)
-            publish(applied!!.runningState(next))
+            stateSink.publish(state)
         } catch (t: Throwable) {
-            partialBackend?.let { backend.stop(it) }
-            partialFirewall?.let { firewall.stop(it) }
-            publish(ProxyOnlyState.Error("Failed to start proxy", t))
+            reporter.report("proxy.state_publish", t)
         }
     }
-
-    private suspend fun stopApplied() {
-        val current = applied ?: return
-        applied = null
-        runCatching { firewall.denyAll(current.firewallId) }
-        runCatching { backend.stop(current.backendHandle) }
-        runCatching { firewall.stop(current.firewallId) }
-    }
-
-    private suspend fun stopBackendFirst() {
-        val current = applied ?: return
-        applied = null
-        // Daemon may be dead and unable to deny; listener must close anyway.
-        runCatching { backend.stop(current.backendHandle) }
-        runCatching { firewall.stop(current.firewallId) }
-    }
 }
 ```
 
-`normalized()` sorts downstreams and clients and removes irrelevant `LinkProperties` churn. Network-generation changes alter the runtime key and therefore use full stop/start. Live `replaceNetwork()` is not part of the MVP.
+Important properties:
 
-## 4. Backend abstraction
+- resource operations have timeouts even inside `NonCancellable`;
+- partial handles are recorded immediately;
+- every cleanup step is attempted;
+- cleanup failures are visible;
+- state publication cannot kill the worker;
+- scope cancellation triggers terminal cleanup.
+
+## 6. Outbound-only probe model
 
 ```kotlin
-interface ProxyBackend {
-    suspend fun start(config: ProxyBackendConfig): ProxyBackendHandle
-    suspend fun probe(handle: ProxyBackendHandle)
-    suspend fun replaceAcl(handle: ProxyBackendHandle, clients: List<AllowedClient>)
-    suspend fun stats(handle: ProxyBackendHandle): ProxyBackendStats
-    suspend fun stop(handle: ProxyBackendHandle)
+enum class ProbeKind {
+    APP_UID_BIND,
+    OUTBOUND_TCP,
+    OUTBOUND_UDP,
+    VPN_DNS,
+    INTERNAL_LISTENER_READY,
 }
 
-internal object ProxyNative {
-    init { System.loadLibrary("vpnhotspot_proxy") }
-
-    external fun start(
-        configYaml: ByteArray,
-        networkHandle: Long,
-        failClosed: Boolean,
-    ): Long
-
-    external fun replaceAllowedClients(instance: Long, addresses: Array<String>)
-    external fun readStats(instance: Long): NativeProxyStats
-    external fun stop(instance: Long)
+data class ProbeReport(val results: Map<ProbeKind, ProbeResult>) {
+    val allRequiredPassed: Boolean get() = ProbeKind.entries.all { results[it]?.success == true }
 }
 ```
 
-No native network-update entry point is required for the MVP. A VPN handle change destroys the old instance and all sessions.
+`INTERNAL_LISTENER_READY` checks native bind/listen state without connecting through the downstream firewall. Client reachability is tested only after allow rules are committed.
 
-## 5. Testable Hev socket hook
+## 7. Hev socket hook with host shim
 
 ```c
-/* vpnhotspot_socket_hook.h */
-#pragma once
-#include <stdint.h>
-
 typedef int (*vpnhotspot_network_bind_fn)(uint64_t network, int fd, void *opaque);
 
 typedef struct {
@@ -230,121 +328,73 @@ int vpnhotspot_prepare_outbound_socket(
     int fd,
     int family,
     int type,
-    const vpnhotspot_network_state_t *state);
-```
-
-Android implementation:
-
-```c
-#include <android/multinetwork.h>
-#include <errno.h>
-
-static int android_bind_network(uint64_t network, int fd, void *opaque) {
-    (void)opaque;
-    return android_setsocknetwork((net_handle_t)network, fd) == 0 ? 0 : -errno;
-}
-
-int vpnhotspot_prepare_outbound_socket(
-    int fd,
-    int family,
-    int type,
-    const vpnhotspot_network_state_t *state) {
-    (void)family;
-    (void)type;
-    if (state == NULL || state->network_handle == 0 || state->bind_fn == NULL) {
+    const vpnhotspot_network_state_t *state)
+{
+    if (state == NULL || state->network_handle == 0 || state->bind_fn == NULL)
         return state != NULL && state->fail_closed ? -ENONET : 0;
-    }
     return state->bind_fn(state->network_handle, fd, state->bind_opaque);
 }
 ```
 
-Hook placement:
+Android adapter:
 
 ```c
-int fd = socket(family, type, protocol);
-if (fd < 0)
-    return -errno;
-
-int rc = vpnhotspot_prepare_outbound_socket(fd, family, type, &server->network);
-if (rc < 0) {
-    close(fd);
-    return rc;
-}
-
-/* connect(), sendto() or resolver use may begin only here. */
-```
-
-Host-CI shim:
-
-```c
-typedef struct {
-    int calls;
-    int fail_with;
-    int last_fd;
-} fake_bind_state_t;
-
-static int fake_bind(uint64_t network, int fd, void *opaque) {
-    fake_bind_state_t *state = opaque;
-    state->calls++;
-    state->last_fd = fd;
-    return state->fail_with;
+static int android_bind_network(uint64_t network, int fd, void *opaque) {
+    (void)opaque;
+    return android_setsocknetwork((net_handle_t)network, fd) == 0 ? 0 : -errno;
 }
 ```
 
-Unit tests inject `fake_bind` and assert every TCP/UDP/retry/fallback path calls it before the first packet-producing operation.
+Every outbound socket path calls the hook after `socket()` and before `connect()`/`sendto()`. Host CI injects a fake callback and records ordering.
 
-## 6. DNS worker boundary
-
-A simple `Network.getAllByName()` call must not run inline on a Hev worker. One acceptable prototype shape is a bounded Kotlin resolver dispatcher:
+## 8. UDP topology discovery model
 
 ```kotlin
-class NetworkResolver(
-    private val network: Network,
-    private val dispatcher: CoroutineDispatcher,
+data class UdpSocketObservation(
+    val associationId: Long,
+    val fd: Int,
+    val role: UdpSocketRole,
+    val localAddress: InetSocketAddress,
+    val remoteAddress: InetSocketAddress?,
+    val boundNetworkHandle: Long?,
+)
+
+enum class UdpSocketRole {
+    CLIENT_RELAY,
+    INTERNET_FACING,
+    SHARED_RELAY_AND_INTERNET,
+}
+
+data class UdpTopologyReport(
+    val observations: List<UdpSocketObservation>,
+    val returnedBindAddresses: List<InetSocketAddress>,
+    val replyIngressInterfaces: Set<String>,
+    val replyConntrackStates: Set<String>,
+)
+```
+
+Phase 0 uses debug-only native instrumentation and packet capture to populate this report. Firewall return rules remain provisional until the topology is proven.
+
+## 9. UDP range and capacity
+
+```kotlin
+data class UdpRelayPolicy(
+    val range: IntRange,
+    val configuredAssociationLimit: Int,
+    val onePortPerAssociation: Boolean,
 ) {
-    suspend fun resolve(host: String): List<InetAddress> = withTimeout(5_000) {
-        withContext(dispatcher) { network.getAllByName(host).toList() }
-    }
+    val usablePorts: Int get() = range.last - range.first + 1
+    val effectiveAssociationLimit: Int get() =
+        if (onePortPerAssociation) minOf(configuredAssociationLimit, usablePorts)
+        else configuredAssociationLimit
 }
 ```
 
-The dispatcher must have bounded parallelism and queueing. Phase 0 may instead choose an asynchronous native resolver. In either case, cancellation/VPN loss returns a controlled failure and never invokes process-default DNS.
+Range exhaustion produces a stable metric/error. The range is never widened at runtime.
 
-## 7. UDP relay range model
-
-```kotlin
-data class UdpRelayRange(val start: Int, val endInclusive: Int) {
-    init {
-        require(start in 1..65535)
-        require(endInclusive in start..65535)
-        require(endInclusive - start <= 255) // product limit; tune after tests
-    }
-}
-```
-
-The pinned Hev config must constrain every `UDP ASSOCIATE` relay to this range. The root firewall denies the entire range before backend startup, then allows only authenticated/known client source identities.
-
-## 8. Proto sketch
+## 10. Proto sketch
 
 ```proto
-message ClientEnvelope {
-  uint64 call_id = 1;
-  oneof command {
-    // existing commands...
-    StartProxyFirewallCommand start_proxy_firewall = 9;
-    ReplaceProxyFirewallCommand replace_proxy_firewall = 10;
-  }
-}
-
-message StartProxyFirewallCommand {
-  ProxyFirewallConfig config = 1;
-}
-
-message ReplaceProxyFirewallCommand {
-  uint64 runtime_id = 1;
-  ProxyFirewallConfig config = 2;
-}
-
 message ProxyFirewallConfig {
   repeated ProxyDownstream downstreams = 1;
   uint32 tcp_port = 2;
@@ -367,18 +417,14 @@ message ProxyClient {
 }
 ```
 
-The call remains active for the firewall runtime lifetime. Existing cancellation semantics terminate it. Channel termination is also the app's daemon-liveness signal.
+The long-lived firewall call is also the daemon-liveness signal.
 
-## 9. Reusing the Rust iptables ledger
-
-The proxy firewall module should reuse, not duplicate, the current routing firewall abstractions. This may require promoting visibility from `pub(super)` to `pub(crate)`.
+## 11. Rust firewall ledger reuse
 
 ```rust
-use crate::firewall::IptablesTarget;
 use crate::routing::iptables::{
     apply_iptables_batch,
     ensure_iptables_chain_result,
-    IptablesChain,
     IptablesRule,
 };
 
@@ -388,69 +434,31 @@ pub(crate) struct Runtime {
 }
 ```
 
-IPv4 allow-rule shape:
+IPv4 client allow includes interface, source IPv4 and source MAC. IPv6 denies all proxy ports in the MVP. `firewall_cleanup::clean()` removes proxy jumps/chains.
 
-```rust
-IptablesRule::new(
-    IptablesTarget::Ipv4,
-    "filter",
-    "vpnhotspot_proxy_input",
-    vec![
-        "-i".into(), downstream.interface_name.clone(),
-        "-s".into(), client_ip.to_string(),
-        "-m".into(), "mac".into(),
-        "--mac-source".into(), mac_string(&client.mac),
-        "-p".into(), "tcp".into(),
-        "--dport".into(), config.tcp_port.to_string(),
-        "-j".into(), "ACCEPT".into(),
-    ],
-)
-```
+A verified return-traffic rule may precede terminal UDP reject only after Phase 0 proves the Hev FD/port topology and conntrack state. Do not add a broad allow for the VPN interface.
 
-Equivalent UDP rules cover the configured relay range. IPv4 chains end in reject. IPv6 chains reject TCP port and UDP range without allow rules in the MVP.
-
-`routing/firewall_cleanup.rs::clean()` must delete repeated proxy jumps and flush/delete proxy chains for both address families. The new runtime must use the same applied-ledger rollback conventions as routing.
-
-## 10. Tethering integration
+## 12. Daemon liveness and background recovery
 
 ```kotlin
-data class ManagedDownstream(
-    val interfaceName: String,
-    val ipv4Addresses: Set<Inet4Address>,
-    val vpnRoutingEnabled: Boolean,
-    val proxyExposureEnabled: Boolean,
-)
+suspend fun onFirewallChannelLost() {
+    service.emergencyCloseListener("root daemon channel lost")
+    stateSink.publishSafely(ProxyOnlyState.FailClosed("Root daemon unavailable"))
+    // ProxyService remains foreground and listener-free.
+}
 
-when (sharingMode) {
-    SharingMode.VPN_ROUTING -> startRouting(downstream)
-    SharingMode.PROXY_ONLY -> exposeProxyWithoutRouting(downstream)
+suspend fun onDaemonReturned() {
+    firewall.cleanOrEstablishDeny()
+    desiredStateSignal.refresh()
+    // Existing foreground service handles recovery; no new background FGS start.
 }
 ```
 
-Do not instantiate `RoutingManager` for a pure Proxy-only downstream.
+## 13. Credential requirements
 
-## 11. Daemon liveness
-
-```kotlin
-firewall.start(config).use { runtime ->
-    select<Unit> {
-        runtime.completion.onAwait {
-            // Kernel allow rules may persist, so close listener immediately.
-            backend.stop(activeBackend)
-            publish(ProxyOnlyState.FailClosed("Root daemon unavailable"))
-        }
-        controllerStop.onAwait { /* normal deny/stop path */ }
-    }
-}
-```
-
-On reconnection, run Clean or establish deny state before starting a new backend.
-
-## 12. Credential requirements
-
-- never include username/password in `toString()`;
-- redact them from exceptions, crash reports and analytics;
-- use app-private credential-encrypted storage;
-- increment `credentialsVersion` on regeneration so runtime restart is deterministic;
+- never include credentials in `toString()`;
+- redact exceptions and crash reports;
+- use credential-encrypted app-private storage;
+- increment `credentialsVersion` on regeneration;
 - never pass secrets through process arguments;
-- show password only after an explicit user action.
+- reveal/copy only after explicit user action.
