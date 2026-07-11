@@ -1,6 +1,6 @@
 # Proxy-only mode design
 
-Status: round-2 corrected design, approved to begin Phase 0 only  
+Status: round-2 corrected design with post-review consistency fixes; approved to begin Phase 0 only  
 Target repository snapshot: `drunkod/VPNHotspot@9b6354c69cbe42c87c8d3a28add8405c3ae79b8d`  
 Target branch: `agent/proxy-only-design`
 
@@ -44,59 +44,84 @@ When Proxy-only reports `Running`:
 2. the VPN Hotspot app UID is allowed to use that VPN;
 3. every Internet-facing TCP, UDP and DNS socket is bound to that VPN before sending;
 4. ingress is allowed only for authenticated, explicitly permitted tethered clients;
-5. any critical dependency failure closes the listener and sessions without direct fallback.
+5. any critical dependency failure closes the listener and sessions without direct fallback;
+6. no unresolved cleanup debt exists.
 
-`Upstreams.primary` is not proof of VPN use because the existing routing mode permits a user-selected physical upstream. Proxy-only uses a VPN-specific candidate and fresh capability validation.
+`Upstreams.primary` is not proof of VPN use because existing routing mode permits a user-selected physical upstream. Proxy-only uses a VPN-specific candidate and fresh capability validation.
 
 If multiple usable VPN candidates are visible, the MVP fails closed with `MultipleVpnCandidates`. It does not choose by transient network-handle ordering.
 
 ## Accepted MVP decisions
 
-1. The UI exposes `VPN_ROUTING` and `PROXY_ONLY`; mixed routing+proxy mode is deferred.
+1. UI exposes `VPN_ROUTING` and `PROXY_ONLY`; mixed mode is deferred.
 2. Ordinary system Wi-Fi/USB tethering supplies the direct path.
-3. `ProxyService` is the sole owner of `ProxyBackend`, native handles and backend statistics.
-4. `ProxyOnlyController` owns desired-state reconciliation and talks to `ProxyServiceClient`; it never invokes the backend directly.
+3. `ProxyService` is the sole owner of `ProxyBackend`, native handles and statistics.
+4. `ProxyOnlyController` owns desired-state reconciliation and talks to `ProxyServiceClient`.
 5. The first backend is a pinned, minimally forked HevSocks5Server.
 6. Every outbound FD passes a testable Android-network binding hook.
 7. SOCKS domain targets use bounded/asynchronous VPN-aware DNS.
 8. Root daemon owns firewall, client ACL, counters and deterministic cleanup.
-9. Proxy firewall reuses the existing `IptablesRule` ledger and `firewall_cleanup` machinery.
+9. Proxy firewall reuses existing `IptablesRule` and `firewall_cleanup` machinery.
 10. Fail-closed is mandatory; physical fallback is not an MVP option.
 11. Standard SOCKS5 `CONNECT` and `UDP ASSOCIATE` are required.
-12. MVP is IPv4-only with explicit IPv6 deny rules.
+12. MVP is IPv4-only with explicit IPv6 deny.
 13. Client allow identity is downstream interface + IPv4 + MAC.
 14. VPN generation changes fully restart the backend.
 15. TPROXY/transparent interception is deferred.
 
 ## Foreground-service lifecycle
 
-The service is started only from a user action that is valid under current Android foreground-service rules. Once Proxy-only is enabled and the service is running, it remains alive through:
+A disabled state must never activate the proxy FGS.
+
+The first start occurs only after a user action allowed by current Android foreground-service rules. Once enabled and active, `ProxyService` remains alive through:
 
 - `WaitingForTethering`;
 - `WaitingForVpn`;
-- VPN loss / `FailClosed`;
-- root-daemon loss / `FailClosed`;
-- background recovery when VPN or daemon service returns.
+- `MultipleVpnCandidates`;
+- `VpnPermissionDenied`;
+- VPN-loss fail-closed;
+- daemon-loss fail-closed;
+- cleanup-degraded recovery;
+- background recovery when dependencies return.
 
-In waiting/fail-closed states the service has **no active listener** and shows a persistent blocked/waiting notification. Keeping the service alive avoids an Android 12+ background restart that may throw `ForegroundServiceStartNotAllowedException`.
+In these states the service has **no active listener** and shows a persistent waiting/blocked notification. The controller issues an explicit `enterWaiting(state)` service command; merely publishing state is insufficient.
 
-The service stops when the user disables Proxy-only, recovery is explicitly abandoned, or the OS terminates the process. Automatic resurrection after process death is not assumed.
+The service stops only through terminal `stopFeature()` after user disable/abandonment, or when the OS terminates the process. Automatic resurrection after process death is not assumed.
 
 ## Exception-safe reconciliation
 
-One `Channel.CONFLATED` feeds one worker. Resource transactions are non-cancellable, but that alone is insufficient. The worker also requires:
+One `Channel.CONFLATED` feeds one resource worker.
 
-- a catch boundary around every reconciliation iteration;
-- fail-closed recovery after fast-path, publish or rollback exceptions;
-- cleanup that attempts deny, backend/listener stop and firewall stop independently;
-- aggregated, structured cleanup error reporting instead of silent `runCatching`;
-- a `finally` block that calls terminal `stopApplied()` in `NonCancellable` context.
+The worker requires:
+
+- no `collectLatest` around resource operations;
+- per-iteration exception boundary;
+- transaction timeout handled as fail-closed failure;
+- parent `CancellationException` rethrown;
+- recovery routine with its own exception boundary;
+- state-publication and reporter failures contained;
+- cleanup that independently attempts deny, backend stop, emergency listener close and firewall stop;
+- structured cleanup reports;
+- terminal cleanup in `finally` and `NonCancellable` context.
 
 No exception may kill the worker while leaving a live listener unreconciled.
 
+## Cleanup debt
+
+A failed safety-relevant cleanup step creates structured cleanup debt rather than discarding handles.
+
+While debt exists:
+
+- no new backend may start;
+- the listener remains closed;
+- emergency close is retried;
+- daemon recovery runs Clean or explicit deny reconciliation;
+- notification/UI shows cleanup degraded;
+- successful cleanup clears debt before normal reconciliation resumes.
+
 ## Probe contract
 
-Deny-first startup intentionally blocks client ingress. Therefore startup probes are outbound-only:
+Deny-first startup intentionally blocks client ingress. Startup probes are outbound-only:
 
 - app-UID bind probe;
 - backend-created outbound TCP probe;
@@ -113,12 +138,12 @@ The pinned Hev source must be inspected to determine:
 - whether client-facing relay and Internet-facing UDP sockets are the same FD or separate FDs;
 - whether upstream replies arrive on a protected relay-range port;
 - how conntrack classifies those replies;
-- whether `ESTABLISHED/RELATED` is required before terminal reject;
+- whether a narrow `ESTABLISHED/RELATED` rule is required before reject;
 - how returned `BND.ADDR/BND.PORT` maps to the configured range.
 
-The firewall design is not final until packet captures and FD/port correlation prove the exact topology. No broad VPN-interface allow is permitted.
+The firewall design is not final until packet captures and FD/port correlation prove the topology. No broad VPN-interface allow is permitted.
 
-If one relay port is consumed per association, the range is also a global capacity ceiling:
+If one relay port is consumed per association:
 
 ```text
 effective UDP capacity = min(configured association limit, usable relay-port count)
@@ -136,12 +161,12 @@ input interface + source IPv4 + source MAC + destination TCP port/UDP relay rang
 
 IPv4 chains end in reject. IPv6 rejects the TCP listener port and full UDP relay range.
 
-iptables rules can survive daemon death. If the long-lived daemon channel breaks, `ProxyService` closes the listener immediately. After daemon recovery, Clean or explicit deny reconciliation completes before any listener restart.
+iptables rules can survive daemon death. If the daemon channel breaks, `ProxyService` closes the listener immediately and cleanup debt records possible stale kernel state. After daemon recovery, Clean or explicit deny reconciliation completes before any listener restart.
 
 ## Documents
 
 - [Round-1 structural review](REVIEW.md)
-- [Round-2 resolution audit](REVIEW_ROUND2.md)
+- [Round-2 resolution audit and post-review consistency fixes](REVIEW_ROUND2.md)
 - [Research decisions](RESEARCH_DECISIONS.md)
 - [Architecture](ARCHITECTURE.md)
 - [Implementation plan](IMPLEMENTATION_PLAN.md)
@@ -178,4 +203,4 @@ iptables rules can survive daemon death. If the long-lived daemon channel breaks
 
 ## Approval boundary
 
-This design is approved to begin **Phase 0 feasibility work only**. UI, production firewall integration and release code remain blocked until the Phase 0 exit criteria pass.
+This design is approved to begin **Phase 0 feasibility work only**. UI, production firewall integration and release code remain blocked until Phase 0 exit criteria pass.
