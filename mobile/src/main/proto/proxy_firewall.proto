@@ -1,0 +1,96 @@
+// Step 9 — Explicit proxy firewall protocol
+// Sketch: docs/proxy-only/sketches/09-firewall-proto.md
+//
+// Daemon-side proxy-firewall configuration message.
+// Deny state is EXPLICIT for both address families.
+// VerifiedUdpReturnPolicy is absent until Phase 0 evidence is collected (Step 8).
+//
+// Implementation rules (Phase 6):
+//   - Reuse IptablesRule / IptablesChain from routing/iptables.rs
+//   - Use applied ledger and delete_repeated()
+//   - Integrate proxy chains into firewall_cleanup::clean()
+//   - IPv4 allow requires interface + IP + MAC; IPv4 chain ends in REJECT
+//   - IPv6 rejects entire listener/UDP range
+//   - No broad VPN-interface allow
+//   - deny_all_ipv4 / deny_all_ipv6 are explicit fields — an empty
+//     allowed_clients list is NOT the deny-state signal
+
+syntax = "proto3";
+
+package vpnhotspot.proxy;
+
+option java_package = "be.mygod.vpnhotspot.proxy.proto";
+option java_outer_classname = "ProxyFirewallProto";
+option optimize_for = LITE_RUNTIME;
+
+// ---------------------------------------------------------------------------
+// Main configuration message
+// ---------------------------------------------------------------------------
+
+message ProxyFirewallConfig {
+  // Tethering downstreams; each entry supplies the interface name and any
+  // known IPv4 addresses of the downstream interface itself.
+  repeated ProxyDownstream downstreams = 1;
+
+  // SOCKS5 TCP listener port.
+  uint32 tcp_port = 2;
+
+  // UDP relay port range (inclusive).
+  uint32 udp_port_range_start = 3;
+  uint32 udp_port_range_end = 4;
+
+  // Per-client allow rules. Must include MAC + IPv4 for each allowed client.
+  // An empty list is NOT a deny signal — use deny_all_ipv4 / deny_all_ipv6.
+  repeated ProxyClient allowed_clients = 5;
+
+  // Monotonically increasing generation counter.  The daemon uses this to
+  // detect and reject stale replacements.
+  uint64 generation = 6;
+
+  // Explicit deny flags. Both must be set to true in the deny-all (startup)
+  // configuration before allow rules are committed.
+  bool deny_all_ipv4 = 7;
+  bool deny_all_ipv6 = 8;
+
+  // UDP return-path policy. Absent until Phase 0 topology evidence proves
+  // the exact semantics (see sketches/08-udp-topology.md).
+  optional VerifiedUdpReturnPolicy udp_return_policy = 9;
+}
+
+// ---------------------------------------------------------------------------
+// Downstream tethering interface descriptor
+// ---------------------------------------------------------------------------
+
+message ProxyDownstream {
+  // Linux interface name (e.g. "wlan1", "usb0").
+  string interface_name = 1;
+
+  // IPv4 addresses of this interface (packed big-endian 4-byte strings).
+  // Required for IPv4 allow rules (interface + IP + MAC).
+  repeated bytes ipv4_addresses = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Allowed client (MAC + IPv4 binding)
+// ---------------------------------------------------------------------------
+
+message ProxyClient {
+  // 6-byte MAC address.
+  bytes mac = 1;
+
+  // Known IPv4 addresses for this client (packed big-endian 4-byte strings).
+  repeated bytes ipv4 = 2;
+}
+
+// ---------------------------------------------------------------------------
+// UDP return-path policy — placeholder, populated after Phase 0
+// ---------------------------------------------------------------------------
+
+message VerifiedUdpReturnPolicy {
+  // Human-readable summary of the Phase 0 evidence justifying this policy.
+  string evidence_summary = 1;
+
+  // Whether to allow RELATED conntrack state in addition to ESTABLISHED
+  // for UDP return flows.
+  bool allow_related = 2;
+}
