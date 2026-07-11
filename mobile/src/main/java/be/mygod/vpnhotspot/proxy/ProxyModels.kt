@@ -292,8 +292,11 @@ fun canonicalizeMac(mac: String): String? {
  */
 fun isValidInterfaceName(name: String): Boolean {
     if (name.isEmpty() || name.length > 15) return false
+    // R6 fix #7: explicit ASCII ranges — isLetterOrDigit() accepts Unicode which
+    // violates the byte-based Linux IFNAMSIZ contract and could allow names that
+    // pass the 15-char check while exceeding the byte limit.
     return name.all { c ->
-        c.isLetterOrDigit() || c == '_' || c == '-' || c == '.' || c == ':' || c == '@'
+        (c in 'A'..'Z') || (c in 'a'..'z') || (c in '0'..'9') || c in "_-.:@"
     }
 }
 

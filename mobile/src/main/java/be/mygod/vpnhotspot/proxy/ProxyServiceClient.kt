@@ -30,7 +30,21 @@ internal const val CLEANUP_STEP_TIMEOUT_MS = 10_000L
 
 @JvmInline value class ProxyServiceHandle(val id: Long)
 @JvmInline value class ProxyBackendHandle(val id: Long)
-@JvmInline value class ProxyFirewallHandle(val id: Long)
+/**
+ * R6 fix: epoch-qualified firewall handle.
+ *
+ * [epoch] is the daemon-acknowledged sanitation epoch returned by
+ * [ProxyFirewallClient.cleanOrDenyBeforeRestart] at the time this handle was
+ * issued. The controller tags every handle with the [sanitizedEpoch] at the
+ * moment the firewall runtime was started.
+ *
+ * A handle is stale iff its epoch is strictly less than the controller's current
+ * [sanitizedEpoch]. Handles from an unknown epoch (sanitizedEpoch == null) are
+ * treated as stale and require a new sanitation cycle.
+ *
+ * Not an @JvmInline value class because value classes may not have multiple fields.
+ */
+data class ProxyFirewallHandle(val epoch: Long, val id: Long)
 
 // ---------------------------------------------------------------------------
 // Report types
