@@ -20,28 +20,36 @@ import kotlin.math.min
 import kotlin.random.Random
 
 // ---------------------------------------------------------------------------
-// Step 6 + Step 10 — ProxyOnlyController (R6-corrected)
+// Step 6 + Step 10 — ProxyOnlyController (R7-corrected)
 //
-// R6 fixes applied over R5 baseline:
-//   Blocker #1: CleanupDebt no longer has firewallHandleGeneration; epoch is in
-//               ProxyFirewallHandle(epoch, id). All construction sites updated.
-//   Blocker #2: On sanitation failure (null return), cleanupApplied() is called
-//               immediately to contain any active listener before publishing the
-//               failure state. Listener is never left running without containment.
-//   Blocker #3: Epoch-based handle provenance replaces daemon-generation-only
-//               tracking. Controller tracks sanitizedEpoch: Long? as the last
-//               daemon-acknowledged epoch. Handle staleness: handle.epoch < epoch.
-//               AppliedProxyState.firewallDaemonGeneration removed; epoch carried
-//               in the handle itself. Firewall handles tagged with sanitizedEpoch
-//               at start time.
-//   High #6:    cleanupApplied() null-sanitizedEpoch path now sets daemonCleanPending
-//               instead of wrongly resolving by dominance.
-//   High #7:    ASCII interface validation fixed in ProxyModels.kt.
-//   High #9:    retryCleanupDebtSafely() uses local accumulators for all mutable
-//               controller-state transitions; commits atomically at end, after the
-//               combined debt is computed (so an invariant failure in mergeUnresolved
-//               leaves controller state fully consistent with the pre-transaction
-//               values).
+// R7 fixes applied over R6 baseline:
+//
+//   Blocker #1 (epoch not overwritten): firewall.start() return value is
+//     validated against (sanitizedSessionId, sanitizedEpoch) rather than
+//     rewritten via .copy(). If the daemon returns a mismatched handle the
+//     controller fails closed without starting the backend.
+//
+//   Blocker #2 (exact epoch equality): cleanupApplied() and retryCleanupDebt-
+//     Safely() use == comparison for both sessionId and epoch. A handle with
+//     a future (>) or conflicting epoch is treated identically to an unknown-
+//     provenance handle: no IPC, daemonCleanPending = true.
+//
+//   Blocker #3 (collision-safe handles): ProxyFirewallHandle(sessionId, epoch,
+//     id) is the authoritative identity triple. cleanOrDenyBeforeRestart()
+//     returns SanitationResult(sessionId, epoch). The controller tracks both
+//     sanitizedSessionId and sanitizedEpoch so that a restarted daemon with
+//     the same epoch number cannot validate old handles.
+//
+//   Blocker #4 (applied cleared too early): applied = null is moved to AFTER
+//     the full CleanupOutcome is constructed. If mergeUnresolved() throws, the
+//     applied state is still set so recoverSafely() → cleanupApplied() retries
+//     with the same handles. Second-attempt IPC calls are idempotent.
+//
+//   High #8 (service notification after sanitation failure): sanitation null-
+//     return path now calls enterWaitingIfActive(state) before returning.
+//
+//   High #9 (./ .. interface names): isValidInterfaceName() rejects "." and
+//     ".." (fixed in ProxyModels.kt).
 // ---------------------------------------------------------------------------
 
 private const val TRANSACTION_TIMEOUT_MS = 30_000L
@@ -85,26 +93,33 @@ class ProxyOnlyController(
     private val latestSnapshot = AtomicReference<DesiredProxyState?>(null)
 
     /**
-     * Which daemon generation was last successfully sanitized.
-     * Non-null after [ProxyFirewallClient.cleanOrDenyBeforeRestart] succeeds for
-     * the current daemon. Reset to null when the daemon becomes unavailable or a
-     * different generation is observed (gate triggers re-sanitation).
+     * Which controller-observed daemon generation was last sanitized.
+     * Used to detect when the daemon restarts (different generation → re-sanitize).
+     * Not the same as [sanitizedSessionId]: this is the Kotlin-side generation
+     * counter from [DesiredProxyState.daemonGeneration]; [sanitizedSessionId] is
+     * the authoritative identity from the daemon's [SanitationResult].
      */
     private var sanitizedDaemonGeneration: Long? = null
 
     /**
-     * R6: The daemon-acknowledged epoch from the most recent successful
+     * R7: daemon-issued session identity from the last successful
      * [ProxyFirewallClient.cleanOrDenyBeforeRestart] call.
      *
-     * Handle provenance: a [ProxyFirewallHandle] with epoch strictly less than
-     * this value belongs to a prior sanitation cycle and must not be submitted
-     * to the current daemon. Unknown provenance (this field is null) is treated
-     * identically to stale — it requires a new sanitation cycle (daemonCleanPending).
+     * A [ProxyFirewallHandle] is current iff its sessionId == this value AND
+     * its epoch == [sanitizedEpoch]. Any other combination is either dominated
+     * (same session, lower epoch) or a conflict requiring re-sanitation.
      *
-     * Reset to null whenever the daemon becomes unavailable or a different
-     * daemon generation is observed (before the re-sanitation IPC call, so that
-     * any handles in applied state are treated as unknown-provenance during the
-     * cleanupApplied call that follows on sanitation failure).
+     * Reset to null when the daemon becomes unavailable or a new daemon
+     * generation is observed (before IPC, so handles become unknown-provenance).
+     */
+    private var sanitizedSessionId: Long? = null
+
+    /**
+     * R6/R7: daemon-acknowledged sanitation epoch from the last successful
+     * [ProxyFirewallClient.cleanOrDenyBeforeRestart] call.
+     *
+     * Together with [sanitizedSessionId] this forms the complete handle identity.
+     * Reset to null in the same situations as [sanitizedSessionId].
      */
     private var sanitizedEpoch: Long? = null
 
@@ -162,13 +177,10 @@ class ProxyOnlyController(
     // -----------------------------------------------------------------------
     // Reconciliation
     //
-    // R5 fix #1: daemon sanitation gate is FIRST (before debt retry).
-    // R6 blocker #2: sanitation failure contains listener before publishing.
-    // R6 blocker #3: sanitizedEpoch tracks per-sanitation epoch, not just
-    //                daemon generation. Epoch is reset before re-sanitation IPC
-    //                so that any handle in applied state is correctly treated as
-    //                unknown-provenance during the cleanupApplied that follows on
-    //                sanitation failure.
+    // Ordering:
+    //   1. Daemon sanitation gate (before debt retry).
+    //   2. Existing cleanup debt retry.
+    //   3. New runtime startup (deny-first → probe → allow).
     // -----------------------------------------------------------------------
 
     private suspend fun reconcile(next: DesiredProxyState) {
@@ -197,11 +209,11 @@ class ProxyOnlyController(
             }
         }
 
-        // ── R5/R6: Daemon sanitation gate — BEFORE debt retry ──────────────
+        // ── Daemon sanitation gate — BEFORE debt retry ──────────────────────
         if (!next.daemonHealthy || next.daemonGeneration == null) {
-            // Daemon unavailable: invalidate both sanitation markers so the
-            // next healthy snapshot triggers a fresh cleanOrDenyBeforeRestart.
+            // Daemon unavailable: invalidate all sanitation markers.
             sanitizedDaemonGeneration = null
+            sanitizedSessionId = null
             sanitizedEpoch = null
             withContext(NonCancellable) {
                 val outcome = cleanupApplied("daemon unavailable", daemonAvailable = false)
@@ -216,16 +228,18 @@ class ProxyOnlyController(
         }
 
         if (sanitizedDaemonGeneration != next.daemonGeneration) {
-            // R6 blocker #3: Reset epoch BEFORE the IPC call so that if the call
-            // fails or we call cleanupApplied, handles in applied state are
-            // treated as unknown-provenance (requires daemonCleanPending).
+            // R6/R7: Reset epoch AND session ID BEFORE the IPC call so that any
+            // handle currently in applied state is unknown-provenance (requires
+            // daemonCleanPending) during the cleanupApplied on failure.
+            sanitizedSessionId = null
             sanitizedEpoch = null
 
-            val epoch = firewall.cleanOrDenyBeforeRestart()
-            if (epoch == null) {
-                // R6 blocker #2: Contain any active listener BEFORE publishing
-                // the failure. Do not leave the listener running while the new
-                // daemon's state is unconfirmed.
+            val result = firewall.cleanOrDenyBeforeRestart()
+            if (result == null) {
+                // R6 blocker #2 / R7 High #8:
+                //   1. Contain any active listener first (cleanupApplied handles this).
+                //   2. Update the foreground notification (enterWaitingIfActive).
+                //   3. Publish failure state.
                 withContext(NonCancellable) {
                     val outcome = cleanupApplied("sanitation failed", daemonAvailable = false)
                     mergeDebt(outcome.debt)
@@ -249,19 +263,22 @@ class ProxyOnlyController(
                     ?: ProxyOnlyState.FailClosed(
                         FailClosedReason.StartupSanitationFailed("cleanOrDenyBeforeRestart returned null")
                     )
+                // R7 High #8: move foreground notification to waiting before returning.
+                enterWaitingIfActive(state)
                 publishSafely(state)
                 cleanupDebt?.let(::scheduleDebtRetry)
                 return
             }
-            firewallGeneration = AtomicLong(epoch)
-            // R5/R6: record both generation and epoch after successful sanitation.
+
+            firewallGeneration = AtomicLong(result.epoch)
             sanitizedDaemonGeneration = next.daemonGeneration
-            sanitizedEpoch = epoch
+            sanitizedSessionId = result.sessionId
+            sanitizedEpoch = result.epoch
         }
         // ── End sanitation gate ──────────────────────────────────────────────
 
-        // Now retry existing cleanup debt — stale handles are dominated by
-        // the completed sanitation above.
+        // Retry existing cleanup debt. Stale handles are dominated or conflict-
+        // detected against the committed (sanitizedSessionId, sanitizedEpoch).
         cleanupDebt?.let {
             retryCleanupDebtSafely()
             cleanupDebt?.let { unresolved ->
@@ -333,17 +350,33 @@ class ProxyOnlyController(
 
         publishSafely(ProxyOnlyState.StartingBackend)
 
-        // R6 blocker #3: AppliedProxyState no longer needs firewallDaemonGeneration;
-        // epoch provenance is carried in ProxyFirewallHandle.epoch.
+        // R7 blocker #4: applied = null happens inside cleanupApplied() AFTER
+        // the debt is successfully constructed. Set applied BEFORE IPC so that
+        // if an exception escapes, cleanupApplied() will see the partial state.
         val partial = AppliedProxyState(key = key)
         applied = partial
 
-        // R6 blocker #3: tag the handle with the current sanitizedEpoch so that
-        // cleanupApplied can later assess staleness correctly. sanitizedEpoch is
-        // guaranteed non-null here (we passed the sanitation gate above).
-        partial.firewall = firewall.start(
+        // R7 blocker #1: Do NOT manufacture handle provenance with .copy().
+        // Call start() and validate the returned (sessionId, epoch) against the
+        // controller's committed sanitation markers. Both must match exactly.
+        val returnedHandle = firewall.start(
             next.firewallConfig(denyAll = true, generationCounter = firewallGeneration)
-        ).copy(epoch = sanitizedEpoch!!)
+        )
+        if (returnedHandle.sessionId != sanitizedSessionId || returnedHandle.epoch != sanitizedEpoch) {
+            withContext(NonCancellable) {
+                transitionAfterExpectedProbeFailure(
+                    ProxyOnlyState.FailClosed(
+                        FailClosedReason.StartupSanitationFailed(
+                            "firewall.start returned (session=${returnedHandle.sessionId}, " +
+                                "epoch=${returnedHandle.epoch}) but expected " +
+                                "(session=$sanitizedSessionId, epoch=$sanitizedEpoch)"
+                        )
+                    )
+                )
+            }
+            return
+        }
+        partial.firewall = returnedHandle
 
         val credentials = try {
             credentialProvider.credentials()
@@ -414,42 +447,48 @@ class ProxyOnlyController(
     // -----------------------------------------------------------------------
     // Cleanup creation — fully local transaction.
     //
-    // R6 blocker #3 / High #6: epoch-based handle provenance.
+    // R7 blocker #2: exact (sessionId, epoch) equality determines whether a
+    // handle is current, dominated, or a conflict. See cases A–D below.
     //
-    // Three cases for the firewall handle (current.firewall):
-    //   A. sanitizedEpoch == null: not yet sanitized — unknown provenance.
-    //      Sets daemonCleanPending = true. No IPC. Handle NOT carried in debt.
-    //   B. handle.epoch < sanitizedEpoch: dominated by current sanitation.
-    //      Resolved without IPC. Handle NOT carried in debt.
-    //   C. handle.epoch >= sanitizedEpoch: current epoch — can call IPC.
-    //      Carries handle in debt if IPC fails or daemon unavailable.
+    // R7 blocker #4: applied = null is set ONLY after the full CleanupOutcome
+    // has been constructed (after mergeUnresolved). If mergeUnresolved() throws,
+    // applied is still set so a retry of this function (from recoverSafely) can
+    // attempt cleanup again. Second-attempt IPC calls are idempotent.
     //
-    // High #6 fix: case A now correctly sets daemonCleanPending rather than
-    // resolving by "dominance" (old code treated null sanitizedDaemonGeneration
-    // as a dominance signal, which was wrong).
+    // Handle disposition:
+    //   A. (sessionId == sId && epoch == sEpoch) → current: IPC allowed.
+    //   B. (sessionId == sId && epoch <  sEpoch) → dominated: resolved, no IPC.
+    //   C. (sessionId == sId && epoch >  sEpoch) → future conflict: no IPC,
+    //        daemonCleanPending = true.
+    //   D. (sessionId != sId || sId == null)     → wrong session: no IPC,
+    //        daemonCleanPending = true.
+    //   (B = "safely dominated by sanitation of the same session")
     // -----------------------------------------------------------------------
 
     private suspend fun cleanupApplied(
         reason: String,
         daemonAvailable: Boolean,
     ): CleanupOutcome {
-        val current = applied ?: return CleanupOutcome(CleanupReport.noOp("nothing applied"), null)
-        applied = null
+        val current = applied
+            ?: return CleanupOutcome(CleanupReport.noOp("nothing applied"), null)
+        // R7 blocker #4: do NOT clear applied here. It is cleared after the
+        // CleanupOutcome is fully constructed (see bottom of this function).
+
         val acc = CleanupAccumulator(reporter)
-
         val fw = current.firewall
-        val epoch = sanitizedEpoch
-        // Case A: epoch unknown → need daemon clean; no IPC on stale handle.
-        // Case B: handle epoch < sanitized epoch → dominated; no IPC.
-        // Case C: handle epoch >= sanitized epoch → current; IPC allowed.
-        val firewallCurrent = fw != null && epoch != null && fw.epoch >= epoch
-        val firewallDominated = fw != null && epoch != null && fw.epoch < epoch
-        val firewallUnknown = fw != null && epoch == null  // case A
+        val sId = sanitizedSessionId
+        val sEpoch = sanitizedEpoch
 
-        var denyResolved = fw == null || firewallDominated  // dominated counts as resolved
+        val sameSession = fw != null && sId != null && fw.sessionId == sId
+        val firewallCurrent = sameSession && sEpoch != null && fw!!.epoch == sEpoch    // case A
+        val firewallDominated = sameSession && sEpoch != null && fw!!.epoch < sEpoch   // case B
+        // Cases C and D: conflict or wrong session → cannot safely IPC
+        val firewallNeedsClean = fw != null && !firewallCurrent && !firewallDominated
+
+        var denyResolved = fw == null || firewallDominated
         var firewallResolved = fw == null || firewallDominated
 
-        // Case C only: attempt denyAll IPC.
+        // Case A only: attempt denyAll IPC before stopping backend.
         if (firewallCurrent && daemonAvailable) {
             val denied = acc.stepSucceeded("deny") { firewall.denyAll(fw!!) }
             if (denied) denyResolved = true
@@ -470,26 +509,25 @@ class ProxyOnlyController(
             emergencyDebt = outcome.debt
         }
 
-        // Case C only: attempt stop IPC after listener is contained.
+        // Case A only: stop IPC after listener is contained.
         if (firewallCurrent && daemonAvailable) {
             val stopped = acc.stepSucceeded("firewall_stop") { firewall.stop(fw!!) }
             if (stopped) {
                 firewallResolved = true
-                denyResolved = true // §D: stop subsumes deny
+                denyResolved = true  // §D: stop subsumes deny
             }
         }
 
         val primaryDebt = CleanupDebt(
             listenerClosePending = !listenerResolved,
             serviceHandlePending = current.service.takeUnless { serviceResolved },
-            // Carry handle in debt only when it is current-epoch and not yet stopped.
+            // Carry handle in debt only for case A (current epoch) + not yet resolved.
             firewallHandlePending = if (firewallCurrent && !firewallResolved) fw else null,
             firewallDenyPending = firewallCurrent && !denyResolved,
             firewallStopPending = firewallCurrent && !firewallResolved,
-            // Case A: unknown provenance — must re-sanitize before any new runtime.
-            // Case B: dominated — already resolved, no pending.
-            // Case C + daemon unavailable: handle stays in debt above, not here.
-            daemonCleanPending = firewallUnknown,
+            // Cases C, D: conflict/unknown session → require daemon sanitation.
+            // Case B: dominated → already safe, no pending needed.
+            daemonCleanPending = firewallNeedsClean,
             featureStopPending = false,
             serviceWasActivated = serviceActivated,
             failures = acc.failures.toList(),
@@ -497,6 +535,8 @@ class ProxyOnlyController(
             attempt = 0,
         ).takeUnless { it.isResolved }
 
+        // This may throw (mergeUnresolved require() violation). applied is still
+        // set at this point; any exception will be caught by recoverSafely().
         val combinedDebt = when {
             primaryDebt != null && emergencyDebt != null ->
                 primaryDebt.mergeUnresolved(emergencyDebt)
@@ -508,19 +548,20 @@ class ProxyOnlyController(
             else -> null
         }
 
+        // R7 blocker #4: clear applied only after a complete, non-throwing result.
+        applied = null
         return CleanupOutcome(acc.report(), combinedDebt)
     }
 
     // -----------------------------------------------------------------------
     // Cleanup debt retry — single local transaction with atomic state commit.
     //
-    // R5 fix #1: stale firewall handles dominated by epoch check.
-    // R6 High #9: local accumulators for all mutable controller-state transitions.
-    //   All changes to serviceActivated / firewallGeneration / sanitizedEpoch /
-    //   sanitizedDaemonGeneration are held in local variables and committed
-    //   atomically AFTER the combined-debt computation. If mergeUnresolved()
-    //   throws an invariant failure, controller state remains at its pre-transaction
-    //   values and the preserved debt is retried next cycle.
+    // R7 blocker #2: exact (sessionId, epoch) equality for current handles;
+    //   dominated = same session, epoch < sanitizedEpoch (resolved without IPC);
+    //   conflict/wrong session = daemonCleanPending required.
+    //
+    // R6 High #9: local accumulators committed atomically after combined-debt
+    //   computation. Controller state is unchanged if mergeUnresolved() throws.
     // -----------------------------------------------------------------------
 
     private suspend fun retryCleanupDebtSafely() {
@@ -528,9 +569,10 @@ class ProxyOnlyController(
         val failures = mutableListOf<CleanupFailure>()
         val daemonHealthy = latestSnapshot.get()?.daemonHealthy == true
 
-        // R6 High #9: local accumulators — committed atomically at the bottom.
+        // Local accumulators — committed atomically at the bottom.
         var newServiceActivated = serviceActivated
-        var newFirewallGenerationEpoch: Long? = null   // non-null → update firewallGeneration
+        var newFirewallGenerationEpoch: Long? = null
+        var newSanitizedSessionId: Long? = sanitizedSessionId
         var newSanitizedEpoch: Long? = sanitizedEpoch
         var newSanitizedDaemonGen: Long? = sanitizedDaemonGeneration
 
@@ -569,32 +611,42 @@ class ProxyOnlyController(
             emergencyOutcomeDebt = outcome.debt
         }
 
-        // R6 blocker #3: epoch-based handle staleness.
-        // Uses newSanitizedEpoch (pre-daemon_clean): the handle from a prior
-        // sanitation cycle is resolved here; if daemon_clean succeeds later it
-        // will update newSanitizedEpoch for the NEXT retry cycle.
+        // R7 blocker #2: classify handle by (sessionId, epoch) against
+        // the LOCAL accumulators (pre-daemon_clean values at this point).
         var firewallHandle = debt.firewallHandlePending
         var denyPending = debt.firewallDenyPending
         var stopPending = debt.firewallStopPending
 
-        val handleStale = firewallHandle != null && (
-            newSanitizedEpoch == null ||                     // no confirmed sanitation
-            firewallHandle!!.epoch < newSanitizedEpoch!!     // dominated by newer epoch
-        )
+        val handleSameSession = firewallHandle != null &&
+            newSanitizedSessionId != null &&
+            firewallHandle!!.sessionId == newSanitizedSessionId
+        val handleCurrent = handleSameSession &&
+            newSanitizedEpoch != null &&
+            firewallHandle!!.epoch == newSanitizedEpoch
+        // Dominated = same session, epoch strictly less than current epoch.
+        // The sanitation that produced the current epoch installed deny-all
+        // atomically for the old handle; no further IPC is needed.
+        val handleDominated = handleSameSession &&
+            newSanitizedEpoch != null &&
+            firewallHandle!!.epoch < newSanitizedEpoch
+        val handleStale = firewallHandle != null && !handleCurrent
+
+        var daemonCleanPending = debt.daemonCleanPending
+
         if (handleStale) {
-            // If epoch is unknown (not sanitized), we still need a daemon clean.
-            if (newSanitizedEpoch == null) {
-                // daemonCleanPending is already in the debt or will be set below;
-                // make sure we don't forget it.
-            }
+            // Conflict or wrong/unknown session: cannot prove containment without
+            // a new sanitation cycle. Dominated (same session, older epoch) is
+            // the only case where IPC is unnecessary and sanitation is not required.
+            if (!handleDominated) daemonCleanPending = true
             firewallHandle = null
             denyPending = false
             stopPending = false
-        } else {
-            if (firewallHandle != null && daemonHealthy && denyPending) {
+        } else if (firewallHandle != null) {
+            // Handle is current — (sessionId, epoch) == (sanitizedSessionId, sanitizedEpoch).
+            if (daemonHealthy && denyPending) {
                 if (attempt("deny") { firewall.denyAll(firewallHandle!!) }) denyPending = false
             }
-            if (firewallHandle != null && daemonHealthy && stopPending) {
+            if (daemonHealthy && stopPending) {
                 if (attempt("firewall_stop") { firewall.stop(firewallHandle!!) }) {
                     stopPending = false
                     firewallHandle = null
@@ -603,12 +655,8 @@ class ProxyOnlyController(
             }
         }
 
-        var daemonCleanPending = debt.daemonCleanPending
-        // Also require daemonClean if epoch was unknown and handle was stale.
-        if (handleStale && newSanitizedEpoch == null) daemonCleanPending = true
-
         if (daemonCleanPending && daemonHealthy) {
-            val epoch = try {
+            val result = try {
                 withTimeoutOrNull(CLEANUP_STEP_TIMEOUT_MS) { firewall.cleanOrDenyBeforeRestart() }
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -616,10 +664,11 @@ class ProxyOnlyController(
                 failures += CleanupFailure("daemon_clean", t)
                 null
             }
-            if (epoch != null) {
+            if (result != null) {
                 daemonCleanPending = false
-                newFirewallGenerationEpoch = epoch
-                newSanitizedEpoch = epoch
+                newFirewallGenerationEpoch = result.epoch
+                newSanitizedEpoch = result.epoch
+                newSanitizedSessionId = result.sessionId
                 newSanitizedDaemonGen = latestSnapshot.get()?.daemonGeneration
             } else if (failures.none { it.step == "daemon_clean" }) {
                 failures += CleanupFailure("daemon_clean",
@@ -631,7 +680,7 @@ class ProxyOnlyController(
         if (featureStopPending && newServiceActivated && serviceHandle == null && !listenerPending) {
             if (attempt("feature_stop") { service.stopFeature("cleanup debt retry") }) {
                 featureStopPending = false
-                newServiceActivated = false  // local — committed below
+                newServiceActivated = false
             }
         }
 
@@ -647,10 +696,7 @@ class ProxyOnlyController(
             attempt = debt.attempt + 1,
         )
 
-        // R6 High #9: compute combined debt BEFORE committing state.
-        // If mergeUnresolved() throws an invariant failure, no controller state
-        // has been mutated yet. The catch in scheduleDebtRetry() will preserve
-        // the pre-transaction cleanupDebt and reschedule.
+        // Compute combined debt BEFORE committing state (mergeUnresolved may throw).
         val combined = if (emergencyOutcomeDebt != null && !updated.isResolved) {
             updated.mergeUnresolved(emergencyOutcomeDebt)
                 .copy(generation = nextDebtGeneration++, attempt = 0)
@@ -665,16 +711,12 @@ class ProxyOnlyController(
         serviceActivated = newServiceActivated
         newFirewallGenerationEpoch?.let { firewallGeneration = AtomicLong(it) }
         sanitizedEpoch = newSanitizedEpoch
+        sanitizedSessionId = newSanitizedSessionId
         sanitizedDaemonGeneration = newSanitizedDaemonGen
     }
 
     // -----------------------------------------------------------------------
     // Debt retry scheduler
-    //
-    // R5 fix #3: top-level failure boundary preserves debt on invariant exceptions.
-    // R5 fix #7: retryJob cleared to null inside stateMutex before the transaction
-    //            begins, so scheduleDebtRetry() called from within does not
-    //            self-cancel the executing job.
     // -----------------------------------------------------------------------
 
     private fun scheduleDebtRetry(debt: CleanupDebt) {
@@ -684,8 +726,8 @@ class ProxyOnlyController(
             try {
                 stateMutex.withLock {
                     // R5 fix #7: clear self-reference before work so that
-                    // scheduleDebtRetry() called from within this block does not
-                    // cancel this (already-executing, non-suspending) coroutine.
+                    // scheduleDebtRetry() called from within does not cancel
+                    // this (already-executing) coroutine.
                     retryJob = null
 
                     try {
@@ -695,21 +737,15 @@ class ProxyOnlyController(
                             publishDebt(unresolved)
                             scheduleDebtRetry(unresolved)
                         } else {
-                            // Debt cleared: nudge reconciliation.
                             latestSnapshot.get()
                                 ?.let { events.trySend(ControllerEvent.Snapshot(it)) }
                         }
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (t: Throwable) {
-                        // R5 fix #3: top-level failure boundary.
-                        // An ordinary exception (e.g. mergeUnresolved require() violation)
-                        // must not kill the retry job permanently. Preserve the
-                        // pre-transaction debt, append a typed supervisor failure and
-                        // reschedule with bounded backoff.
-                        // R6 High #9: cleanupDebt is NOT mutated until the bottom of
-                        // retryCleanupDebtSafely(), so the pre-transaction value is
-                        // preserved when the invariant exception is thrown.
+                        // Top-level failure boundary: preserve pre-transaction debt.
+                        // R7 High #9: cleanupDebt is only committed at the bottom
+                        // of retryCleanupDebtSafely(); pre-transaction value is intact.
                         safeReport("proxy.cleanup_retry.transaction", t)
                         val preserved = cleanupDebt
                         if (preserved != null) {
@@ -724,9 +760,7 @@ class ProxyOnlyController(
                         }
                     }
                 }
-            } catch (_: CancellationException) {
-                // Cancelled externally (newer scheduleDebtRetry call) — OK.
-            }
+            } catch (_: CancellationException) { }
         }
     }
 
@@ -830,7 +864,6 @@ class ProxyOnlyController(
                 }
             }
         }
-        // Retries run directly in cleanupScope (survive worker exit).
         cleanupDebt?.let(::scheduleDebtRetry)
     }
 

@@ -292,6 +292,10 @@ fun canonicalizeMac(mac: String): String? {
  */
 fun isValidInterfaceName(name: String): Boolean {
     if (name.isEmpty() || name.length > 15) return false
+    // R7 fix: explicitly reject path-special names. The '.' and '..' names pass
+    // the character-class check (because '.' is in the allowed set) but must never
+    // be submitted as interface identifiers.
+    if (name == "." || name == "..") return false
     // R6 fix #7: explicit ASCII ranges — isLetterOrDigit() accepts Unicode which
     // violates the byte-based Linux IFNAMSIZ contract and could allow names that
     // pass the 15-char check while exceeding the byte limit.

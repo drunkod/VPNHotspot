@@ -31,20 +31,41 @@ internal const val CLEANUP_STEP_TIMEOUT_MS = 10_000L
 @JvmInline value class ProxyServiceHandle(val id: Long)
 @JvmInline value class ProxyBackendHandle(val id: Long)
 /**
- * R6 fix: epoch-qualified firewall handle.
+ * R6/R7: epoch-qualified, session-qualified firewall runtime handle.
  *
- * [epoch] is the daemon-acknowledged sanitation epoch returned by
- * [ProxyFirewallClient.cleanOrDenyBeforeRestart] at the time this handle was
- * issued. The controller tags every handle with the [sanitizedEpoch] at the
- * moment the firewall runtime was started.
+ * All three fields must be returned by the daemon in the start-acknowledgement
+ * response; the controller MUST NOT manufacture them locally (no `.copy()`).
  *
- * A handle is stale iff its epoch is strictly less than the controller's current
- * [sanitizedEpoch]. Handles from an unknown epoch (sanitizedEpoch == null) are
- * treated as stale and require a new sanitation cycle.
+ * Identity invariant:
+ *   - [sessionId] uniquely identifies the daemon boot session. It changes on
+ *     every daemon process restart and must never repeat (in practice: the daemon
+ *     issues a monotonically increasing, crash-persistent counter).
+ *   - [epoch] is the sanitation epoch within a session, issued by
+ *     [ProxyFirewallClient.cleanOrDenyBeforeRestart] and returned in every
+ *     subsequent start-acknowledgement for that session.
+ *   - [id] is the runtime-specific identity within one epoch.
+ *
+ * A handle is current iff (sessionId, epoch) == controller's (sanitizedSessionId,
+ * sanitizedEpoch). Any other (sessionId, epoch) combination is either dominated
+ * (same session, lower epoch → sanitation already covered it) or a conflict
+ * requiring re-sanitation (different session, or epoch > sanitizedEpoch).
  *
  * Not an @JvmInline value class because value classes may not have multiple fields.
  */
-data class ProxyFirewallHandle(val epoch: Long, val id: Long)
+data class ProxyFirewallHandle(val sessionId: Long, val epoch: Long, val id: Long)
+
+/**
+ * Result of [ProxyFirewallClient.cleanOrDenyBeforeRestart].
+ *
+ * [sessionId] is an opaque daemon-session identity that must change on every
+ * daemon process restart and never repeat within a lifetime. Using daemon
+ * generation as the session ID is acceptable for Phase 0 scaffolding.
+ *
+ * [epoch] is the ledger epoch reset by this sanitation. Handles created by
+ * [ProxyFirewallClient.start] after a successful sanitation carry the same
+ * (sessionId, epoch) pair.
+ */
+data class SanitationResult(val sessionId: Long, val epoch: Long)
 
 // ---------------------------------------------------------------------------
 // Report types
@@ -180,19 +201,22 @@ interface ProxyFirewallClient {
     suspend fun stop(handle: ProxyFirewallHandle): CleanupReport
 
     /**
-     * R3/R4 fix: perform idempotent proxy-chain sanitation and atomically reset
+     * R3/R4/R7: perform idempotent proxy-chain sanitation and atomically reset
      * the daemon's generation ledger.
      *
-     * @return The daemon-acknowledged epoch (last accepted base). The controller
-     *         calls `incrementAndGet()` before each transmission, so the first
-     *         sent generation after init is `epoch + 1`. Returns `null` on
-     *         failure; controller must treat null as a fatal startup gate.
+     * @return [SanitationResult] carrying the daemon-acknowledged session ID and
+     *   epoch. Returns `null` on failure; the controller treats null as a fatal
+     *   startup gate that prevents any new runtime from being started.
      *
      * The daemon atomically: (1) installs deny-all, (2) resets its ledger to
-     * reject any generation ≤ epoch from prior app-process lifetimes, and (3)
-     * returns the new epoch. Only a successful non-null return proves containment.
+     * reject any command from prior sessions or epochs, and (3) returns the new
+     * (sessionId, epoch). Only a successful non-null return proves containment.
+     *
+     * The [SanitationResult.sessionId] must change on every daemon process restart
+     * and must never repeat, ensuring that handles from a prior daemon process
+     * cannot match a new session even if the epoch counter is reused.
      */
-    suspend fun cleanOrDenyBeforeRestart(): Long?
+    suspend fun cleanOrDenyBeforeRestart(): SanitationResult?
 }
 
 fun Boolean.asCleanupReport() =
