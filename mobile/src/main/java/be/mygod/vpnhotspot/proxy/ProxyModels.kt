@@ -1,40 +1,29 @@
 package be.mygod.vpnhotspot.proxy
 
 import android.net.Network
+import java.net.Inet4Address
+import java.net.InetAddress
 import java.util.UUID
 
 // ---------------------------------------------------------------------------
 // Step 1 — Settings, state, activation and desired-state models
 // Sketch: docs/proxy-only/sketches/01-models-and-state.md
-// R1 fix #10 / R2 fix #8: ProxyCredentials is NOT a data class — no generated
-//   copy/component methods, no plaintext equality, redacted toString.
 // ---------------------------------------------------------------------------
 
 enum class SharingMode { VPN_ROUTING, PROXY_ONLY }
 
 /**
- * Secret container for SOCKS5 credentials.
- *
- * Intentionally NOT a data class:
- *   - no generated copy(), component1(), component2()
- *   - no automatic equality/hashCode over secret values
- *   - toString() is always redacted
- *
- * Credentials must be fetched immediately before backend start from a
- * [ProxyCredentialProvider]; they must not live in long-lived state objects.
+ * Secret container — NOT a data class.
+ * No generated copy/component methods, no automatic equality over secrets,
+ * always-redacted toString.
  */
 class ProxyCredentials(
     val username: String,
     val password: String,
 ) {
     override fun toString(): String = "ProxyCredentials(username=<redacted>)"
-    // Equality is identity — two separate fetches are not considered equal.
 }
 
-/**
- * Fetches credentials at backend-start time. The controller holds only this
- * provider reference, not the credentials themselves.
- */
 interface ProxyCredentialProvider {
     /** Returns current credentials, or throws if unavailable. */
     fun credentials(): ProxyCredentials
@@ -47,13 +36,10 @@ data class ProxyOnlySettings(
     val udpPortRange: IntRange,
     val maxUdpAssociations: Int,
     val credentialsVersion: Long,
-    // Username and password are NOT stored here; fetched via ProxyCredentialProvider.
+    // Username/password are NOT stored here; fetched via ProxyCredentialProvider.
 )
 
-enum class ActivationSource {
-    USER_ENABLE,
-    USER_RESUME,
-}
+enum class ActivationSource { USER_ENABLE, USER_RESUME }
 
 data class ActivationGrant(
     val id: UUID,
@@ -76,7 +62,7 @@ data class RuntimeKey(
     val udpPortRange: IntRange?,
     val credentialsVersion: Long,
     val vpnNetworkHandle: Long,
-    /** Sorted list of (interfaceName, sortedIpv4Addresses) for stable equality. */
+    /** Sorted list of (interfaceName, sortedCanonicalIpv4) for stable equality. */
     val downstreams: List<Pair<String, List<String>>>,
     val backendVersion: Int,
 )
@@ -91,7 +77,7 @@ sealed interface FailClosedReason {
     data class ProbeReportIncomplete(val missing: Set<ProbeKind>) : FailClosedReason
     data class StartupSanitationFailed(val detail: String) : FailClosedReason
     data class InternalFailure(val category: String) : FailClosedReason
-    /** R2 fix #6: published only when all downstreams lack a routable IPv4 address. */
+    /** Published when all downstreams lack a routable, non-loopback IPv4 address. */
     data object NoReachableDownstreamAddress : FailClosedReason
 }
 
@@ -104,6 +90,7 @@ sealed interface ProxyOnlyState {
     data class MultipleVpnCandidates(val count: Int) : ProxyOnlyState
     data object VpnPermissionDenied : ProxyOnlyState
     data object StartingBackend : ProxyOnlyState
+    /** One endpoint per downstream; never empty. */
     data class Running(val endpoints: List<ProxyEndpoint>) : ProxyOnlyState
     data class FailClosed(val reason: FailClosedReason) : ProxyOnlyState
     data class CleanupDegraded(
@@ -127,52 +114,109 @@ data class DesiredProxyState(
     val daemonGeneration: Long?,
 ) {
     /**
-     * Normalise to prevent irrelevant churn from creating new runtime keys.
-     * R1 fix #12 / R2 fix #9: sort, deduplicate and validate entries.
+     * Normalise to a canonical form that prevents irrelevant churn from
+     * creating new runtime keys.
+     *
+     * R3 fix #4: merge-based deduplication instead of distinctBy.
+     *   - Downstreams with the same interfaceName are merged; the first routable
+     *     IPv4 across all observations is used (so a null-address observation
+     *     cannot discard a later valid one).
+     *   - Clients with the same canonical MAC are merged; IPv4 bindings are
+     *     unioned, validated and sorted.
+     *   - Malformed, loopback and unspecified addresses are rejected.
      */
     fun normalized(): DesiredProxyState = copy(
         downstreams = downstreams
-            .sortedBy { it.interfaceName }
-            .distinctBy { it.interfaceName },
-        allowedClients = allowedClients
-            .map { client ->
-                client.copy(
-                    ipv4Addresses = client.ipv4Addresses.map { it.trim() }
-                        .filter { it.isNotEmpty() }
-                        .distinct()
-                        .sorted()
+            .groupBy { it.interfaceName.trim() }
+            .map { (iface, group) ->
+                ManagedDownstream(
+                    interfaceName = iface,
+                    // Take the first routable address found across all observations.
+                    ipv4Address = group.mapNotNull { it.ipv4Address }
+                        .firstOrNull { isRoutableIpv4(it) },
                 )
             }
-            .sortedBy { it.mac.uppercase() }
-            .distinctBy { it.mac.uppercase() },
+            .sortedBy { it.interfaceName },
+        allowedClients = allowedClients
+            .groupBy { canonicalizeMac(it.mac) }
+            .map { (canonicalMac, group) ->
+                AllowedClient(
+                    mac = canonicalMac,
+                    ipv4Addresses = group.flatMap { it.ipv4Addresses }
+                        .filter { isRoutableIpv4(it) }
+                        .map { normalizeIpv4(it) }
+                        .distinct()
+                        .sorted(),
+                )
+            }
+            .sortedBy { it.mac },
     )
 }
+
+// ---------------------------------------------------------------------------
+// Address validation helpers
+// R3 fix #4: reject loopback, unspecified and malformed addresses.
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns true if [address] is a parseable, non-loopback, non-unspecified
+ * unicast IPv4 address that a tethered client could plausibly reach.
+ */
+fun isRoutableIpv4(address: String): Boolean {
+    return try {
+        val inet = InetAddress.getByName(address.trim())
+        inet is Inet4Address &&
+            !inet.isLoopbackAddress &&
+            !inet.isAnyLocalAddress &&
+            !inet.isMulticastAddress &&
+            !inet.isLinkLocalAddress
+    } catch (_: Exception) {
+        false
+    }
+}
+
+/** Returns the canonical dotted-decimal form of a parseable IPv4 address. */
+fun normalizeIpv4(address: String): String {
+    return try {
+        InetAddress.getByName(address.trim()).hostAddress ?: address.trim()
+    } catch (_: Exception) {
+        address.trim()
+    }
+}
+
+/**
+ * Returns an uppercase colon-separated MAC string for canonical comparison.
+ * Accepts colon-, dash- and plain-hex formats.
+ */
+fun canonicalizeMac(mac: String): String {
+    val hex = mac.trim().replace("[-:]".toRegex(), "").uppercase()
+    return if (hex.length == 12) {
+        hex.chunked(2).joinToString(":")
+    } else {
+        mac.trim().uppercase() // fall back to trimmed upper for unknown format
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stubs
+// ---------------------------------------------------------------------------
 
 sealed interface ControllerEvent {
     data class Snapshot(val state: DesiredProxyState) : ControllerEvent
     data class RetryCleanupDebt(val generation: Long) : ControllerEvent
 }
 
-// ---------------------------------------------------------------------------
-// Placeholder stubs for types referenced above but defined in other files
-// ---------------------------------------------------------------------------
-
-/** Downstream tethering interface with optional IPv4 address. */
 data class ManagedDownstream(
     val interfaceName: String,
     val ipv4Address: String?,
 )
 
-/** Client identified by MAC with optional IPv4 bindings. */
 data class AllowedClient(
     val mac: String,
     val ipv4Addresses: List<String> = emptyList(),
 )
 
-/**
- * Proxy endpoint advertised to a specific tethering downstream.
- * R2 fix #6: one endpoint per downstream; never published as loopback.
- */
+/** One endpoint per tethering downstream; host is a validated routable IPv4. */
 data class ProxyEndpoint(
     val downstreamInterface: String,
     val host: String,

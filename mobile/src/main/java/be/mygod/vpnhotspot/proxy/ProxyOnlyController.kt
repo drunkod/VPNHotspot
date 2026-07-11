@@ -11,31 +11,32 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.min
 import kotlin.random.Random
 
 // ---------------------------------------------------------------------------
-// Step 6 + Step 10 — ProxyOnlyController
-// R1 fixes #1-#13 applied; R2 fixes applied in this revision.
+// Step 6 + Step 10 — ProxyOnlyController (R3-corrected)
 //
-// R2 fixes:
-//   Blocker 1  Compilation: firewallConfig/backendConfig call sites updated;
-//              ProxyCredentialProvider injected into constructor.
-//   Blocker 2  Retry ordering: featureStop only after serviceHandle==null &&
-//              listenerPending==false.
-//   Blocker 3  CancellationException re-thrown in every cleanup helper.
-//   Blocker 4  Emergency debt no longer overwrites merged debt; collected
-//              locally and committed once at end of retry transaction.
-//   Blocker 5  staleHandle() is now a critical failure (in CleanupReport).
-//   High #6    runningState() fails closed with NoReachableDownstreamAddress
-//              when no downstream has a routable IPv4; never publishes 127.0.0.1.
-//   High #7    Firewall generation is scoped to daemonGeneration so it cannot
-//              go backwards across app-process restarts.
-//   High #8    ProxyCredentials is now a non-data class; fetched via provider.
-//   High #9    Normalization deduplicates and trims (in ProxyModels.kt).
-//   High #10   VPN selector merges interface names (in ProxyVpnSelector.kt).
+// R3 fixes applied:
+//   B1  Named argument syntax: all firewallConfig() calls use
+//       `generationCounter = firewallGeneration`.
+//   B1  CancellationException is imported; the credential-fetch catch re-throws it.
+//   B2  withTimeoutOrNull used in attempt() and safeEmergencyClose() so only
+//       the step's own deadline is absorbed; outer CancellationException propagates.
+//   B2  NonCancellable removed from RetryCleanupDebt handling; only specific
+//       finalization sub-paths use NonCancellable.
+//   B3  cleanOrDenyBeforeRestart() now returns Long? (daemon-issued epoch).
+//       firewallGeneration is reset from that epoch, not a locally derived shift.
+//   B4  cleanupApplied() is a fully local transaction: it never calls mergeDebt()
+//       internally; it combines primary + emergency debt locally and returns one
+//       CleanupOutcome. The caller merges once.
+//   B5  Terminal debt retries use cleanupScope (separate from the worker scope)
+//       so they survive after the worker's finally block completes.
+//   B6  Credential-fetch catch re-throws CancellationException before mapping
+//       other failures to InternalFailure.
 // ---------------------------------------------------------------------------
 
 private const val TRANSACTION_TIMEOUT_MS = 30_000L
@@ -55,11 +56,20 @@ class ProxyOnlyController(
     private val service: ProxyServiceClient,
     private val firewall: ProxyFirewallClient,
     private val activationGrants: ActivationGrantConsumer,
-    /** R2 blocker 1: credentials fetched from provider immediately before backend start. */
     private val credentialProvider: ProxyCredentialProvider,
     private val stateSink: ProxyStateSink,
     private val reporter: ProxyErrorReporter,
     private val scope: CoroutineScope,
+    /**
+     * R3 fix #5: cleanup retry jobs are launched into this scope, which must
+     * outlive [scope] so that terminal cleanup debt can still be retried after
+     * the worker coroutine's finally block has completed.
+     *
+     * Production callers should supply a scope tied to the application/service
+     * lifecycle rather than the controller coroutine. Defaults to [scope] for
+     * tests that don't need terminal-retry survival.
+     */
+    private val cleanupScope: CoroutineScope = scope,
 ) {
     private val latestSnapshot = AtomicReference<DesiredProxyState?>(null)
     private var sanitizedDaemonGeneration: Long? = null
@@ -73,10 +83,10 @@ class ProxyOnlyController(
     private var nextDebtGeneration = 1L
 
     /**
-     * R2 high #7: firewall generation counter scoped to daemonGeneration.
-     * When [sanitizedDaemonGeneration] changes, this counter is reset so
-     * values are strictly increasing within a daemon lifetime and cannot go
-     * backwards if the app process restarts while the daemon survives.
+     * R3 fix #3: initialized from the daemon-acknowledged epoch returned by
+     * cleanOrDenyBeforeRestart(), not from a locally shifted value.
+     * Reset on every new daemon generation so values never go backwards
+     * relative to what the daemon has already accepted.
      */
     private var firewallGeneration = AtomicLong(0L)
 
@@ -108,10 +118,11 @@ class ProxyOnlyController(
             when (event) {
                 is ControllerEvent.Snapshot ->
                     withTimeout(TRANSACTION_TIMEOUT_MS) { reconcile(event.state) }
+                // R3 fix #2: RetryCleanupDebt no longer wrapped in NonCancellable.
+                // Individual steps are bounded by withTimeoutOrNull; parent
+                // cancellation propagates naturally.
                 is ControllerEvent.RetryCleanupDebt ->
-                    withContext(NonCancellable) {
-                        withTimeout(TRANSACTION_TIMEOUT_MS) { retryDebtEvent(event) }
-                    }
+                    withTimeout(TRANSACTION_TIMEOUT_MS) { retryDebtEvent(event) }
             }
         } catch (timeout: TimeoutCancellationException) {
             withContext(NonCancellable) { recoverSafely(timeout) }
@@ -218,7 +229,9 @@ class ProxyOnlyController(
             return
         }
         if (sanitizedDaemonGeneration != next.daemonGeneration) {
-            if (!firewall.cleanOrDenyBeforeRestart()) {
+            // R3 fix #3: use daemon-acknowledged epoch from cleanOrDenyBeforeRestart().
+            val epoch = firewall.cleanOrDenyBeforeRestart()
+            if (epoch == null) {
                 mergeDebt(
                     CleanupDebt(
                         listenerClosePending = false,
@@ -231,7 +244,7 @@ class ProxyOnlyController(
                         failures = listOf(
                             CleanupFailure(
                                 "startup_sanitation",
-                                RuntimeException("cleanOrDenyBeforeRestart returned false"),
+                                RuntimeException("cleanOrDenyBeforeRestart returned null"),
                             )
                         ),
                         generation = nextDebtGeneration++,
@@ -240,38 +253,41 @@ class ProxyOnlyController(
                 )
                 val state = cleanupDebt?.let(::debtState)
                     ?: ProxyOnlyState.FailClosed(
-                        FailClosedReason.StartupSanitationFailed("cleanOrDenyBeforeRestart returned false")
+                        FailClosedReason.StartupSanitationFailed("cleanOrDenyBeforeRestart returned null")
                     )
                 publishSafely(state)
                 cleanupDebt?.let(::scheduleDebtRetry)
                 return
             }
-            // R2 high #7: reset generation counter when daemon generation changes.
-            firewallGeneration = AtomicLong(next.daemonGeneration shl 20)
+            // Initialize generation counter from daemon-acknowledged epoch.
+            firewallGeneration = AtomicLong(epoch)
             sanitizedDaemonGeneration = next.daemonGeneration
         }
 
-        // R2 high #6: require at least one downstream with a routable IPv4.
+        // R3 fix #4 (H6): require at least one routable downstream address.
         val downstreamEndpoints = next.downstreams.mapNotNull { ds ->
-            ds.ipv4Address?.let { ip ->
+            ds.ipv4Address?.takeIf { isRoutableIpv4(it) }?.let { ip ->
                 ProxyEndpoint(
                     downstreamInterface = ds.interfaceName,
-                    host = ip,
+                    host = normalizeIpv4(ip),
                     tcpPort = next.settings.tcpPort,
                     udpPortRange = if (next.settings.udpEnabled) next.settings.udpPortRange else null,
                 )
             }
         }
         if (downstreamEndpoints.isEmpty()) {
-            enterWaiting(next, ProxyOnlyState.WaitingForTethering, "no downstream IPv4")
+            enterWaiting(next, ProxyOnlyState.WaitingForTethering, "no routable downstream IPv4")
             return
         }
 
         val key = next.runtimeKey(upstream)
         val current = applied
         if (current?.complete == true && current.key == key) {
-            // R2 blocker 1: pass firewallGeneration to every firewallConfig call.
-            firewall.replace(current.firewall!!, next.firewallConfig(denyAll = false, firewallGeneration))
+            // R3 fix B1: named argument for generationCounter.
+            firewall.replace(
+                current.firewall!!,
+                next.firewallConfig(denyAll = false, generationCounter = firewallGeneration),
+            )
             service.replaceAcl(current.service!!, next.allowedClients)
             publishSafely(ProxyOnlyState.Running(downstreamEndpoints))
             return
@@ -292,12 +308,16 @@ class ProxyOnlyController(
         val partial = AppliedProxyState(key)
         applied = partial
 
-        // R2 blocker 1: pass firewallGeneration to deny-first startup config.
-        partial.firewall = firewall.start(next.firewallConfig(denyAll = true, firewallGeneration))
+        // R3 fix B1: named argument.
+        partial.firewall = firewall.start(
+            next.firewallConfig(denyAll = true, generationCounter = firewallGeneration)
+        )
 
-        // R2 blocker 1: fetch credentials immediately before backend start.
+        // R3 fix #6: re-throw CancellationException from credential fetch.
         val credentials = try {
             credentialProvider.credentials()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (t: Throwable) {
             withContext(NonCancellable) {
                 transitionAfterExpectedProbeFailure(
@@ -311,7 +331,6 @@ class ProxyOnlyController(
         val requirements = ProbeRequirements(udpRequired = next.settings.udpEnabled)
         val report = service.runOutboundProbes(partial.service!!, requirements)
 
-        // Exhaustive probe mapping — compiler enforces every branch.
         val probeDecision: ProbeStartDecision = when (val ev = report.evaluate(requirements)) {
             ProbeEvaluation.Success -> ProbeStartDecision.Proceed
             ProbeEvaluation.VpnPermissionDenied ->
@@ -335,8 +354,11 @@ class ProxyOnlyController(
             return
         }
 
-        // R2 blocker 1: pass firewallGeneration when switching to allow rules.
-        firewall.replace(partial.firewall!!, next.firewallConfig(denyAll = false, firewallGeneration))
+        // R3 fix B1: named argument.
+        firewall.replace(
+            partial.firewall!!,
+            next.firewallConfig(denyAll = false, generationCounter = firewallGeneration),
+        )
         partial.complete = true
         publishSafely(ProxyOnlyState.Running(downstreamEndpoints))
     }
@@ -360,7 +382,8 @@ class ProxyOnlyController(
     }
 
     // -----------------------------------------------------------------------
-    // Cleanup creation
+    // Cleanup creation — R3 fix #4: fully local transaction, no mergeDebt calls.
+    // Returns one combined CleanupOutcome; caller merges exactly once.
     // -----------------------------------------------------------------------
 
     private suspend fun cleanupApplied(
@@ -384,13 +407,13 @@ class ProxyOnlyController(
         }
 
         var listenerResolved = serviceResolved
-        var emergencyOutcomeDebt: CleanupDebt? = null
+        // R3 fix #4: collect emergency debt locally; do NOT call mergeDebt here.
+        var emergencyDebt: CleanupDebt? = null
         if (!serviceResolved && serviceActivated) {
             val outcome = safeEmergencyClose(reason)
             listenerResolved = !outcome.report.hasCriticalFailure
             acc.failures += outcome.report.failures
-            // R2 blocker 4: collect emergency debt locally — commit after final debt construction.
-            emergencyOutcomeDebt = outcome.debt
+            emergencyDebt = outcome.debt
         }
 
         var firewallResolved = current.firewall == null
@@ -398,11 +421,11 @@ class ProxyOnlyController(
             val stopped = acc.stepSucceeded("firewall_stop") { firewall.stop(current.firewall!!) }
             if (stopped) {
                 firewallResolved = true
-                denyResolved = true  // firewall stop clears deny (Step 10 §D)
+                denyResolved = true  // §D: firewall stop also clears deny
             }
         }
 
-        val debt = CleanupDebt(
+        val primaryDebt = CleanupDebt(
             listenerClosePending = !listenerResolved,
             serviceHandlePending = current.service.takeUnless { serviceResolved },
             firewallHandlePending = current.firewall.takeUnless { firewallResolved },
@@ -415,17 +438,25 @@ class ProxyOnlyController(
             attempt = 0,
         ).takeUnless { it.isResolved }
 
-        // R2 blocker 4: merge emergency debt AFTER primary debt is built.
-        if (emergencyOutcomeDebt != null) mergeDebt(emergencyOutcomeDebt)
+        // R3 fix #4: merge primary and emergency debt locally into one outcome.
+        val combinedDebt = when {
+            primaryDebt != null && emergencyDebt != null ->
+                primaryDebt.mergeUnresolved(emergencyDebt).copy(
+                    generation = nextDebtGeneration++,
+                    attempt = 0,
+                )
+            primaryDebt != null -> primaryDebt
+            emergencyDebt != null -> emergencyDebt.copy(generation = nextDebtGeneration++, attempt = 0)
+            else -> null
+        }
 
-        return CleanupOutcome(acc.report(), debt)
+        return CleanupOutcome(acc.report(), combinedDebt)
     }
 
     // -----------------------------------------------------------------------
-    // Item-by-item debt retry
-    // R2 blocker 2: featureStop only after handle and listener are cleared.
-    // R2 blocker 3: CancellationException re-thrown in attempt helper.
-    // R2 blocker 4: emergency debt collected locally, merged once at end.
+    // Debt retry
+    // R3 fix #2: withTimeoutOrNull in attempt(); no CancellationException catch.
+    // R3 fix #4: emergency debt collected locally, merged after updated is built.
     // -----------------------------------------------------------------------
 
     private suspend fun retryCleanupDebtSafely() {
@@ -433,23 +464,17 @@ class ProxyOnlyController(
         val failures = mutableListOf<CleanupFailure>()
         val daemonHealthy = latestSnapshot.get()?.daemonHealthy == true
 
-        // R2 blocker 3: re-throw parent CancellationException.
+        // R3 fix #2: withTimeoutOrNull absorbs only the step's own deadline.
+        // CancellationException propagates naturally without any explicit catch.
         suspend fun attempt(name: String, block: suspend () -> CleanupReport): Boolean {
-            return try {
-                val r = withTimeout(CLEANUP_STEP_TIMEOUT_MS) { block() }
-                failures += r.failures
-                r.failures.isEmpty()
-            } catch (stepTimeout: TimeoutCancellationException) {
-                failures += CleanupFailure(name, stepTimeout)
-                safeReport("proxy.cleanup_debt.$name", stepTimeout)
-                false
-            } catch (cancelled: CancellationException) {
-                throw cancelled   // R2 blocker 3
-            } catch (t: Throwable) {
-                failures += CleanupFailure(name, t)
-                safeReport("proxy.cleanup_debt.$name", t)
-                false
+            val r = withTimeoutOrNull(CLEANUP_STEP_TIMEOUT_MS) { block() }
+            if (r == null) {
+                failures += CleanupFailure(name, RuntimeException("step '$name' timed out"))
+                safeReport("proxy.cleanup_debt.$name.timeout", RuntimeException("step '$name' timed out"))
+                return false
             }
+            failures += r.failures
+            return r.failures.isEmpty()
         }
 
         var serviceHandle = debt.serviceHandlePending
@@ -462,13 +487,13 @@ class ProxyOnlyController(
             }
         }
 
-        // R2 blocker 4: collect emergency debt locally; merge after updated is built.
+        // R3 fix #4: collect emergency outcome, merge after updated is built.
         var emergencyOutcomeDebt: CleanupDebt? = null
         if (listenerPending && serviceActivated) {
             val outcome = safeEmergencyClose("cleanup debt retry")
             if (!outcome.report.hasCriticalFailure) listenerPending = false
             failures += outcome.report.failures
-            emergencyOutcomeDebt = outcome.debt  // do NOT call mergeDebt here
+            emergencyOutcomeDebt = outcome.debt
         }
 
         var firewallHandle = debt.firewallHandlePending
@@ -488,21 +513,27 @@ class ProxyOnlyController(
 
         var daemonCleanPending = debt.daemonCleanPending
         if (daemonCleanPending && daemonHealthy) {
-            if (attempt("daemon_clean") { firewall.cleanOrDenyBeforeRestart().asCleanupReport() }) {
+            val epoch = withTimeoutOrNull(CLEANUP_STEP_TIMEOUT_MS) {
+                firewall.cleanOrDenyBeforeRestart()
+            }
+            if (epoch != null) {
                 daemonCleanPending = false
+                firewallGeneration = AtomicLong(epoch)
+            } else {
+                failures += CleanupFailure("daemon_clean", RuntimeException("cleanOrDenyBeforeRestart timed out or returned null"))
             }
         }
 
         var featureStopPending = debt.featureStopPending
-        // R2 blocker 2: only attempt feature stop after service handle and listener are cleared.
-        if (featureStopPending && serviceActivated &&
-            serviceHandle == null && !listenerPending
-        ) {
-            if (attempt("feature_stop") {
-                    withTimeout(CLEANUP_STEP_TIMEOUT_MS) { service.stopFeature("cleanup debt retry") }
-                }) {
+        // R2 fix #2: feature stop only after service handle and listener are cleared.
+        if (featureStopPending && serviceActivated && serviceHandle == null && !listenerPending) {
+            val r = withTimeoutOrNull(CLEANUP_STEP_TIMEOUT_MS) { service.stopFeature("cleanup debt retry") }
+            if (r != null && r.failures.isEmpty()) {
                 featureStopPending = false
                 serviceActivated = false
+            } else {
+                failures += r?.failures
+                    ?: listOf(CleanupFailure("feature_stop", RuntimeException("feature_stop timed out")))
             }
         }
 
@@ -517,26 +548,28 @@ class ProxyOnlyController(
             failures = failures,
             attempt = debt.attempt + 1,
         )
-        // R2 blocker 4: commit primary updated debt first, then merge emergency debt on top.
+
+        // R3 fix #4: commit primary updated debt first, then merge emergency debt.
         cleanupDebt = updated.takeUnless { it.isResolved }
         emergencyOutcomeDebt?.let { mergeDebt(it) }
     }
 
     // -----------------------------------------------------------------------
-    // Self-triggered debt retry scheduler (Step 10 §B)
+    // Debt retry scheduler
+    // R3 fix #5: uses cleanupScope so retries survive worker termination.
     // -----------------------------------------------------------------------
 
     private fun scheduleDebtRetry(debt: CleanupDebt) {
         if (retryJob?.isActive == true && scheduledRetryGeneration == debt.generation) return
         retryJob?.cancel()
         scheduledRetryGeneration = debt.generation
-        retryJob = scope.launch {
+        // R3 fix #5: cleanupScope outlives the worker scope.
+        retryJob = cleanupScope.launch {
             delay(cleanupBackoff(debt.attempt))
             events.send(ControllerEvent.RetryCleanupDebt(debt.generation))
         }
     }
 
-    // Step 10 §B: mergeDebt assigns fresh generation and cancels old timer.
     private fun mergeDebt(incoming: CleanupDebt?) {
         if (incoming == null) return
         val merged = cleanupDebt?.mergeUnresolved(incoming) ?: incoming
@@ -547,7 +580,7 @@ class ProxyOnlyController(
     }
 
     // -----------------------------------------------------------------------
-    // Waiting, recovery and terminal stop
+    // Waiting / recovery / terminal stop
     // -----------------------------------------------------------------------
 
     private suspend fun enterWaiting(next: DesiredProxyState, state: ProxyOnlyState, reason: String) {
@@ -590,7 +623,6 @@ class ProxyOnlyController(
         }
     }
 
-    // R2 blocker 2: feature stop deferred when service/listener debt remains.
     private suspend fun terminalStopSafely(reason: String) {
         val outcome = cleanupApplied(
             reason,
@@ -604,27 +636,22 @@ class ProxyOnlyController(
             } == true
 
             if (hasServiceDebt) {
-                // Defer feature stop until service/listener debt clears.
                 mergeDebt(
                     CleanupDebt(
-                        listenerClosePending = false,
-                        serviceHandlePending = null,
-                        firewallHandlePending = null,
-                        firewallDenyPending = false,
-                        firewallStopPending = false,
-                        daemonCleanPending = false,
-                        featureStopPending = true,
-                        failures = emptyList(),
-                        generation = nextDebtGeneration++,
-                        attempt = 0,
+                        listenerClosePending = false, serviceHandlePending = null,
+                        firewallHandlePending = null, firewallDenyPending = false,
+                        firewallStopPending = false, daemonCleanPending = false,
+                        featureStopPending = true, failures = emptyList(),
+                        generation = nextDebtGeneration++, attempt = 0,
                     )
                 )
             } else {
-                // Bound the feature-stop call.
                 val featureReport = try {
-                    withTimeout(CLEANUP_STEP_TIMEOUT_MS) { service.stopFeature(reason) }
-                } catch (stepTimeout: TimeoutCancellationException) {
-                    CleanupReport.failure("feature_stop_timeout", stepTimeout)
+                    withTimeoutOrNull(CLEANUP_STEP_TIMEOUT_MS) { service.stopFeature(reason) }
+                        ?: CleanupReport.failure("feature_stop_timeout",
+                            RuntimeException("feature_stop timed out"))
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (t: Throwable) {
                     CleanupReport.failure("feature_stop", t)
                 }
@@ -633,21 +660,17 @@ class ProxyOnlyController(
                 } else {
                     mergeDebt(
                         CleanupDebt(
-                            listenerClosePending = false,
-                            serviceHandlePending = null,
-                            firewallHandlePending = null,
-                            firewallDenyPending = false,
-                            firewallStopPending = false,
-                            daemonCleanPending = false,
-                            featureStopPending = true,
-                            failures = featureReport.failures,
-                            generation = nextDebtGeneration++,
-                            attempt = 0,
+                            listenerClosePending = false, serviceHandlePending = null,
+                            firewallHandlePending = null, firewallDenyPending = false,
+                            firewallStopPending = false, daemonCleanPending = false,
+                            featureStopPending = true, failures = featureReport.failures,
+                            generation = nextDebtGeneration++, attempt = 0,
                         )
                     )
                 }
             }
         }
+        // R3 fix #5: scheduleDebtRetry uses cleanupScope — survives after this finally.
         cleanupDebt?.let(::scheduleDebtRetry)
     }
 
@@ -655,49 +678,47 @@ class ProxyOnlyController(
     // Helpers
     // -----------------------------------------------------------------------
 
-    /** Safe wrapper around emergencyCloseListener that never throws. */
+    /** R3 fix #2: withTimeoutOrNull so outer CancellationException propagates. */
     private suspend fun safeEmergencyClose(reason: String): CleanupOutcome {
         return try {
-            withTimeout(CLEANUP_STEP_TIMEOUT_MS) { service.emergencyCloseListener(reason) }
-        } catch (stepTimeout: TimeoutCancellationException) {
-            val f = CleanupFailure("emergency_close_timeout", stepTimeout)
-            val debtFromTimeout = CleanupDebt(
-                listenerClosePending = true,
-                serviceHandlePending = applied?.service,
-                firewallHandlePending = null,
-                firewallDenyPending = false,
-                firewallStopPending = false,
-                daemonCleanPending = false,
-                featureStopPending = false,
-                failures = listOf(f),
-                generation = nextDebtGeneration++,
-                attempt = 0,
-            )
-            CleanupOutcome(CleanupReport(listOf(f)), debtFromTimeout)
+            withTimeoutOrNull(CLEANUP_STEP_TIMEOUT_MS) {
+                service.emergencyCloseListener(reason)
+            } ?: run {
+                val f = CleanupFailure("emergency_close_timeout",
+                    RuntimeException("emergencyCloseListener timed out"))
+                CleanupOutcome(
+                    CleanupReport(listOf(f)),
+                    CleanupDebt(
+                        listenerClosePending = true,
+                        serviceHandlePending = applied?.service,
+                        firewallHandlePending = null, firewallDenyPending = false,
+                        firewallStopPending = false, daemonCleanPending = false,
+                        featureStopPending = false, failures = listOf(f),
+                        generation = nextDebtGeneration++, attempt = 0,
+                    )
+                )
+            }
         } catch (cancelled: CancellationException) {
-            throw cancelled  // R2 blocker 3
+            throw cancelled   // R3 fix #2
         } catch (t: Throwable) {
             val f = CleanupFailure("emergency_close", t)
-            val debtFromFailure = CleanupDebt(
-                listenerClosePending = true,
-                serviceHandlePending = applied?.service,
-                firewallHandlePending = applied?.firewall,
-                firewallDenyPending = applied?.firewall != null,
-                firewallStopPending = applied?.firewall != null,
-                daemonCleanPending = true,
-                featureStopPending = false,
-                failures = listOf(f),
-                generation = nextDebtGeneration++,
-                attempt = 0,
+            CleanupOutcome(
+                CleanupReport(listOf(f)),
+                CleanupDebt(
+                    listenerClosePending = true,
+                    serviceHandlePending = applied?.service,
+                    firewallHandlePending = applied?.firewall,
+                    firewallDenyPending = applied?.firewall != null,
+                    firewallStopPending = applied?.firewall != null,
+                    daemonCleanPending = true, featureStopPending = false,
+                    failures = listOf(f), generation = nextDebtGeneration++, attempt = 0,
+                )
             )
-            CleanupOutcome(CleanupReport(listOf(f)), debtFromFailure)
         }
     }
 
     private fun debtState(debt: CleanupDebt) = ProxyOnlyState.CleanupDegraded(
-        unresolved = debt.unresolved,
-        failures = debt.failures,
-        retryAttempt = debt.attempt,
+        unresolved = debt.unresolved, failures = debt.failures, retryAttempt = debt.attempt,
     )
 
     private suspend fun publishDebt(debt: CleanupDebt) = publishSafely(debtState(debt))
@@ -707,8 +728,7 @@ class ProxyOnlyController(
     }
 
     private fun safeReport(
-        category: String,
-        failure: Throwable,
+        category: String, failure: Throwable,
         cleanupFailures: List<CleanupFailure> = emptyList(),
     ) {
         try { reporter.report(category, failure, cleanupFailures) } catch (_: Throwable) { }
@@ -717,9 +737,7 @@ class ProxyOnlyController(
 
 // ---------------------------------------------------------------------------
 // Extension helpers on DesiredProxyState
-// R2 blocker 1: generationCounter required on every firewallConfig call.
-// R2 blocker 1: credentials required for backendConfig.
-// R2 high #6: runningState removed — endpoints built inline in reconcile().
+// R3 fix B1: all firewallConfig() calls require named generationCounter.
 // ---------------------------------------------------------------------------
 
 fun DesiredProxyState.runtimeKey(upstream: ProxyVpnUpstream): RuntimeKey =
@@ -729,12 +747,11 @@ fun DesiredProxyState.runtimeKey(upstream: ProxyVpnUpstream): RuntimeKey =
         credentialsVersion = settings.credentialsVersion,
         vpnNetworkHandle = upstream.handle,
         downstreams = downstreams.map { ds ->
-            ds.interfaceName to listOfNotNull(ds.ipv4Address).sorted()
+            ds.interfaceName to listOfNotNull(ds.ipv4Address).map { normalizeIpv4(it) }.sorted()
         },
         backendVersion = 1,
     )
 
-/** R2 blocker 1: generationCounter is mandatory — no default. */
 fun DesiredProxyState.firewallConfig(
     denyAll: Boolean,
     generationCounter: AtomicLong,
@@ -751,7 +768,6 @@ fun DesiredProxyState.firewallConfig(
     denyAllIpv6 = true,
 )
 
-/** R2 blocker 1: credentials are mandatory — no default. */
 fun DesiredProxyState.backendConfig(
     upstream: ProxyVpnUpstream,
     credentials: ProxyCredentials,

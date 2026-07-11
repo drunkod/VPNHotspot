@@ -1,19 +1,22 @@
 package be.mygod.vpnhotspot.proxy
 
 import android.app.Service
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 
 // ---------------------------------------------------------------------------
 // Step 3 — Service/backend ownership and the persistent foreground service
 // Sketch: docs/proxy-only/sketches/03-service-and-backend-ownership.md
 //
-// Fixes applied:
-//   #3  emergencyCloseListener returns CleanupOutcome (not just CleanupReport)
-//       so the controller can merge real listener/handle debt on failure.
-//   #5  CleanupAccumulator.stepSucceeded applies CLEANUP_STEP_TIMEOUT per step.
-//   #7  Reporter calls inside the accumulator are non-throwing.
-//   #10 ProxyBackendConfig takes ProxyCredentials, not raw strings.
+// R3 fixes:
+//   B1  Added missing import kotlinx.coroutines.CancellationException
+//   B2  CleanupAccumulator.stepSucceeded uses withTimeoutOrNull so only the
+//       step's own timeout is absorbed; outer/parent CancellationException
+//       propagates naturally through withTimeoutOrNull without being caught.
+//   B3  cleanOrDenyBeforeRestart() returns Long? (null = failure; non-null =
+//       daemon-acknowledged new epoch) so the controller can initialize its
+//       generation counter from the epoch rather than deriving it locally.
 // ---------------------------------------------------------------------------
 
 internal const val CLEANUP_STEP_TIMEOUT_MS = 10_000L
@@ -27,7 +30,7 @@ internal const val CLEANUP_STEP_TIMEOUT_MS = 10_000L
 @JvmInline value class ProxyFirewallHandle(val id: Long)
 
 // ---------------------------------------------------------------------------
-// Report / accumulator types
+// Report types
 // ---------------------------------------------------------------------------
 
 data class CleanupFailure(val step: String, val cause: Throwable)
@@ -48,8 +51,8 @@ data class CleanupReport(
             CleanupReport(failures = listOf(CleanupFailure(step, cause)))
 
         /**
-         * R2 fix #5: a mismatched/stale handle is a CRITICAL unresolved failure, not
-         * a context-only success. Debt must not be cleared while another backend lives.
+         * R2 fix #5: stale handle is a CRITICAL failure — not context-only.
+         * Mismatched handles must never clear SERVICE_HANDLE or LISTENER debt.
          */
         fun staleHandle(id: Long) = CleanupReport(
             failures = listOf(
@@ -63,18 +66,13 @@ data class CleanupReport(
 }
 
 // ---------------------------------------------------------------------------
-// Service activation result
+// Service activation / backend config
 // ---------------------------------------------------------------------------
 
 sealed interface ServiceActivation {
     data object Active : ServiceActivation
     data object ForegroundStartNotAllowed : ServiceActivation
 }
-
-// ---------------------------------------------------------------------------
-// Backend configuration
-// Fix #10: credentials travel as ProxyCredentials, not raw strings
-// ---------------------------------------------------------------------------
 
 data class ProxyBackendConfig(
     val tcpPort: Int,
@@ -92,8 +90,6 @@ data class ProxyBackendStats(
 
 // ---------------------------------------------------------------------------
 // ProxyServiceClient interface
-// Fix #3: emergencyCloseListener returns CleanupOutcome so controller can
-//         merge real debt when the emergency close itself fails.
 // ---------------------------------------------------------------------------
 
 interface ProxyServiceClient {
@@ -109,20 +105,22 @@ interface ProxyServiceClient {
         handle: ProxyServiceHandle,
         requirements: ProbeRequirements,
     ): ProbeReport
+
     suspend fun stopBackend(handle: ProxyServiceHandle): CleanupReport
+
     /**
      * Attempt fail-closed listener containment.
-     * Returns a [CleanupOutcome] so the controller can merge debt when this
-     * operation itself fails (fix #3). The service handle is NEVER cleared
-     * by emergency close alone — only a successful [stopBackend] removes it.
+     * Returns [CleanupOutcome] so the controller can merge debt on failure.
+     * The backend handle is NEVER cleared by emergency close alone.
      */
     suspend fun emergencyCloseListener(reason: String): CleanupOutcome
+
     suspend fun stopFeature(reason: String): CleanupReport
     suspend fun readStats(handle: ProxyServiceHandle): ProxyBackendStats
 }
 
 // ---------------------------------------------------------------------------
-// ProxyBackend interface (owned exclusively by ProxyService)
+// ProxyBackend interface
 // ---------------------------------------------------------------------------
 
 interface ProxyBackend {
@@ -133,16 +131,13 @@ interface ProxyBackend {
         requirements: ProbeRequirements,
     ): ProbeReport
     suspend fun stats(handle: ProxyBackendHandle): ProxyBackendStats
-    suspend fun emergencyCloseListener(
-        handle: ProxyBackendHandle,
-        reason: String,
-    ): CleanupReport
+    suspend fun emergencyCloseListener(handle: ProxyBackendHandle, reason: String): CleanupReport
     suspend fun stop(handle: ProxyBackendHandle): CleanupReport
 }
 
 // ---------------------------------------------------------------------------
 // ProxyFirewallClient interface
-// Fix #2: denyAll/stop return Boolean → CleanupReport to make failures visible
+// R3 fix #3: cleanOrDenyBeforeRestart returns Long? (daemon-issued epoch).
 // ---------------------------------------------------------------------------
 
 data class ProxyFirewallConfig(
@@ -164,17 +159,33 @@ data class ProxyDownstreamConfig(
 interface ProxyFirewallClient {
     suspend fun start(config: ProxyFirewallConfig): ProxyFirewallHandle
     suspend fun replace(handle: ProxyFirewallHandle, config: ProxyFirewallConfig)
-    /** Returns [CleanupReport] so a failed deny creates FIREWALL_DENY debt. */
     suspend fun denyAll(handle: ProxyFirewallHandle): CleanupReport
-    /** Returns [CleanupReport] so a failed stop retains FIREWALL_RUNTIME debt. */
     suspend fun stop(handle: ProxyFirewallHandle): CleanupReport
-    suspend fun cleanOrDenyBeforeRestart(): Boolean
+
+    /**
+     * R3 fix #3: perform idempotent proxy-chain sanitation and atomically reset
+     * the daemon's generation ledger.
+     *
+     * @return The daemon-acknowledged new epoch (starting sequence value) to use
+     *         as the base for subsequent firewall-config generation numbers, or
+     *         `null` if sanitation failed.
+     *
+     * The controller must use this epoch to initialize its generation counter.
+     * Deriving the counter from a locally shifted value without an acknowledgement
+     * can reuse sequences already accepted by a surviving daemon.
+     */
+    suspend fun cleanOrDenyBeforeRestart(): Long?
 }
+
+fun Boolean.asCleanupReport() =
+    if (this) CleanupReport.empty()
+    else CleanupReport.failure("operation", RuntimeException("returned false"))
 
 // ---------------------------------------------------------------------------
 // CleanupAccumulator
-// Fix #5: applies CLEANUP_STEP_TIMEOUT_MS per step via withTimeout.
-// Fix #7: reporter calls are non-throwing (catch-all inside report()).
+//
+// R3 fix #2: uses withTimeoutOrNull so only the step's own deadline is absorbed.
+// Parent CancellationException propagates naturally — no explicit catch needed.
 // ---------------------------------------------------------------------------
 
 class CleanupAccumulator(private val reporter: ProxyErrorReporter? = null) {
@@ -182,33 +193,26 @@ class CleanupAccumulator(private val reporter: ProxyErrorReporter? = null) {
     val failures = mutableListOf<CleanupFailure>()
 
     /**
-     * Run [block] with a per-step timeout.
+     * Run [block] under a per-step deadline.
      *
-     * R2 fix #3: catch order is TimeoutCancellationException → CancellationException (re-throw)
-     * → Throwable. A parent coroutine cancellation must propagate; only a step-level timeout
-     * is classified as a cleanup failure.
+     * [withTimeoutOrNull] returns `null` only when the block itself exceeds its
+     * own timeout. A parent or outer [CancellationException] is not caught here
+     * and propagates to the caller. This correctly distinguishes inner step
+     * timeouts from outer transaction timeouts.
      */
     suspend fun stepSucceeded(name: String, block: suspend () -> CleanupReport): Boolean {
-        return try {
-            val r = withTimeout(CLEANUP_STEP_TIMEOUT_MS) { block() }
-            failures += r.failures
-            r.failures.isEmpty()
-        } catch (stepTimeout: TimeoutCancellationException) {
-            // Step-level timeout: record failure, keep accumulating other steps.
-            failures += CleanupFailure(name, stepTimeout)
-            safeReport("proxy.cleanup.$name", stepTimeout)
-            false
-        } catch (cancelled: CancellationException) {
-            // R2 fix #3: parent cancellation must not be swallowed.
-            throw cancelled
-        } catch (t: Throwable) {
-            failures += CleanupFailure(name, t)
-            safeReport("proxy.cleanup.$name", t)
-            false
+        val r = withTimeoutOrNull(CLEANUP_STEP_TIMEOUT_MS) { block() }
+        if (r == null) {
+            // Only this step's own deadline elapsed.
+            val f = CleanupFailure(name, RuntimeException("step '$name' timed out after ${CLEANUP_STEP_TIMEOUT_MS}ms"))
+            failures += f
+            safeReport("proxy.cleanup.$name.timeout", f.cause)
+            return false
         }
+        failures += r.failures
+        return r.failures.isEmpty()
     }
 
-    /** Fix #7: reporter must not throw into the cleanup path. */
     private fun safeReport(category: String, failure: Throwable) {
         try { reporter?.report(category, failure, emptyList()) } catch (_: Throwable) { }
     }
@@ -233,9 +237,7 @@ interface ProxyStateSink {
 }
 
 // ---------------------------------------------------------------------------
-// ProxyService skeleton (sole backend owner)
-// Fix #3: emergencyCloseListener returns CleanupOutcome with handle info.
-// Fix #4: stopFeature cannot mark service inactive while backend debt exists.
+// ProxyService skeleton
 // ---------------------------------------------------------------------------
 
 abstract class ProxyService : Service() {
@@ -276,27 +278,17 @@ abstract class ProxyService : Service() {
         if (!featureActive) return CleanupReport.noOp("service inactive")
         val current = backendHandle ?: return CleanupReport.noOp("backend absent")
         if (current.id != handle.id) return CleanupReport.staleHandle(handle.id)
-
         val report = backend.stop(current).withContext("ProxyService.stopBackend")
-        // Never discard the only native handle before stop is proven complete.
         if (!report.hasCriticalFailure) backendHandle = null
         return report
     }
 
-    /**
-     * Fix #3: returns [CleanupOutcome] so the controller knows whether listener
-     * containment succeeded. The backend handle is NEVER cleared here — only a
-     * successful [stopBackend] removes it.
-     */
     suspend fun emergencyCloseListener(reason: String): CleanupOutcome {
         if (!featureActive) return CleanupOutcome(CleanupReport.noOp("service inactive"), null)
         val current = backendHandle
             ?: return CleanupOutcome(CleanupReport.noOp("backend absent"), null)
-
         val report = backend.emergencyCloseListener(current, reason)
             .withContext("ProxyService.emergencyCloseListener")
-
-        // Listener containment failure → return listener debt with the retained handle.
         val debt = if (report.hasCriticalFailure) {
             CleanupDebt(
                 listenerClosePending = true,
@@ -307,12 +299,11 @@ abstract class ProxyService : Service() {
                 daemonCleanPending = false,
                 featureStopPending = false,
                 failures = report.failures,
-                generation = 0L, // controller assigns generation after merge
+                generation = 0L,
                 attempt = 0,
             )
         } else null
-
-        // backendHandle is intentionally NOT cleared (listener ≠ full backend stop).
+        // backendHandle intentionally NOT cleared — listener ≠ full backend stop.
         return CleanupOutcome(report, debt)
     }
 
@@ -328,8 +319,7 @@ abstract class ProxyService : Service() {
 
     private suspend fun closeCurrentBackend(reason: String): CleanupReport {
         val current = backendHandle ?: return CleanupReport.noOp("backend absent")
-        val report = backend.stop(current)
-            .withContext("ProxyService.closeCurrentBackend", reason)
+        val report = backend.stop(current).withContext("ProxyService.closeCurrentBackend", reason)
         if (!report.hasCriticalFailure) backendHandle = null
         return report
     }
