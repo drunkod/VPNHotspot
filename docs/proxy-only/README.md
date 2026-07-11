@@ -1,12 +1,12 @@
 # Proxy-only mode design
 
-Status: revised design proposal after structural and code-graph review  
+Status: round-2 corrected design, approved to begin Phase 0 only  
 Target repository snapshot: `drunkod/VPNHotspot@9b6354c69cbe42c87c8d3a28add8405c3ae79b8d`  
 Target branch: `agent/proxy-only-design`
 
 ## Goal
 
-Add an optional **Proxy only** mode to VPN Hotspot. Android system tethering remains the normal direct Internet path, while VPN Hotspot exposes an authenticated SOCKS5 endpoint. Only traffic explicitly sent to that endpoint is carried through the phone VPN.
+Add an optional **Proxy only** mode. Android system tethering remains the fast direct path, while VPN Hotspot exposes an authenticated SOCKS5 endpoint for traffic that must use the phone VPN.
 
 ```text
 Unselected laptop applications
@@ -16,7 +16,7 @@ Unselected laptop applications
 
 Selected laptop applications
   -> FlClash PROCESS-NAME rule
-  -> SOCKS5 server inside VPN Hotspot
+  -> SOCKS5 endpoint in VPN Hotspot
   -> outbound socket bound to a validated Android VPN Network
   -> VPN provider
   -> Internet
@@ -24,110 +24,124 @@ Selected laptop applications
 Selected laptop applications with WARP
   -> FlClash WireGuard/WARP outbound
   -> dialer-proxy: PhoneVPN
-  -> SOCKS5 server inside VPN Hotspot
+  -> SOCKS5 endpoint in VPN Hotspot
   -> phone VPN
   -> Cloudflare WARP
   -> Internet
 ```
 
-The final public IP is therefore:
+Expected public IP:
 
-- physical/carrier IP for `DIRECT` traffic;
-- phone VPN exit IP for `PhoneVPN` traffic;
-- Cloudflare WARP IP for `WARP-via-PhoneVPN` traffic.
+- `DIRECT`: physical/carrier IP;
+- `PhoneVPN`: phone VPN exit IP;
+- `WARP-via-PhoneVPN`: Cloudflare WARP IP.
 
 ## Security contract
 
-Proxy-only makes a stronger promise than the existing routing mode:
+When Proxy-only reports `Running`:
 
-> When the proxy reports `Running`, every Internet-facing TCP, UDP and DNS operation is using a network whose capabilities include `TRANSPORT_VPN` and whose use is permitted for the VPN Hotspot app UID.
+1. exactly one usable VPN candidate has current `TRANSPORT_VPN` capability;
+2. the VPN Hotspot app UID is allowed to use that VPN;
+3. every Internet-facing TCP, UDP and DNS socket is bound to that VPN before sending;
+4. ingress is allowed only for authenticated, explicitly permitted tethered clients;
+5. any critical dependency failure closes the listener and sessions without direct fallback.
 
-The current routing path intentionally allows the user to override `Upstreams.primary` with an interface regex. `Routing.kt` consumes that selected upstream and forwards its `networkHandle` to the daemon without requiring it to be a VPN. That is valid for routing mode because the user explicitly selected the upstream.
+`Upstreams.primary` is not proof of VPN use because the existing routing mode permits a user-selected physical upstream. Proxy-only uses a VPN-specific candidate and fresh capability validation.
 
-Proxy-only must not inherit that permissive behaviour. It must either consume `Upstreams.vpn` directly or validate `NetworkCapabilities.TRANSPORT_VPN` immediately before startup. A physical `wlan0`/cellular network is not an acceptable proxy upstream, even if it is configured as `service.upstream`.
+If multiple usable VPN candidates are visible, the MVP fails closed with `MultipleVpnCandidates`. It does not choose by transient network-handle ordering.
 
-## Accepted MVP requirements
+## Accepted MVP decisions
 
-1. Add a global `Proxy only` operating mode while keeping a per-downstream internal model.
-2. Use ordinary Android system tethering as the direct path.
-3. Run the SOCKS5 data plane inside the VPN Hotspot application process.
-4. Use a pinned, minimally forked HevSocks5Server for the feasibility prototype.
-5. Bind every outbound TCP and UDP socket to a validated Android VPN network handle.
-6. Resolve SOCKS domain targets through the same VPN without blocking Hev workers indefinitely.
-7. Keep firewall, client ACL, counters and deterministic cleanup in the root daemon.
-8. Reuse the daemon's existing `IptablesRule` mutation ledger and `firewall_cleanup` conventions.
-9. Default to fail-closed; no automatic physical-network fallback is included in the MVP.
-10. Support SOCKS5 `CONNECT` and standard `UDP ASSOCIATE`.
-11. Select laptop applications in FlClash with `PROCESS-NAME` rules.
-12. Do not implement transparent proxying or TPROXY in the first version.
-13. Bind the MVP listener to IPv4 only and install explicit IPv6 deny rules for all proxy ports.
-14. Treat root-daemon loss as a stop event: close the native listener immediately.
-15. Restart the native backend on every VPN network-generation change; live network replacement is deferred.
+1. The UI exposes `VPN_ROUTING` and `PROXY_ONLY`; mixed routing+proxy mode is deferred.
+2. Ordinary system Wi-Fi/USB tethering supplies the direct path.
+3. `ProxyService` is the sole owner of `ProxyBackend`, native handles and backend statistics.
+4. `ProxyOnlyController` owns desired-state reconciliation and talks to `ProxyServiceClient`; it never invokes the backend directly.
+5. The first backend is a pinned, minimally forked HevSocks5Server.
+6. Every outbound FD passes a testable Android-network binding hook.
+7. SOCKS domain targets use bounded/asynchronous VPN-aware DNS.
+8. Root daemon owns firewall, client ACL, counters and deterministic cleanup.
+9. Proxy firewall reuses the existing `IptablesRule` ledger and `firewall_cleanup` machinery.
+10. Fail-closed is mandatory; physical fallback is not an MVP option.
+11. Standard SOCKS5 `CONNECT` and `UDP ASSOCIATE` are required.
+12. MVP is IPv4-only with explicit IPv6 deny rules.
+13. Client allow identity is downstream interface + IPv4 + MAC.
+14. VPN generation changes fully restart the backend.
+15. TPROXY/transparent interception is deferred.
 
-## Operating modes
+## Foreground-service lifecycle
 
-MVP UI exposes two modes:
+The service is started only from a user action that is valid under current Android foreground-service rules. Once Proxy-only is enabled and the service is running, it remains alive through:
 
-```kotlin
-enum class SharingMode {
-    VPN_ROUTING,
-    PROXY_ONLY,
-}
-```
+- `WaitingForTethering`;
+- `WaitingForVpn`;
+- VPN loss / `FailClosed`;
+- root-daemon loss / `FailClosed`;
+- background recovery when VPN or daemon service returns.
 
-The implementation keeps independent per-downstream flags underneath so a later release can add mixed modes without migrating stored state:
+In waiting/fail-closed states the service has **no active listener** and shows a persistent blocked/waiting notification. Keeping the service alive avoids an Android 12+ background restart that may throw `ForegroundServiceStartNotAllowedException`.
 
-```kotlin
-data class ManagedDownstream(
-    val interfaceName: String,
-    val vpnRoutingEnabled: Boolean,
-    val proxyExposureEnabled: Boolean,
-)
-```
+The service stops when the user disables Proxy-only, recovery is explicitly abandoned, or the OS terminates the process. Automatic resurrection after process death is not assumed.
 
-`VPN_ROUTING_AND_PROXY` is deliberately deferred until rule-ordering and interaction tests exist. It is not required for the selective-app use case.
+## Exception-safe reconciliation
 
-## Important distinction from existing routing
+One `Channel.CONFLATED` feeds one worker. Resource transactions are non-cancellable, but that alone is insufficient. The worker also requires:
 
-The current routing mode creates a `Routing` session for a managed downstream and forwards tethered traffic through the selected primary upstream. `Proxy only` must **not** create that forwarding session. Otherwise `MATCH,DIRECT` on the laptop still travels through the phone VPN and the fast direct path is lost.
+- a catch boundary around every reconciliation iteration;
+- fail-closed recovery after fast-path, publish or rollback exceptions;
+- cleanup that attempts deny, backend/listener stop and firewall stop independently;
+- aggregated, structured cleanup error reporting instead of silent `runCatching`;
+- a `finally` block that calls terminal `stopApplied()` in `NonCancellable` context.
 
-The new mode separates responsibilities:
+No exception may kill the worker while leaving a live listener unreconciled.
 
-- Android owns system tethering, DHCP, NAT and direct forwarding;
-- the app process owns the authenticated SOCKS5 listener and relay lifecycle;
-- the root daemon owns safe listener exposure, ACLs, counters and cleanup.
+## Probe contract
 
-## Hev integration boundary
+Deny-first startup intentionally blocks client ingress. Therefore startup probes are outbound-only:
 
-HevSocks5Server already provides `CONNECT`, `UDP ASSOCIATE`, authentication, Android NDK support and an embeddable API. Its `bind-interface` and static mark settings are not equivalent to binding each socket to an Android `Network`.
+- app-UID bind probe;
+- backend-created outbound TCP probe;
+- backend-created outbound UDP probe;
+- VPN-aware DNS probe;
+- internal listener bind/listen readiness signal.
 
-The fork must provide a testable hook after `socket()` and before `connect()` or first UDP send:
+A downstream client reachability probe runs only after per-client allow rules are committed.
 
-```c
-int vpnhotspot_prepare_outbound_socket(int fd, const network_state_t *state);
-```
+## UDP Phase 0 gate
 
-The Android implementation calls `android_setsocknetwork()`. A host-CI shim records hook calls and simulates failures, allowing every retry/fallback socket path to be tested on Linux. In fail-closed mode, no outbound FD may continue after hook failure.
+The pinned Hev source must be inspected to determine:
 
-Phase 0 must also determine Hev's UDP relay-port behaviour. The firewall contract uses a configured UDP relay range rather than assuming the SOCKS TCP port is also the UDP port.
+- whether client-facing relay and Internet-facing UDP sockets are the same FD or separate FDs;
+- whether upstream replies arrive on a protected relay-range port;
+- how conntrack classifies those replies;
+- whether `ESTABLISHED/RELATED` is required before terminal reject;
+- how returned `BND.ADDR/BND.PORT` maps to the configured range.
 
-## Firewall identity and lifecycle
+The firewall design is not final until packet captures and FD/port correlation prove the exact topology. No broad VPN-interface allow is permitted.
 
-Allow rules match all available identity dimensions:
+If one relay port is consumed per association, the range is also a global capacity ceiling:
 
 ```text
-downstream interface + source IPv4 + source MAC + destination proxy port/range
+effective UDP capacity = min(configured association limit, usable relay-port count)
 ```
 
-IP-only access is considered spoofable and is not an MVP fallback. IPv6 access is denied explicitly because the first listener is IPv4-only.
+Range exhaustion returns a controlled failure and metric; the firewall range never expands dynamically.
 
-The new proxy firewall remains separate from `SessionConfig`. This avoids growing an already central routing abstraction and lets proxy policy have its own long-lived command lifecycle. Its implementation must reuse `routing/iptables.rs::IptablesRule`, idempotent insertion/deletion and `routing/firewall_cleanup.rs::clean()` rather than introduce a parallel rule representation.
+## Firewall and daemon lifecycle
 
-Kernel rules survive daemon death. Therefore daemon loss does **not** imply that access automatically becomes denied. The app must monitor the long-lived firewall call/channel and close the native listener immediately if it breaks. On daemon recovery, Clean/deny reconciliation must complete before the listener can reopen.
+IPv4 allow rules match:
+
+```text
+input interface + source IPv4 + source MAC + destination TCP port/UDP relay range
+```
+
+IPv4 chains end in reject. IPv6 rejects the TCP listener port and full UDP relay range.
+
+iptables rules can survive daemon death. If the long-lived daemon channel breaks, `ProxyService` closes the listener immediately. After daemon recovery, Clean or explicit deny reconciliation completes before any listener restart.
 
 ## Documents
 
-- [Structural review and graph grounding](REVIEW.md)
+- [Round-1 structural review](REVIEW.md)
+- [Round-2 resolution audit](REVIEW_ROUND2.md)
 - [Research decisions](RESEARCH_DECISIONS.md)
 - [Architecture](ARCHITECTURE.md)
 - [Implementation plan](IMPLEMENTATION_PLAN.md)
@@ -139,14 +153,15 @@ Kernel rules survive daemon death. Therefore daemon loss does **not** imply that
 
 - transparent interception or TPROXY/REDIRECT;
 - a new Android `VpnService`;
-- embedding WARP credentials in the Android application;
-- replacing the user-selected VPN application;
-- proxying traffic without client-side configuration;
+- embedded WARP credentials;
+- replacing the selected VPN app;
+- clientless transparent proxying;
 - IPv6 proxy relay;
-- `VPN_ROUTING_AND_PROXY`;
-- LocalOnlyHotspot and Wi-Fi Direct repeater support;
-- automatic fallback to the physical network;
-- hot-swapping a live native instance to a new Android `Network`.
+- mixed `VPN_ROUTING_AND_PROXY` mode;
+- LocalOnlyHotspot, Wi-Fi Direct repeater or Bluetooth support;
+- automatic physical-network fallback;
+- live backend network replacement;
+- automatic background resurrection after process death.
 
 ## Source references
 
@@ -161,17 +176,6 @@ Kernel rules survive daemon death. Therefore daemon loss does **not** imply that
 - Mihomo WireGuard outbound: https://wiki.metacubex.one/en/config/proxies/wg/
 - Mihomo dialer proxy: https://wiki.metacubex.one/en/config/proxies/dialer-proxy/
 
-## Decisions required before implementation
+## Approval boundary
 
-Reviewers should approve:
-
-- VPN-only capability validation independent of `Upstreams.primary` overrides;
-- the app-process data plane and small maintained Hev fork;
-- IPv4-only listener plus IPv6 deny policy for MVP;
-- fixed/configured UDP relay range;
-- iface + IP + MAC ACL matching;
-- independent proxy-firewall command lifecycle reusing `IptablesRule` machinery;
-- restart-on-network-generation-change;
-- fail-closed daemon-loss handling;
-- the selected Android foreground-service type and distribution-policy eligibility;
-- the Phase 0 per-app VPN allow/exclude compatibility matrix.
+This design is approved to begin **Phase 0 feasibility work only**. UI, production firewall integration and release code remain blocked until the Phase 0 exit criteria pass.
