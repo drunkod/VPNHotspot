@@ -36,6 +36,10 @@ interface ProxyBackend {
         requirements: ProbeRequirements,
     ): ProbeReport
     suspend fun stats(handle: ProxyBackendHandle): ProxyBackendStats
+    suspend fun emergencyCloseListener(
+        handle: ProxyBackendHandle,
+        reason: String,
+    ): CleanupReport
     suspend fun stop(handle: ProxyBackendHandle): CleanupReport
 }
 ```
@@ -91,13 +95,20 @@ class ProxyService : Service() {
         if (!featureActive) return CleanupReport.noOp("service inactive")
         val current = backendHandle ?: return CleanupReport.noOp("backend absent")
         if (current.id != handle.id) return CleanupReport.staleHandle(handle.id)
-        backendHandle = null
-        return backend.stop(current).withContext("ProxyService.stopBackend")
+
+        val report = backend.stop(current).withContext("ProxyService.stopBackend")
+        // Never discard the only native handle before stop is proven complete.
+        if (!report.hasCriticalFailure) backendHandle = null
+        return report
     }
 
     suspend fun emergencyCloseListener(reason: String): CleanupReport {
         if (!featureActive) return CleanupReport.noOp("service inactive")
-        return closeCurrentBackend("emergency: $reason")
+        val current = backendHandle ?: return CleanupReport.noOp("backend absent")
+        // Emergency listener closure is fail-closed containment, not proof that the
+        // backend handle and all native resources were destroyed.
+        return backend.emergencyCloseListener(current, reason)
+            .withContext("ProxyService.emergencyCloseListener")
     }
 
     suspend fun stopFeature(reason: String): CleanupReport {
@@ -112,10 +123,18 @@ class ProxyService : Service() {
 
     private suspend fun closeCurrentBackend(reason: String): CleanupReport {
         val current = backendHandle ?: return CleanupReport.noOp("backend absent")
-        backendHandle = null
-        return backend.stop(current).withContext("ProxyService.closeCurrentBackend", reason)
+        val report = backend.stop(current)
+            .withContext("ProxyService.closeCurrentBackend", reason)
+        if (!report.hasCriticalFailure) backendHandle = null
+        return report
     }
 }
 ```
 
 After activation, the service remains foreground but listener-free in waiting/fail-closed states.
+
+A failed stop retains the native handle for a later idempotent retry. Emergency listener
+closure may establish fail-closed safety, but it never causes the service/backend handle
+to be forgotten. Phase 0 must prove that both `stop()` and `emergencyCloseListener()` are
+idempotent and that a stale/mismatched handle is reported as unresolved rather than
+silently treated as success.
