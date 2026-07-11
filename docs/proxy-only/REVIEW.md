@@ -1,16 +1,28 @@
 # Structural review — proxy-only design (`agent/proxy-only-design`)
 
-Reviewed: ARCHITECTURE.md, README.md, IMPLEMENTATION_PLAN.md, RESEARCH_DECISIONS.md,
-CODE_SKETCHES.md, TEST_PLAN.md, cross-checked against the codebase at `86fedc89`.
+Reviewed: `README.md`, `ARCHITECTURE.md`, `IMPLEMENTATION_PLAN.md`, `RESEARCH_DECISIONS.md`, `CODE_SKETCHES.md`, `TEST_PLAN.md`, cross-checked against the VPNHotspot source and then re-verified through the supplied Graphify index.
+
+## Review provenance and graph grounding
+
+The supplied Graphify index reports:
+
+- 2,464 nodes;
+- 6,088 edges;
+- `SessionConfig` as a 90-edge god-node;
+- `IptablesRule` as a 44-edge core abstraction.
+
+The graph does not replace line-level source review, but it strengthened two conclusions:
+
+1. `Routing.kt` already consumes `Upstreams.primary` and forwards its `networkHandle` to the daemon without VPN-capability validation. That is acceptable for configurable routing mode but cannot be inherited by a feature promising VPN-only fail-closed egress.
+2. The daemon's established firewall convention is the `IptablesRule` mutation ledger in `routing/iptables.rs`, including idempotent insertion/deletion and `delete_repeated()`, plus deterministic cleanup in `routing/firewall_cleanup.rs::clean()`. `proxy_firewall/` must reuse this machinery rather than create a parallel rule representation.
+
+The high connectivity of `SessionConfig` and `IptablesRule` also supports the design decision to keep the proxy firewall lifecycle separate from `SessionConfig` while reusing the existing firewall primitive.
 
 ## Verdict
 
-The design is well-structured: fail-closed by default, deny-first firewall ordering,
-serialized reconciliation, a backend abstraction that keeps Hev replaceable, and honest
-open questions. It is approvable in direction. However, it contains one unverified
-feasibility assumption that belongs in Phase 0, one incorrect claim about codebase
-behaviour, one wrong entry in the failure matrix, an IPv6 policy gap, and several
-internal inconsistencies between documents.
+The direction remains sound: explicit SOCKS5, app-process data plane, deny-first policy, fail-closed behaviour, backend abstraction and phased feasibility gate. The original plan needed corrections around VPN selection, daemon death, IPv6, identity enforcement, UDP ports and cancellation safety.
+
+The revised design documents now address the blocking and high-priority findings below. Implementation is still gated on Phase 0 evidence.
 
 ---
 
@@ -18,197 +30,146 @@ internal inconsistencies between documents.
 
 ### 1.1 `Upstreams.primary` is not guaranteed to be a VPN network
 
-The design states throughout that `Upstreams.primary` is the VPN
-(`ARCHITECTURE.md §1`, `RESEARCH_DECISIONS.md Decision 5`). In the actual code
-(`Upstreams.kt:98–103`), `primary` is:
+`Upstreams.primary` defaults to the VPN flow but can be replaced by the `service.upstream` interface-regex preference. A physical interface such as `wlan0` can therefore become primary.
 
-```kotlin
-val primary = role(KEY_PRIMARY, vpn)   // preferenceFlow(KEY_PRIMARY).flatMapLatest {
-                                       //   if (empty) vpn else iface(upstreamRegex) }
+The existing routing path (`Routing.kt` collection/start path and `SessionConfig.primary_network` construction) forwards this selected network unvalidated. That is valid for routing mode because the user chose the upstream and the feature does not promise VPN-only egress.
+
+Proxy-only makes a stronger claim. The revised plan now requires:
+
+- `Upstreams.vpn` or equivalent VPN-only selection;
+- fresh `TRANSPORT_VPN` capability validation;
+- rejection of a physical primary override;
+- revalidation immediately before startup/`Running`.
+
+**Resolution:** addressed in `README.md`, `ARCHITECTURE.md`, `IMPLEMENTATION_PLAN.md`, `CODE_SKETCHES.md`, `RESEARCH_DECISIONS.md` and `TEST_PLAN.md`.
+
+### 1.2 Per-app VPN policy can make binding fail
+
+A VPN allowed/disallowed-app policy may prevent the VPN Hotspot app UID from using the VPN `Network`. `android_setsocknetwork()`/`Network.bindSocket()` can fail even when the network exists and has `TRANSPORT_VPN`.
+
+The revised Phase 0 matrix tests:
+
+- VPN applied to all apps;
+- VPN Hotspot explicitly included;
+- VPN Hotspot excluded/denied;
+- policy changed while running.
+
+Exclusion maps to a distinct user-visible fail-closed state and never falls back to physical networking.
+
+**Resolution:** addressed in Phase 0, selector sketches and security tests.
+
+### 1.3 Root daemon death does not make existing rules disappear
+
+iptables rules remain in the kernel after `vpnhotspotd` exits. Previously committed allow rules can survive without ACL reconciliation or counters.
+
+The revised liveness contract is:
+
+- long-lived firewall call/channel completion is treated as a critical dependency loss;
+- app-process listener and active sessions close immediately;
+- stale rules are harmless only because no listener remains;
+- daemon recovery runs Clean or deny reconciliation before listener restart.
+
+**Resolution:** corrected in architecture, controller sketch and failure matrix; a mid-session daemon-kill integration test is mandatory.
+
+---
+
+## 2. High-priority findings
+
+### 2.1 IPv6 policy gap
+
+An IPv4-only firewall around a dual-stack/wildcard listener could expose the proxy over IPv6.
+
+MVP now explicitly chooses:
+
+- IPv4-only listener and relay;
+- no published IPv6 endpoint;
+- ip6tables reject rules for TCP listener port and full UDP relay range;
+- IPv6 interface-scan tests.
+
+Full IPv6 relay is deferred.
+
+### 2.2 ACL must enforce MAC as well as IP
+
+IP-only matching permits DHCP/static-IP reuse. Revised IPv4 allows require:
+
+```text
+input interface + source IPv4 + source MAC + destination port/range
 ```
 
-If the user has set the `service.upstream` preference to an interface regex (e.g.
-`wlan0`), `primary` emits a **physical** network. A proxy pinning its sockets to
-`Upstreams.primary.network` would then advertise "fail-closed VPN path" while sending
-traffic over the carrier network — silently defeating the feature's entire security
-contract.
+Interfaces without reliable MAC identity are unsupported in the MVP.
 
-**Fix:** the proxy controller must either consume `Upstreams.vpn` directly, or validate
-`NetworkCapabilities.TRANSPORT_VPN` on the bound network and refuse (fail-closed) when
-the selected upstream is not a VPN. Add this to the security properties in TEST_PLAN §1
-and to the Kotlin unit tests.
+### 2.3 UDP relay range must be explicit
 
-Note: the existing routing path (`Routing.kt` L119, L312) also consumes
-`Upstreams.primary` and forwards `networkHandle` to the daemon unvalidated. That is
-acceptable there — the user explicitly chose the upstream and there is no fail-closed
-promise. The proxy mode makes a stronger claim ("traffic exits via the VPN"), so it
-cannot inherit the same permissiveness.
+The original single `udp_port` proto was premature. Phase 0 must verify the pinned Hev behaviour and constrain relays to a fixed range. Revised settings/proto/firewall use `udp_port_range_start/end` unless a single shared port is proven.
 
-### 1.2 Per-app VPN policy can make `android_setsocknetwork()` fail — untested in Phase 0
+### 2.4 Reconciliation must not be cancelled mid-transaction
 
-Binding a socket to a `Network` requires the calling UID to be permitted to use that
-network. If the user's VPN app is configured with an allowed-apps list that excludes
-VPN Hotspot (or a disallowed-apps list that includes it — plausible, since users may
-exclude it to avoid routing loops in the existing mode), `android_setsocknetwork()` /
-`Network.bindSocket()` fails with EPERM.
+`collectLatest` can cancel after firewall creation but before applied-state recording, or during unsafe teardown.
 
-The Phase 0 spike tests binding mechanics but not this **configuration dimension**.
-Add to Phase 0 exit criteria: binding succeeds/fails as expected under (a) VPN applied
-to all apps, (b) VPN Hotspot excluded, (c) VPN Hotspot explicitly included. Define the
-user-visible error for case (b) — this will be a real support issue.
+The revised controller:
 
-### 1.3 Failure matrix: "Root daemon killed → access defaults to denied" is wrong
-
-iptables rules persist in the kernel after the daemon process dies. If the daemon is
-killed while per-client **allow** rules are committed, those rules survive: clients keep
-proxy access with no ACL reconciliation, no counters, and no block-list enforcement.
-Access does not "default to denied".
-
-**Fix:** the app must monitor daemon liveness (the existing long-lived call/channel
-presumably breaks on death) and treat daemon loss as a stop event: close the native
-listener immediately, then re-establish deny state when the daemon returns. Update
-TEST_PLAN §6 accordingly and add an integration test that kills `vpnhotspotd` mid-session.
+- sends immutable snapshots to `Channel.CONFLATED`;
+- uses one serialized worker;
+- runs commit/rollback in `NonCancellable` context;
+- records partial resources immediately;
+- derives VPN generation in the worker;
+- fully restarts backend on network-handle change;
+- treats client changes as ACL replacement only.
 
 ---
 
-## 2. High-priority gaps
+## 3. Medium-priority findings
 
-### 2.1 IPv6 is unhandled in the firewall model
+### 3.1 Global mode versus per-downstream model
 
-`CODE_SKETCHES.md §8` matches "source IPv4"; `ARCHITECTURE.md §9` binds to "discovered
-downstream IPv4 addresses"; the proto has no address-family field. But Hev supports
-IPv6, tethered clients receive IPv6 addresses (the daemon even ships a full `nat66`
-module), and `IptablesTarget::Ipv6` already exists in `firewall.rs`. A wildcard-bound
-listener with only IPv4 rules is reachable over IPv6 with **no firewall policy at all**.
+Resolved as global MVP UI (`VPN_ROUTING`, `PROXY_ONLY`) with independent per-downstream flags underneath. Mixed mode is deferred.
 
-**Fix:** explicitly choose for the MVP: either (a) install ip6tables deny rules for the
-proxy ports and bind IPv4-only, or (b) mirror the full rule set on both families. Option
-(a) is the smaller change; either way it must be stated, implemented, and covered by the
-interface-exposure tests (which currently don't mention address family).
+### 3.2 Blocking DNS in Hev workers
 
-### 2.2 ACL matches IP only; identity is MAC
+Phase 0 now includes blackholed-DNS concurrency measurements. The design requires a bounded resolver pool or asynchronous network-aware resolver; no unbounded blocking call in Hev workers.
 
-Decision 4 / Phase 6 say "MAC is the public identity, IP is an implementation selector",
-but the firewall pseudo-policy matches downstream interface + source IPv4 only. DHCP
-reassignment or deliberate static-IP reuse lets one client inherit another's allow rule
-(and its counters). iptables supports `-m mac --mac-source`; the neighbour monitor
-already provides MAC↔IP mappings.
+### 3.3 Foreground-service type is a merge gate
 
-**Fix:** match iface + source IP + source MAC for allow rules on interfaces where MAC is
-visible (Wi-Fi; USB/RNDIS has a peer MAC too). Document that IP-only matching is a
-spoofing surface if MAC matching is dropped anywhere.
+Moved into Phase 2. The manifest change cannot merge until the current target SDK, required type/permissions and distribution-policy eligibility are documented and tested.
 
-### 2.3 UDP relay ports vs. single `udp_port`
+### 3.4 Untested combined mode
 
-`ARCHITECTURE.md §7` mentions "listener UDP port or UDP port range", but
-`ProxyFirewallConfig` has a single `uint32 udp_port`, and `ProxyOnlySettings` a single
-`port`. Standard `UDP ASSOCIATE` servers commonly allocate **ephemeral per-association
-relay ports** and return them in the reply. If Hev does this, the firewall must allow a
-configured relay port range (and Hev must be constrained to it) or the UDP path dies at
-the firewall.
+`VPN_ROUTING_AND_PROXY` was cut from the MVP rather than left untested.
 
-**Fix:** resolve in Phase 0 against the pinned Hev source; make the proto carry
-`udp_port_range_start/end` if needed. This is exactly the kind of mismatch that
-surfaces late and forces a proto change mid-implementation.
+### 3.5 Native fork CI
 
-### 2.4 Reconciler sketch is not cancellation-safe
+The prepare hook now accepts an injected bind function. Linux host CI uses a shim to record calls and force failures; Android instrumentation tests the real `android_setsocknetwork()` path.
 
-`CODE_SKETCHES.md §2` uses `collectLatest { mutex.withLock { reconcile(desired) } }`.
-`collectLatest` **cancels** the running block on a new emission. Cancellation between
-`firewall.startDenied(...)` and `current = AppliedProxyState(...)` leaks the firewall
-runtime (deny rules stay installed, `current` never records the id); cancellation inside
-`stopCurrent()` can leave the native listener running with firewall state removed.
+### 3.6 Runtime key precision
 
-**Fix:** run reconciliation in a dedicated worker consuming a conflated channel of
-desired states (emission never cancels an in-flight apply), or wrap commit/rollback
-sections in `withContext(NonCancellable)`. Also move the `generation`/`previousNetwork`
-mutation out of the `combine` transform — side effects in flow operators re-execute
-unpredictably; derive generation inside the serialized worker.
-
-Additionally, the state machine (`Running → Stopping → Starting` on generation change)
-and the JNI surface (`updateNetwork`/`replaceNetwork` on a live instance) describe two
-different mechanisms for the same event. Pick one for the MVP — full restart is simpler,
-matches the state machine, and makes "close all old-generation sessions" trivially true.
-Keep `updateNetwork` as a later optimization behind the `ProxyBackend` interface.
+The revised key includes TCP port, UDP range, credentials version, validated VPN handle, sorted downstream set and backend version. Client ordering and irrelevant link churn do not restart the listener.
 
 ---
 
-## 3. Medium-priority issues
+## 4. Sound decisions retained
 
-**3.1 Global `SharingMode` vs per-downstream flags.** Phase 2 defines a single global
-enum; Phase 5 defines `ManagedDownstream(vpnRoutingEnabled, proxyExposureEnabled)` per
-interface. These are different products (all-or-nothing vs per-interface mixing). Decide
-now: recommend global mode for MVP UI, but with the per-downstream data model underneath
-so the setting can become per-interface without migration.
+- fail-closed by default with no MVP direct fallback;
+- deny-first startup and deny-before-normal-teardown ordering;
+- data plane in app process and privileged policy in root daemon;
+- `ProxyBackend` abstraction so Phase 0 can reject Hev;
+- explicit SOCKS5 instead of TPROXY;
+- independent proxy firewall lifecycle instead of extending `SessionConfig`;
+- phased PR sequence with a hard Phase 0 stop gate;
+- threat coverage for open proxy, VPN bypass, DNS leaks, UDP hijacking and exhaustion.
 
-**3.2 Blocking DNS inside the Hev event loop.** Hev runs on hev-task-system coroutines.
-Both proposed resolvers (`android_getaddrinfofornetwork()`, JNI → `Network.getAllByName()`)
-are blocking calls; invoked from a task, they stall every session on that worker
-(head-of-line blocking, seconds per timeout). The plan flags JVM-attach complexity but
-not this. **Fix:** require the Phase 0 spike to measure resolver behaviour under a
-blackholed DNS server; plan for a dedicated resolver thread pool or `android_res_nsend`
-(async, network-aware, API 29+) rather than assuming the simple call is safe.
+## 5. Required implementation gates after rewrite
 
-**3.3 Foreground-service type is a gating requirement, not a footnote.** Android 14+
-requires a declared FGS type with a policy-compliant justification; `specialUse` needs
-Play review. This can gate release regardless of code quality. Promote open question 7
-to a Phase 2 task with an actual answer (likely `connectedDevice` — verify eligibility).
+The documents are now internally aligned, but implementation must still provide evidence for:
 
-**3.4 `VPN_ROUTING_AND_PROXY` is designed but never tested.** TEST_PLAN covers baseline,
-proxy-only, and the existing mode; no test exercises the combined mode (interaction of
-RoutingManager rules with proxy firewall chains on the same interface is exactly where
-rule-ordering bugs live). Either add a test section or cut the mode from the MVP —
-README's own rationale for it ("useful for compatibility testing") is weak.
+1. exact Hev pin and complete prepare-hook coverage;
+2. per-app VPN policy matrix;
+3. UDP relay range behaviour;
+4. non-blocking VPN-aware DNS under blackhole;
+5. IPv6 denial;
+6. iface+IP+MAC rules using shared `IptablesRule` ledger;
+7. daemon-death listener shutdown and recovery Clean;
+8. foreground-service declaration/policy;
+9. reliable MAC identity for each supported downstream;
+10. host CI plus Android instrumentation tests.
 
-**3.5 Native fork CI story is missing.** The Hev-fork unit tests (hook coverage, retry
-paths, IPv4/IPv6 fallback) are listed but nothing says where they run.
-`android_setsocknetwork` doesn't exist on a Linux CI host. Specify a host build with a
-shim (`vpnhotspot_prepare_outbound_socket` behind a testable seam — the hook design
-already permits this) so the "every socket path invokes the hook" property is enforced
-by CI, not by a manual audit checklist that rots as the fork rebases.
-
-**3.6 `distinctUntilChanged` on `DesiredProxyState` / `runtimeKey()` underspecified.**
-Client-list ordering or `LinkProperties` churn must not restart the listener. Define
-`runtimeKey` precisely (port, credentials version, network handle, downstream set as a
-sorted set) and make client changes a `replace`, never a restart — §2's sketch gestures
-at this but the key derivation is the part that will be gotten wrong.
-
----
-
-## 4. What is sound (keep as-is)
-
-- **Fail-closed as default with explicit-opt-in fallback** (Decision 5) — correct call.
-- **Deny-first startup / deny-before-teardown ordering** (ARCHITECTURE §10) — the
-  open-proxy-window analysis is right.
-- **Data plane in app process, policy in root daemon** (Decision 3/4) — correct
-  privilege separation; keeps the fork off UID 0.
-- **`ProxyBackend` abstraction** (Decision 10) — cheap insurance given Phase 0 has a
-  real chance of rejecting Hev; the Kotlin/Rust fallbacks are pre-identified.
-- **Explicit SOCKS5 over TPROXY** (Decision 1) — right scope for the FlClash use case.
-- **Independent proxy-firewall proto lifecycle** rather than overloading
-  `SessionConfig` — matches existing `daemon.proto` conventions (commands 9/10 are free,
-  `CancelCommand` semantics reusable). One concretization: `proxy_firewall/` should
-  reuse the existing `IptablesRule` ledger machinery
-  (`routing/iptables.rs` — `-I`/`delete_repeated` idempotent mutations) and hook into
-  `routing/firewall_cleanup.rs::clean()` rather than introducing a parallel rule
-  representation; the sketches currently leave this open.
-- **Phased PR sequence with a kill-switch spike** — Phase 0 exit criteria are concrete;
-  the "stop before UI/daemon work" gate is the most valuable line in the plan.
-- **Threat model coverage** (open proxy, VPN bypass, DNS leak, UDP hijack, exhaustion)
-  is unusually complete for a design at this stage.
-
-## 5. Recommended amendments before implementation
-
-1. Phase 0 additions: VPN-capability validation of the upstream (1.1), per-app VPN
-   binding matrix (1.2), Hev UDP relay-port behaviour (2.3), resolver blocking
-   measurement (3.2).
-2. Correct the failure matrix for daemon death (1.3) and add the kill-daemon
-   integration test.
-3. Add an explicit IPv6 policy section to ARCHITECTURE §7 and TEST_PLAN §4 (2.1).
-4. Firewall rules: iface + IP + MAC matching (2.2).
-5. Replace `collectLatest`+mutex with a non-cancellable serialized apply loop; choose
-   restart-on-generation-change for MVP (2.4).
-6. Resolve global-vs-per-downstream mode ambiguity (3.1); cut or test
-   `VPN_ROUTING_AND_PROXY` (3.4).
-7. Answer the FGS-type question in Phase 2, not at release (3.3).
-8. Specify host-CI shim for the Hev fork tests (3.5).
+Until these pass, the design is approved only in direction, not implementation-ready.
