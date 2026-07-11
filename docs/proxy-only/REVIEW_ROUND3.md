@@ -140,3 +140,34 @@ it currently requires `OUTBOUND_UDP` to pass even when `udpEnabled = false`.
 With findings 1.1–1.4 corrected in the documents, the design is internally consistent
 and Phase 0 implementation can begin. The Phase 0 exit criteria and release gates from
 the previous rounds remain unchanged and still gate everything beyond the spike.
+
+---
+
+## 5. Resolution applied after round 3
+
+The branch documents were rewritten after this review. Resolution status:
+
+| Round-3 item | Resolution |
+| --- | --- |
+| 1.1 Debt clearing mismatch | `CleanupDebt` now carries listener, service handle, firewall handle, deny, firewall stop, daemon Clean and feature-stop obligations separately. Retry clears fields item by item. A healthy-daemon firewall-stop failure retains and retries the exact firewall handle. |
+| 1.2 No retry trigger | Added `ControllerEvent.RetryCleanupDebt(generation)` plus bounded exponential-backoff re-enqueue of the retained latest desired snapshot. Debt can clear with no external flow emission. |
+| 1.3 Activation context missing | Added one-time `ActivationGrant`, `ActivationRequired`, grant consumption after successful FGS activation, pre-activation service-call guards and no-op client behavior. Persisted enable state alone cannot start the FGS. |
+| 1.4 Typed failures unreachable | Replaced generic all-pass `check()` with typed, configuration-aware `ProbeEvaluation`. `VpnPermissionDenied` is reachable; UDP is required only when enabled; TCP/DNS/UDP/listener failures retain distinct reasons. |
+| Idle emergency-close churn | `cleanupApplied` returns immediately when no applied resources exist. Emergency close runs only after a real partial/backend resource existed and normal stop did not prove closure. |
+| Duplicate feature stop | Terminal shutdown is the sole owner of `stopFeature`. |
+| Exception control-flow debt gate | Replaced with explicit publish/schedule/return while debt remains. |
+| Implicit IPv4 deny | Restored explicit `deny_all_ipv4` alongside `deny_all_ipv6` in the proto and firewall contract. |
+
+### Added verification gates
+
+- healthy-daemon firewall-stop debt partial-resolution test;
+- quiescent-system retry test;
+- activation grant expiration/replay/process-restart tests;
+- pre-activation service no-op tests;
+- typed probe reachability tests;
+- UDP-disabled probe requirement test;
+- no-idle-debt test;
+- single-owner feature-stop test;
+- explicit IPv4 deny tests.
+
+With these document changes, the design is approved to begin **Phase 0 feasibility work only**. This remains no approval for production UI, firewall commands or release code before the Phase 0 exit criteria pass.
