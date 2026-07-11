@@ -1,116 +1,161 @@
 # Proxy-only implementation plan
 
-This plan is split into independently reviewable stages. Only Phase 0 is approved to start. UI, production firewall integration and release work remain gated by Phase 0 evidence.
+This plan is limited to the selective SOCKS5 design described in this directory. The feature keeps ordinary Android system tethering as the direct path and exposes an authenticated proxy whose outbound operations use a validated Android VPN `Network`.
+
+No UI, production daemon command or release code may proceed until the Phase 0 exit criteria pass.
+
+## Non-negotiable invariants
+
+1. Proxy-only never treats `Upstreams.primary` as proof of VPN transport.
+2. Exactly one usable `TRANSPORT_VPN` candidate must exist.
+3. Every Internet-facing TCP, UDP and resolver socket is bound to that VPN before packet-producing use.
+4. VPN/app-policy/binding failure never falls back to the physical network.
+5. `ProxyService` is the sole `ProxyBackend` and native-handle owner.
+6. The listener is never reachable without a live root firewall runtime.
+7. Daemon loss closes the listener even though kernel allow rules may remain.
+8. IPv4 allow requires downstream interface + source IPv4 + source MAC.
+9. The MVP listener/relay is IPv4-only; proxy ports are denied over IPv6.
+10. Desired-state reconciliation is serialized, exception-safe, terminal-safe and restart-blocked while cleanup debt exists.
+11. Startup probes are outbound-only until client allow rules are committed.
+12. TPROXY, mixed routing+proxy mode and direct fallback are outside the MVP.
+
+---
 
 ## Phase 0 — feasibility and security spike
 
-### Objective
+### Goal
 
-Prove that a pinned HevSocks5Server can provide a fail-closed SOCKS5 data plane on Android without hidden physical fallback, worker death, DNS head-of-line blocking, ambiguous UDP firewall behavior or background-service restart assumptions.
+Prove that a pinned HevSocks5Server revision can satisfy the invariants with a small maintainable fork. Phase 0 produces test code, measurements and an architecture decision; it does not produce release UI or production firewall integration.
 
-### 0.1 Pin and build
+### 0.1 Pin and audit Hev
 
-1. Pin an exact Hev commit and recursive dependency state.
-2. Record licenses/notices.
-3. Build host-test and Android variants for all VPN Hotspot ABIs.
-4. Enumerate every Internet-facing TCP, UDP and resolver FD creation path.
-5. Add one injected socket-prepare seam for host CI and Android `android_setsocknetwork()`.
-6. Make hook failure fatal in fail-closed mode.
+- Pin exact HevSocks5Server and recursive dependency commits.
+- Record license and attribution obligations.
+- Build Linux host-test and Android variants for all VPN Hotspot ABIs.
+- Enumerate every outbound TCP, UDP and resolver FD creation path, including retries and address-family fallback.
+- Add one injected `prepare_outbound_socket` seam.
+- Make prepare-hook failure fatal in fail-closed mode.
+- Verify hook ordering: `socket()` → prepare/bind → `connect()` or first `sendto()`.
 
-### 0.2 VPN selection and app-UID policy
+### 0.2 VPN candidate selection
 
-1. Demonstrate that `Upstreams.primary` may be physical.
-2. Prototype a VPN-only candidate source.
-3. Re-read capabilities immediately before startup.
-4. Require `TRANSPORT_VPN`.
-5. Test app-UID binding when VPN applies to all apps, explicitly includes VPN Hotspot, excludes VPN Hotspot and changes policy while running.
-6. Detect more than one usable VPN candidate and return `MultipleVpnCandidates` instead of selecting nondeterministically.
+- Use the VPN-specific candidate flow or enumerate networks with fresh capabilities.
+- Reject physical/stale candidates.
+- Fail closed when zero usable VPNs exist.
+- Fail closed with `MultipleVpnCandidates` when more than one usable VPN exists.
+- Do not sort transient network handles to infer user intent.
+- Re-read `NetworkCapabilities` immediately before startup and before `Running`.
 
-Expected exclusion result: stable permission error, no listener exposure and no physical fallback.
+### 0.3 Per-app VPN policy matrix
 
-### 0.3 UDP socket-topology discovery
+Test binding and outbound traffic when:
 
-For multiple simultaneous `UDP ASSOCIATE` sessions, record:
+- the VPN applies to all apps;
+- VPN Hotspot is explicitly included;
+- VPN Hotspot is excluded/denied;
+- the policy changes while running;
+- always-on/lockdown is enabled where available.
 
-- control TCP FD and peer;
-- returned `BND.ADDR/BND.PORT`;
-- client-facing relay FD/local port;
-- Internet-facing FD/local port;
-- whether those roles share an FD;
-- prepare-hook calls for each FD;
-- ingress interface for client packets and remote replies;
-- conntrack state of remote replies;
-- behavior when relay range is exhausted.
+Expected exclusion behavior: stable `VpnPermissionDenied`, no listener exposure and no physical fallback.
 
-Use packet capture plus native FD/port logging in a debug-only test build. Determine whether the firewall needs a verified `ESTABLISHED/RELATED` rule before terminal relay-range reject. Do not approve a broad VPN-interface allow.
+### 0.4 UDP socket-topology discovery
 
-The spike must define:
+Instrument and correlate:
+
+- SOCKS control TCP FD;
+- client-facing relay FD and returned `BND.ADDR/BND.PORT`;
+- Internet-facing UDP FD;
+- shared versus separate relay/upstream sockets;
+- every prepare-hook call;
+- local address/port for each FD;
+- client packet ingress interface;
+- remote-reply ingress interface;
+- conntrack state of replies;
+- behavior for multiple simultaneous associations.
+
+Use packet capture and debug-only native events. Do not finalize the UDP INPUT rule until remote replies work with a narrowly evidenced rule. A broad VPN-interface allow is prohibited.
+
+### 0.5 UDP range and capacity
+
+Determine whether Hev supports:
+
+- one fixed relay port;
+- a bounded configured port range;
+- one relay port per association;
+- a shared relay port for many associations.
+
+Unless one fixed/shared port is proven, the cross-process contract carries `udp_port_range_start/end`.
+
+If a port is consumed per association:
 
 ```text
-udp_port_range_start
-udp_port_range_end
-configured association limit
-effective association limit
+effectiveUdpCapacity = min(configuredAssociationLimit, usableRelayPortCount)
 ```
 
-If one port is consumed per association:
+Range exhaustion returns a controlled failure and metric. The range never expands dynamically.
 
-```text
-effective limit = min(configured limit, usable ports in range)
-```
+### 0.6 DNS architecture
 
-### 0.4 DNS architecture
+Measure domain requests with:
 
-Test domain requests with working and blackholed VPN DNS, VPN loss, cancellation and concurrent resolutions.
+- working VPN DNS;
+- blackholed VPN DNS;
+- many concurrent requests;
+- VPN loss during resolution;
+- network-generation replacement.
 
 Select either:
 
-- bounded resolver workers around a VPN-aware synchronous API; or
-- an asynchronous Android resolver path.
+- bounded dedicated resolver workers using a VPN-aware API; or
+- asynchronous Android network-aware resolver integration.
 
-The chosen path must not block all Hev workers and must never use process-default DNS.
+The process-default resolver is forbidden. A blackholed resolver must not stall unrelated sessions.
 
-### 0.5 Probe semantics
+### 0.7 Address-family proof
 
-Startup probes are outbound-only:
+- Bind the MVP listener and relay explicitly as IPv4-only.
+- Verify no unintended dual-stack wildcard listener exists.
+- Verify native IPv6 and IPv4-mapped access cannot reach the proxy.
+- Prepare explicit ip6tables denial for TCP port and complete UDP relay range.
 
-1. app-UID socket bind;
-2. backend-created outbound TCP;
-3. backend-created outbound UDP;
-4. VPN-aware DNS;
-5. internal listener bind/listen readiness.
+### 0.8 Host CI seam
 
-Do not run a downstream listener-reachability probe while deny-first rules are active. External client reachability is tested only after allow commit.
+Linux host CI injects a fake network-binding function that records:
 
-### 0.6 IPv6 boundary
+- FD;
+- family/type;
+- path/role;
+- ordering;
+- configured failure.
 
-Prove IPv4-only listener/relay creation and ip6tables denial. Test native IPv6 and IPv4-mapped access.
+CI proves every outbound socket path invokes the hook before traffic and closes the FD on failure. Android instrumentation separately verifies real `android_setsocknetwork()` behavior.
 
-### 0.7 Host-CI seam
+### Phase 0 exit criteria
 
-Host tests inject a fake bind callback and assert every TCP/UDP/retry/resolver path invokes it before packet-producing operations. The host target must not link Android APIs.
+All must pass:
 
-### 0.8 Exit criteria
+- exact Hev pin and small maintainable delta;
+- complete host-tested prepare-hook coverage;
+- TCP through the phone VPN;
+- standard UDP ASSOCIATE through the phone VPN;
+- documented UDP topology and safe return-rule design;
+- bounded UDP range/capacity behavior;
+- VPN-aware DNS without global worker stalls;
+- zero/one/multiple VPN selection behavior;
+- per-app VPN include/exclude matrix;
+- invalid/stale/non-VPN handles fail closed;
+- IPv6 cannot reach the listener/range;
+- repeated start/stop leaks no FD/thread;
+- VPN generation replacement requires full backend restart;
+- no physical-network packet appears during failure tests.
 
-- exactly one usable VPN candidate is required;
-- physical primary override is rejected;
-- app exclusion is diagnosed fail-closed;
-- TCP `CONNECT` works through VPN;
-- UDP `ASSOCIATE` works with documented FD/port topology;
-- firewall reply rule requirements are proven by capture/conntrack evidence;
-- relay ports stay in range and exhaustion fails safely;
-- VPN-aware DNS is bounded and non-blocking to unrelated sessions;
-- all outbound FDs pass the hook;
-- IPv6 cannot reach the MVP listener/range;
-- backend restart handles VPN generation changes;
-- repeated start/stop leaks no threads or FDs;
-- fork delta is maintainable.
+If any security criterion fails, stop and evaluate a Kotlin or Rust backend behind the same service/controller interfaces.
 
-If any security criterion fails, stop and evaluate a Kotlin or Rust backend behind the same service/controller contracts.
+---
 
-## Phase 1 — native dependency integration
+## Phase 1 — dependency and build integration
 
-Proposed layout:
+### Layout
 
 ```text
 external/hev-socks5-server/
@@ -119,33 +164,23 @@ mobile/src/main/java/be/mygod/vpnhotspot/proxy/
 mobile/src/main/rust/vpnhotspotd/src/proxy_firewall/
 ```
 
-Requirements:
+### Requirements
 
-- reproducible pin in local, CI and source archives;
-- MIT notices in app OSS notices;
-- `libvpnhotspot_proxy.so` for every ABI;
-- Hev internals hidden behind backend/JNI boundary;
-- host-native test target using bind shim;
-- APK/AAB symbol, ABI and size inspection.
+- reproducible source pin in local, CI and source archives;
+- MIT notices included in app OSS notices;
+- native library built for every supported ABI;
+- Hev internals hidden behind `ProxyBackend`/JNI;
+- host-native test target retained;
+- APK/AAB ABI, symbols, duplicate libraries and size inspected;
+- current Gradle/Rust checks remain green.
 
-Validation:
+---
 
-```bash
-git submodule update --init --recursive
-./gradlew assembleDebug
-./gradlew check
-./gradlew test
-```
+## Phase 2 — settings, state and foreground-service gate
 
-Also run host-native fork tests and current Rust daemon tests.
-
-## Phase 2 — domain model and foreground-service gate
-
-### Models
+### Settings
 
 ```kotlin
-enum class SharingMode { VPN_ROUTING, PROXY_ONLY }
-
 data class ProxyOnlySettings(
     val enabled: Boolean,
     val tcpPort: Int,
@@ -160,120 +195,212 @@ data class ProxyOnlySettings(
 
 Requirements:
 
-- random credentials;
+- random generated credentials;
 - credential-encrypted storage and backup exclusion;
-- bounded TCP port, UDP range and association limit;
-- effective UDP capacity exposed to diagnostics;
-- no secret logging or implicit export;
-- existing users migrate to `VPN_ROUTING`.
+- validated TCP port, UDP range and conflicts;
+- effective UDP capacity shown in diagnostics;
+- no secrets in logs, `toString()`, implicit intents or routine notification;
+- existing installations remain `VPN_ROUTING`.
+
+### States
+
+At minimum:
+
+```text
+Disabled
+ServiceStarting
+WaitingForTethering
+WaitingForVpn
+MultipleVpnCandidates
+VpnPermissionDenied
+StartingBackend
+Running
+FailClosed
+CleanupDegraded
+Stopping
+```
 
 ### Foreground-service type and start context
 
-Before merging `ProxyService`:
+Before merging the manifest change:
 
 1. verify current target SDK;
-2. choose a valid FGS type and permissions;
-3. verify store-policy eligibility;
-4. document which user action starts the service;
+2. select a valid FGS type and permissions;
+3. verify distribution/store policy eligibility;
+4. document the exact user action that starts the service;
 5. add manifest/lint tests;
-6. explicitly handle `ForegroundServiceStartNotAllowedException`.
+6. map `ForegroundServiceStartNotAllowedException` to an actionable error.
 
-Once user-started and enabled, the service remains alive in waiting/fail-closed states. It does not stop on VPN or daemon loss and then attempt a background restart.
+A disabled snapshot must never start the FGS. The first start occurs only after a user-approved enable action.
 
-Automatic process-death resurrection is not assumed.
+Once enabled and started, the FGS remains alive—without a listener—in waiting/fail-closed states. Automatic process-death resurrection is not assumed.
 
-## Phase 3 — controller, service client and exception-safe worker
+---
+
+## Phase 3 — service ownership and command contract
 
 ### Ownership
 
 ```text
-ProxyOnlyController -> ProxyServiceClient -> ProxyService -> ProxyBackend
-ProxyOnlyController -> ProxyFirewallClient -> vpnhotspotd
+ProxyOnlyController
+  -> ProxyServiceClient
+      -> ProxyService
+          -> ProxyBackend / native handles
+
+ProxyOnlyController
+  -> ProxyFirewallClient
+      -> vpnhotspotd
 ```
 
-The controller never owns or calls `ProxyBackend` directly.
+The controller never holds `ProxyBackend` or native handles.
 
-### Desired inputs
-
-- settings/credentials version;
-- VPN candidates and fresh capabilities;
-- tethered interface/IPv4 state;
-- MAC↔IPv4 neighbours and blocked clients;
-- daemon channel health;
-- service lifecycle.
-
-### Worker contract
-
-One `Channel.CONFLATED` feeds one worker.
-
-Required behavior:
-
-- no `collectLatest` around resource operations;
-- normalized runtime key;
-- per-iteration `try/catch`;
-- `NonCancellable` transaction and rollback;
-- fast-path replace exceptions enter fail-closed recovery;
-- publication errors are contained;
-- cleanup attempts deny, service backend stop and firewall stop independently;
-- cleanup errors are aggregated and reported;
-- worker `finally` runs terminal `stopApplied()`.
-
-### Runtime key
-
-Restart only for:
-
-- TCP port;
-- UDP enabled/range;
-- credentials version;
-- VPN network handle;
-- sorted downstream interface/address set;
-- backend configuration version.
-
-Client changes perform firewall/service ACL replacement only.
-
-## Phase 4 — ProxyService and backend
-
-Files:
-
-```text
-ProxyService.kt
-ProxyServiceClient.kt
-ProxyNotification.kt
-ProxyBackend.kt
-HevProxyBackend.kt
-ProxyNative.kt
-```
-
-`ProxyService` owns:
-
-- FGS lifecycle;
-- backend instance;
-- native handles;
-- listener/sessions;
-- backend stats;
-- emergency listener closure.
-
-Service API should expose intent/binder-safe commands such as:
+### Service commands
 
 ```kotlin
 interface ProxyServiceClient {
+    suspend fun activateFeature(initialState: ProxyOnlyState): ServiceActivation
+    suspend fun enterWaiting(state: ProxyOnlyState): CleanupReport
     suspend fun startBackend(config: ProxyBackendConfig): ProxyServiceHandle
     suspend fun replaceAcl(handle: ProxyServiceHandle, clients: List<AllowedClient>)
     suspend fun runOutboundProbes(handle: ProxyServiceHandle): ProbeReport
     suspend fun stopBackend(handle: ProxyServiceHandle): CleanupReport
     suspend fun emergencyCloseListener(reason: String): CleanupReport
+    suspend fun stopFeature(reason: String): CleanupReport
+    suspend fun readStats(handle: ProxyServiceHandle): ProxyBackendStats
 }
 ```
 
-`stopBackend` must be idempotent and attempt complete native cleanup even when one native step fails.
+Semantics:
 
-There is no live network replacement in the MVP.
+- `activateFeature` is called only from the approved enable path.
+- `enterWaiting` closes backend/listener, retains FGS and updates notification.
+- `stopFeature` closes backend/listener and terminates the FGS.
+- backend commands are serialized inside the service.
+- stop/emergency commands are idempotent and return structured results.
 
-## Phase 5 — system tethering integration
+---
 
-Pure `PROXY_ONLY` downstreams do not create `RoutingManager`.
+## Phase 4 — exception-safe desired-state worker
 
-Internal model:
+### Input
+
+Immutable normalized snapshots include:
+
+- settings and credential version;
+- zero/one/multiple usable VPN result;
+- tethered interface/IPv4 set;
+- neighbour MAC↔IPv4 state;
+- blocked clients;
+- daemon/firewall channel health;
+- service activation state;
+- outstanding cleanup debt.
+
+One `Channel.CONFLATED` feeds one worker. No resource operation uses `collectLatest`.
+
+### Activation ordering
+
+1. If settings are disabled, run terminal cleanup and `stopFeature`; do not call service activation.
+2. If enabled but the service has not been user-started, request/await the approved activation result.
+3. Waiting/fail-closed snapshots call `enterWaiting(state)` so the FGS notification and listener state match the controller state.
+4. Running startup proceeds only when no cleanup debt exists.
+
+### Exception and cancellation contract
+
+Each iteration:
+
+- runs resource commit/rollback in bounded `NonCancellable` sections;
+- catches `TimeoutCancellationException` as an operation failure;
+- rethrows parent `CancellationException` so terminal `finally` executes;
+- catches other unexpected exceptions and enters fail-closed recovery;
+- contains state-publication errors without killing the resource worker.
+
+Worker `finally` performs terminal cleanup in `NonCancellable` context and attempts service emergency closure even if normal backend stop fails.
+
+### Cleanup algorithm
+
+Attempt independently, with per-step timeout:
+
+1. firewall deny when daemon is available;
+2. service backend stop;
+3. service emergency listener close if stop failed or ownership is uncertain;
+4. firewall runtime stop;
+5. service waiting transition or terminal feature stop;
+6. error/state publication.
+
+Every failure is recorded with step, handle/generation context and cause. No silent `runCatching`.
+
+### Cleanup debt
+
+Failed cleanup creates structured debt containing unresolved service/firewall handles and required recovery actions.
+
+While debt exists:
+
+- no backend start is allowed;
+- service remains listener-free/fail-closed;
+- emergency close is retried;
+- daemon recovery runs Clean or explicit deny before normal start;
+- successful recovery clears debt;
+- UI/notification reports degraded cleanup.
+
+### Runtime key
+
+Restart backend only when these change:
+
+- TCP port;
+- UDP enabled/range;
+- credentials version;
+- validated VPN network handle;
+- sorted downstream interface/address set;
+- backend configuration version.
+
+Client ordering and block-list changes perform firewall/service ACL replacement only. Fast-path replacement exceptions use the same fail-closed recovery path.
+
+---
+
+## Phase 5 — backend, probes and DNS
+
+### Backend contract
+
+```kotlin
+interface ProxyBackend {
+    suspend fun start(config: ProxyBackendConfig): ProxyBackendHandle
+    suspend fun replaceAcl(handle: ProxyBackendHandle, clients: List<AllowedClient>)
+    suspend fun runOutboundProbes(handle: ProxyBackendHandle): ProbeReport
+    suspend fun stats(handle: ProxyBackendHandle): ProxyBackendStats
+    suspend fun stop(handle: ProxyBackendHandle): CleanupReport
+}
+```
+
+No live network replacement in MVP. Network-handle change performs deny → close → stop → validate → recreate.
+
+### Outbound-only probes
+
+Before ingress allows:
+
+- app-UID network bind;
+- backend-created outbound TCP;
+- backend-created outbound UDP;
+- VPN-aware DNS;
+- internal native bind/listen readiness.
+
+The pre-allow probe never connects to the SOCKS listener through a tethered interface. External reachability is tested after allow commit.
+
+### UDP
+
+- RFC 1928 UDP ASSOCIATE;
+- control TCP owns association lifetime;
+- `FRAG != 0` rejected;
+- authenticated/control peer source enforced;
+- relay range constrained;
+- effective capacity enforced;
+- all Internet-facing FDs pass network hook;
+- range exhaustion is controlled and measured.
+
+---
+
+## Phase 6 — system tethering integration
+
+In `PROXY_ONLY`, do not instantiate the existing VPN-forwarding `RoutingManager` for that downstream.
 
 ```kotlin
 data class ManagedDownstream(
@@ -286,121 +413,116 @@ data class ManagedDownstream(
 
 Initial support:
 
-- Wi-Fi system tethering;
+- system Wi-Fi tethering;
 - USB tethering where MAC identity is reliable;
-- Ethernet only after equivalent tests.
+- Ethernet only after equivalent testing.
 
 Deferred:
 
 - LocalOnlyHotspot;
 - Wi-Fi Direct repeater;
 - Bluetooth;
-- interfaces without reliable MAC identity.
+- interfaces without reliable MAC+IPv4 identity.
 
-## Phase 6 — root proxy firewall
+---
 
-### Independent lifecycle
+## Phase 7 — root proxy firewall
 
-Add a long-lived start/replace/cancel command separate from `SessionConfig`.
+### Lifecycle
 
-```proto
-message ProxyFirewallConfig {
-  repeated ProxyDownstream downstreams = 1;
-  uint32 tcp_port = 2;
-  uint32 udp_port_range_start = 3;
-  uint32 udp_port_range_end = 4;
-  repeated ProxyClient allowed_clients = 5;
-  uint64 generation = 6;
-  bool ipv6_deny = 7;
-}
-```
+Use an independent long-lived daemon command; do not extend `SessionConfig`.
 
 ### Mandatory reuse
 
-- expose/reuse `routing/iptables.rs::IptablesRule` and `IptablesChain` at crate scope;
-- reuse applied ledger and `delete_repeated()`;
-- add proxy jumps/chains to `firewall_cleanup.rs::clean()`;
-- use IPv4 and IPv6 targets;
-- preserve deterministic cleanup without app DB state.
+- promote/reuse `routing/iptables.rs::IptablesRule` and `IptablesChain` as needed;
+- use the existing applied ledger and `delete_repeated()` semantics;
+- add proxy jumps/chains to `routing/firewall_cleanup.rs::clean()`;
+- use both IPv4 and IPv6 targets;
+- keep cleanup reconstructable without private app state.
 
 ### Policy
 
 IPv4 client allow requires:
 
 ```text
-input interface + source IPv4 + source MAC + destination TCP/UDP port range
+input interface + source IPv4 + source MAC + destination port/range
 ```
 
-IPv4 terminal reject and IPv6 deny are mandatory.
+IPv4 ends in reject. IPv6 rejects TCP port and complete UDP range.
 
-The exact return-traffic rule before UDP terminal reject is implemented only after Phase 0 proves Hev socket topology and conntrack semantics.
-
-No IP-only fallback and no broad VPN-interface allow.
+Any UDP return-traffic rule remains provisional until Phase 0 topology evidence defines exact interface, state and ordering. No broad VPN-interface allow.
 
 ### Daemon death
 
-Unexpected long-lived call completion causes immediate service listener closure. The FGS remains alive in fail-closed state. On daemon return, Clean/deny completes before backend restart.
+Unexpected completion of the firewall command/channel:
 
-## Phase 7 — UI and diagnostics
+1. triggers service emergency listener close immediately;
+2. enters foreground fail-closed state;
+3. records cleanup debt because stale kernel rules may remain;
+4. requires Clean/deny reconciliation before backend restart.
+
+---
+
+## Phase 8 — UI and support diagnostics
 
 Show:
 
 - sharing mode;
-- persistent service state;
-- actionable VPN/permission/multiple-VPN errors;
-- endpoint and credentials;
+- FGS/service state;
+- waiting/fail-closed reason;
+- cleanup-degraded state and recovery status;
+- IPv4 endpoint and TCP port;
 - UDP range and effective capacity;
-- daemon unavailable state;
-- cleanup failures requiring attention;
-- active TCP/UDP counts and per-client counters;
+- credentials with controlled reveal/copy/regenerate;
+- selected VPN identity/status;
+- multiple-VPN and app-excluded guidance;
+- daemon health;
+- active TCP/UDP counts and counters;
 - generated FlClash snippet.
 
-Waiting/fail-closed notifications must clearly state that the listener is closed.
+Do not publish IPv6 endpoints.
 
-## Phase 8 — integration and failure tests
+---
 
-Must cover:
+## Phase 9 — tests, hardening and rollout
 
-- direct path versus PhoneVPN/WARP;
-- physical primary rejection;
-- multiple VPN candidates;
-- app-policy include/exclude matrix;
-- outbound-only probe ordering;
-- DNS blackhole;
-- UDP FD/port/conntrack topology;
-- range exhaustion and capacity metrics;
-- IPv6 denial;
-- iface+IP+MAC spoofing;
-- exceptions in fast-path replace, publish and every cleanup step;
-- controller scope cancellation terminal cleanup;
-- daemon death and background recovery without FGS restart;
-- VPN return while UI backgrounded;
-- process death without assumed automatic resurrection.
+Required suites:
 
-## Phase 9 — hardening and rollout
+- selector zero/one/multiple VPN tests;
+- app-policy include/exclude tests;
+- service start-context and background recovery tests;
+- worker fast-path, publication and cleanup fault injection;
+- parent cancellation and terminal cleanup tests;
+- cleanup-debt blocks restart and later clears;
+- host hook-ordering tests;
+- UDP topology/range/capacity tests;
+- DNS blackhole/concurrency tests;
+- IPv6 exposure scans;
+- iface+IP+MAC spoof tests;
+- daemon-kill and recovery Clean tests;
+- process-death behavior;
+- FlClash DIRECT / PhoneVPN / WARP interoperability;
+- throughput, latency, CPU, memory, battery, FD and APK-size measurements.
 
-- connection/FD/memory limits;
-- handshake, DNS and idle timeouts;
-- fuzz SOCKS and UDP headers;
-- native sanitizers;
-- reproducible fork rebases;
-- performance and battery measurements;
-- experimental feature flag;
-- visible limitations and troubleshooting.
+Release remains behind an experimental flag until all security gates pass on multiple Android versions/vendors.
+
+---
 
 ## Suggested PR sequence
 
-1. Round-2 ADR and exact Hev pin.
-2. Host-testable socket hook and UDP topology spike.
-3. VPN-only/multiple-candidate selector and app-policy tests.
-4. DNS/probe feasibility and IPv6 boundary.
-5. Settings plus FGS type/start-context decision.
-6. Exception-safe controller with fake service/firewall clients.
-7. Persistent ProxyService and TCP backend.
-8. UDP backend, range and capacity enforcement.
-9. Root firewall using `IptablesRule` and Clean.
-10. MAC+IP ACL and counters.
-11. System tethering integration.
-12. UI, FlClash snippet and full failure matrix.
+1. Review/ADR and exact Hev pin.
+2. Host-testable prepare hook and Android feasibility harness.
+3. VPN selection plus app-policy instrumentation.
+4. UDP topology, relay range/capacity and DNS decision.
+5. Settings/state and approved FGS declaration/start context.
+6. `ProxyService` ownership and fake backend.
+7. Exception-safe worker, terminal cleanup and cleanup debt.
+8. TCP backend and outbound probes.
+9. UDP ASSOCIATE implementation.
+10. Root firewall lifecycle reusing `IptablesRule` and Clean.
+11. MAC+IP ACL and counters.
+12. System tethering Proxy-only integration.
+13. UI and FlClash snippet.
+14. Failure injection, device matrix and hardening.
 
-Each PR must build independently and avoid unrelated routing refactors.
+Each PR must build independently and must not mix unrelated routing refactors.
