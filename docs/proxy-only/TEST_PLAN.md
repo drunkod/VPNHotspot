@@ -1,318 +1,393 @@
 # Proxy-only security and test plan
 
-The feature is acceptable only when all security properties and Phase 0 gates below pass. Tests must not claim success based only on a public-IP check; packet path, network binding, listener exposure and cleanup behavior must also be observed.
+The feature is acceptable only when every security property and Phase 0 gate below passes. Public-IP checks alone are insufficient; tests must observe network binding, listener exposure, firewall state, cleanup behavior and typed diagnostics.
 
 ## 1. Security properties
 
-1. A candidate is usable only with fresh `TRANSPORT_VPN` capability.
-2. `Upstreams.primary` physical override cannot satisfy proxy VPN selection.
-3. Exactly one usable VPN candidate is required in the MVP.
-4. The VPN Hotspot app UID must be permitted to use the selected VPN.
-5. Every Internet-facing TCP, UDP and resolver FD is bound before packet-producing use.
-6. VPN loss, binding failure, resolver failure or daemon loss never falls back to physical networking.
-7. A disabled configuration never starts or retains the proxy FGS.
-8. An enabled, user-started FGS remains alive but listener-free in waiting/fail-closed states.
-9. `ProxyService` is the sole backend/native-handle owner.
-10. The listener is reachable only from explicitly allowed IPv4 tethering clients.
-11. IPv4 allow requires downstream interface + source IPv4 + source MAC.
-12. IPv6 cannot reach the TCP listener or UDP relay range.
-13. Standard UDP ASSOCIATE is bounded, source-validated and tied to control TCP.
-14. Daemon death closes the listener even if kernel allow rules persist.
-15. Reconciliation exceptions and parent cancellation cannot leave an untracked listener.
-16. Cleanup attempts every step and records unresolved cleanup debt.
-17. No backend restart occurs while cleanup debt exists.
-18. Credentials, destination metadata and network handles are redacted.
-19. Existing VPN-routing behavior is unchanged unless `PROXY_ONLY` is selected.
+1. A proxy upstream has current `TRANSPORT_VPN` capability.
+2. A physical `Upstreams.primary` override cannot satisfy the proxy requirement.
+3. Zero or multiple usable VPN candidates fail closed.
+4. The VPN Hotspot app UID is permitted to use the selected VPN.
+5. Every Internet-facing TCP/UDP/DNS socket is bound before sending.
+6. UDP is required by startup probes only when UDP is enabled.
+7. App-UID permission denial reaches `VpnPermissionDenied`.
+8. DNS/TCP/UDP/listener failures retain typed fail-closed reasons.
+9. Persisted `enabled=true` does not authorize a background FGS start.
+10. Service activation requires a valid foreground `ActivationGrant`.
+11. Enabled without grant reaches `ActivationRequired`.
+12. Pre-activation wait/stop/emergency commands are no-op reports, not exceptions.
+13. The service is the sole backend/native owner.
+14. Listener exposure exists only for authenticated allowed tethered clients.
+15. IPv4 allow requires interface + IPv4 + MAC.
+16. IPv4 and IPv6 deny state is explicit in protocol/configuration.
+17. IPv6 cannot reach the MVP listener or UDP range.
+18. VPN loss, daemon loss, binding failure and DNS failure never cause direct fallback.
+19. Daemon loss closes the listener even if kernel allows survive.
+20. Cleanup attempts every eligible step.
+21. Cleanup debt records unresolved resources individually.
+22. A successful listener close cannot clear unresolved firewall debt.
+23. No backend/firewall runtime starts while debt remains.
+24. Cleanup debt retries with no external state change.
+25. Each debt field clears only after that resource/action succeeds.
+26. Idle snapshots with no applied resources cannot fabricate debt.
+27. Feature stop has one owner.
+28. Parent cancellation reaches worker `finally` and terminal cleanup.
+29. Process restart does not assume automatic service resurrection.
+30. Existing VPN-routing behavior is unchanged unless `PROXY_ONLY` is selected.
 
-## 2. Threat model
+## 2. Threat model and controls
 
-### Physical network selected as VPN
+### Physical upstream mistaken for VPN
 
 Controls:
 
-- VPN-specific enumeration or fresh capability validation;
-- zero/one/multiple candidate result;
-- app-owned bind probe;
-- no fallback to `Upstreams.fallback` or process default.
+- VPN-specific candidate enumeration;
+- fresh capability checks;
+- exact-one selection;
+- physical-primary override tests.
 
 ### Per-app VPN exclusion
 
 Controls:
 
-- allowed/excluded policy matrix;
-- stable `VpnPermissionDenied` state;
-- no listener exposure after bind failure;
-- policy-change-while-running test.
+- typed app-UID bind probe;
+- EPERM maps to `VpnPermissionDenied`;
+- no direct fallback;
+- clear user guidance.
+
+### Unauthorized foreground-service activation
+
+Threat: process restarts in background with persisted enabled state and attempts to start the FGS.
+
+Controls:
+
+- one-time `ActivationGrant` issued only by foreground user action;
+- `ActivationRequired` state without grant;
+- grant consumed only after successful activation;
+- no service calls before activation except defined no-op behavior;
+- explicit `ForegroundServiceStartNotAllowedException` tests.
 
 ### Open proxy exposure
 
 Controls:
 
-- deny-first root runtime;
+- deny runtime before listener startup;
+- explicit `deny_all_ipv4` and `deny_all_ipv6`;
+- iface + IPv4 + MAC allow;
+- terminal reject;
 - authentication;
-- iface+IPv4+MAC allow;
-- terminal IPv4 reject;
-- complete IPv6 deny;
 - listener closure on daemon loss;
-- interface/address-family scans.
+- interface scans.
 
-### Native VPN bypass
-
-Controls:
-
-- one injected prepare hook;
-- host CI ordering assertions;
-- close FD on hook failure;
-- Android invalid/stale handle tests;
-- packet capture on physical and VPN interfaces.
-
-### DNS leak or head-of-line blocking
+### VPN bypass in native fork
 
 Controls:
 
-- VPN-aware resolver only;
-- bounded concurrency/queue;
+- centralized injected prepare hook;
+- host CI counts every path;
+- hook failure closes FD;
+- invalid-handle Android tests;
+- physical-interface captures.
+
+### Blocking or leaking DNS
+
+Controls:
+
+- network-aware resolver only;
+- bounded concurrency and queue;
 - strict timeout;
-- blackhole stress tests;
-- no process-default DNS traffic.
+- blackhole stress test;
+- process-default DNS capture;
+- VPN generation invalidation.
 
-### UDP rule/topology error
-
-Controls:
-
-- Phase 0 FD/port/interface/conntrack correlation;
-- no final return rule before evidence;
-- no broad VPN-interface accept;
-- configured relay range and capacity;
-- source/control-peer validation.
-
-### Reconciler failure
+### UDP topology assumption
 
 Controls:
 
-- one serialized worker;
-- timeout distinguished from parent cancellation;
-- per-iteration exception boundary;
-- recovery routine with its own exception boundary;
-- terminal cleanup in `finally`;
-- state publication and reporter failures contained;
-- cleanup debt blocks restart.
+- debug FD/port/network instrumentation;
+- packet capture;
+- conntrack observation;
+- no broad VPN-interface allow;
+- return policy absent until evidence exists.
 
-### Background FGS restart rejection
+### Cleanup debt cleared incorrectly
+
+Threat: listener close succeeds but firewall runtime remains, and the controller clears debt and restarts.
 
 Controls:
 
-- initial start only from user-approved foreground action;
-- no activation while disabled;
-- waiting/fail-closed states retain existing FGS;
-- background dependency recovery uses existing service;
-- process-death resurrection is not assumed.
+- per-resource fields;
+- surviving firewall handle retained;
+- separate deny/stop obligations;
+- partial resolution tests;
+- restart gate checks `debt.isResolved` only.
 
-## 3. Phase 0 device matrix
+### Cleanup retry starvation
 
-### VPN selection
+Threat: cleanup fails transiently while all external flows remain stable; no new snapshot arrives.
 
-| Scenario | Expected result |
-| --- | --- |
-| No VPN | waiting/fail-closed, no listener |
-| One usable VPN | candidate accepted after fresh validation |
-| Physical `service.upstream` override | routing may use it; proxy rejects it |
-| Two usable VPN candidates | `MultipleVpnCandidates`, no listener |
-| Candidate loses VPN capability before commit | startup rolls back |
-| VPN handle changes with same interface name | full backend restart |
+Controls:
 
-### Per-app VPN policy
+- internal `RetryCleanupDebt` event;
+- bounded exponential backoff;
+- retained latest snapshot;
+- stale-generation rejection;
+- quiescent-system recovery test.
+
+## 3. Phase 0 device tests
+
+### VPN candidate selection
+
+1. One VPN, default primary: candidate accepted.
+2. Physical `wlan0` primary override: routing may accept; proxy rejects.
+3. No VPN: waiting/fail-closed.
+4. Two usable VPN networks: `MultipleVpnCandidates`.
+5. VPN disappears between selection and startup: startup rejected.
+6. VPN handle changes with same interface name: backend fully restarts.
+
+### Per-app policy matrix
 
 | VPN policy | Expected result |
 | --- | --- |
-| All apps | bind/TCP/UDP/DNS probes succeed |
-| VPN Hotspot explicitly allowed | probes succeed |
-| VPN Hotspot excluded/denied | `VpnPermissionDenied`, no listener |
-| Policy changes while running | listener closes, fail-closed |
-| Lockdown/always-on | behavior documented and no bypass |
+| all apps | bind/TCP/UDP/DNS succeed |
+| VPN Hotspot explicitly allowed | succeed |
+| VPN Hotspot excluded | `VpnPermissionDenied`, no listener |
+| policy revoked while running | listener closes, typed waiting state |
 
-### UDP topology
+### Activation context matrix
 
-For multiple associations, record:
+1. User enables in foreground with grant: service activates.
+2. Grant consumed after successful activation.
+3. Replaying consumed grant: rejected.
+4. Expired grant: `ActivationRequired`.
+5. Persisted enabled after process restart, background context: `ActivationRequired`, no FGS start.
+6. User opens app and taps Resume: new grant activates service.
+7. Background VPN/daemon return while service already active: recovery without new FGS start.
+8. `ForegroundServiceStartNotAllowedException`: actionable activation state, no undefined `enterWaiting` call.
 
-- control TCP FD;
-- returned `BND.ADDR/BND.PORT`;
-- relay FD/port;
-- Internet-facing FD/port;
-- shared versus separate socket role;
-- prepare-hook events;
-- client packet input interface;
-- remote-reply input interface;
-- conntrack state;
-- range/capacity consumption.
+### Typed probes
 
-Assertions:
+- app-UID bind permission denial -> `VpnPermissionDenied`;
+- TCP timeout -> `TcpProbeFailed`;
+- DNS timeout -> `DnsProbeFailed`;
+- listener readiness failure -> `ListenerNotReady`;
+- UDP enabled + UDP failure -> `UdpProbeFailed`;
+- UDP disabled + missing/failing UDP result -> startup can still pass;
+- missing required result -> typed incomplete/internal readiness failure;
+- no typed expected failure is collapsed into generic `IllegalStateException`.
 
-- every Internet-facing FD is bound;
-- all returned relay ports are inside range;
-- reply traffic works without broad VPN-interface allow;
-- verified return rule is narrowly scoped and ordered before terminal reject;
-- range exhaustion returns controlled failure and metric.
+### Hev UDP topology
 
-### DNS
+- record control TCP FD;
+- record returned `BND.ADDR/BND.PORT`;
+- record relay and upstream FDs;
+- determine shared/separate sockets;
+- prove all Internet-facing UDP FDs pass network hook;
+- record remote-reply ingress interface;
+- record conntrack states;
+- prove exact narrow return rule if required;
+- prove no broad VPN-interface allow;
+- prove all ports stay in configured range;
+- prove association closes with control TCP;
+- prove range exhaustion fails safely.
+
+### Resolver behavior
 
 With working and blackholed VPN DNS:
 
-- one and many concurrent domain requests;
-- unrelated TCP/UDP remains responsive;
-- timeout is bounded;
-- VPN loss invalidates results;
-- no physical/default DNS packet appears.
+- one and many concurrent resolutions;
+- unrelated TCP/UDP sessions remain responsive;
+- timeout/cancellation bounded;
+- no physical/process-default DNS packet;
+- VPN loss invalidates outstanding result.
 
-### Address family
+### IPv6 behavior
 
-- scan TCP port over native IPv6;
-- scan complete UDP range over IPv6;
-- test IPv4-mapped behavior;
-- confirm ip6tables reject and IPv4 functionality.
+- scan listener TCP over native IPv6;
+- scan entire UDP range over IPv6;
+- test dual-stack wildcard and IPv4-mapped paths;
+- verify explicit IPv6 deny;
+- verify IPv4 path still works.
 
-## 4. Kotlin/controller unit tests
+## 4. Unit tests — domain and selection
 
-### Selection and normalization
+- existing install migrates to `VPN_ROUTING`;
+- settings validate TCP/UDP ranges and association limit;
+- effective UDP capacity calculation;
+- credentials redaction;
+- runtime key excludes client ordering and irrelevant link churn;
+- multiple VPN candidates fail closed;
+- app-UID denial maps to typed state;
+- physical primary override rejected;
+- explicit IPv4 deny flag is preserved independently from ACL emptiness.
 
-- settings migration defaults to `VPN_ROUTING`;
-- invalid ports/ranges/limits rejected;
-- effective UDP capacity computed correctly;
-- runtime key ignores client ordering and irrelevant link churn;
-- zero/one/multiple VPN result stable;
-- app-policy bind failure maps correctly.
+## 5. Unit tests — activation grant
 
-### Service activation ordering
+- grant issued only by foreground enable/resume action;
+- grant has unique identity and expiration;
+- successful activation consumes grant;
+- failed activation does not silently mark service active;
+- persisted enabled without grant -> `ActivationRequired`;
+- disabled state checked before activation;
+- controller never calls `enterWaiting` before activation;
+- service client pre-activation commands return no-op report;
+- user disable with inactive service remains safe;
+- process restart does not auto-activate.
 
-- disabled snapshot never calls `activateFeature`;
-- disabled snapshot calls terminal stop when service was active;
-- enable from approved action activates once;
-- repeated enabled snapshots do not restart FGS;
-- waiting states call `enterWaiting`;
-- user disable calls `stopFeature`;
-- background VPN/daemon return does not call a new FGS start.
+## 6. Unit tests — typed probes
 
-### Worker exception injection
+- required kinds always include bind/TCP/DNS/readiness;
+- UDP kind included only when enabled;
+- bind permission error maps to `VpnPermissionDenied`;
+- TCP failure maps to TCP reason;
+- DNS failure maps to DNS reason;
+- UDP failure maps to UDP reason only when required;
+- listener readiness maps distinctly;
+- missing required result is diagnosed;
+- expected probe failure performs controlled cleanup and waiting transition;
+- generic recovery reserved for unexpected exceptions.
 
-Inject at:
+## 7. Unit tests — exception-safe worker
 
-1. service activation;
-2. firewall deny-runtime start;
-3. backend start;
-4. outbound probes;
-5. allow replacement;
-6. fast-path `firewall.replace`;
-7. fast-path `service.replaceAcl`;
-8. state publication;
-9. reporter publication;
-10. deny during cleanup;
-11. normal backend stop;
-12. emergency listener close;
-13. firewall stop;
-14. waiting transition;
-15. feature stop;
-16. cleanup-debt recovery.
+Inject failures at:
+
+1. fast-path firewall replace;
+2. fast-path ACL replace;
+3. deny-runtime start;
+4. backend start;
+5. typed probe execution;
+6. allow replacement;
+7. state publication;
+8. deny during cleanup;
+9. backend stop;
+10. emergency close;
+11. firewall stop;
+12. daemon Clean;
+13. feature stop;
+14. reporter callback.
 
 Assertions:
 
-- recoverable iteration failures do not kill the worker;
-- recovery failure itself is contained and reported;
+- worker remains alive after recoverable iteration failure;
+- parent cancellation is rethrown;
+- worker `finally` runs terminal cleanup;
 - later cleanup steps run after earlier failures;
-- emergency close is attempted after uncertain/failed normal stop;
-- no new backend starts over cleanup debt;
-- newest conflated snapshot is eventually processed after debt clears;
-- publication failure does not alter resource safety.
+- publication/reporting failures do not kill worker;
+- newest desired snapshot is processed after recovery;
+- no listener remains active without firewall policy.
 
-### Cancellation and timeout
+## 8. Unit tests — cleanup debt content
 
-- transaction timeout enters fail-closed recovery;
-- parent `CancellationException` is rethrown;
-- cancellation during idle reaches `finally`;
-- cancellation after firewall start cleans partial firewall state;
-- cancellation after backend start closes listener;
-- cancellation while cleanup throws still attempts remaining steps;
-- terminal cleanup executes in `NonCancellable` context.
+### Creation
 
-### Cleanup debt
+- backend-stop failure retains service handle;
+- emergency-close failure sets listener pending;
+- deny failure sets deny pending;
+- firewall-stop failure retains firewall handle and stop pending;
+- daemon unavailable sets Clean pending;
+- feature-stop failure sets feature-stop pending;
+- successful item does not remain pending;
+- idle `applied == null` creates no emergency-close call/debt.
 
-- failed backend stop records service handle/debt;
-- failed firewall stop records firewall handle/debt;
-- daemon-unavailable stop marks Clean required;
-- debt blocks backend startup;
-- emergency close retries while debt exists;
-- daemon Clean/deny clears firewall debt;
-- successful recovery clears debt before normal reconciliation;
-- UI state is `CleanupDegraded` while unresolved.
+### Partial resolution
 
-## 5. ProxyService tests
+1. Create debt from healthy-daemon firewall-stop failure.
+2. Listener is already closed.
+3. First retry deny succeeds, firewall stop still fails.
+4. Debt retains firewall handle/stop only.
+5. Second retry firewall stop succeeds.
+6. Debt clears.
+7. Only then can startup resume.
 
-- only service owns `ProxyBackend`;
-- controller has no direct backend reference;
-- `activateFeature` requires permitted start context;
-- `ForegroundServiceStartNotAllowedException` is actionable;
-- `enterWaiting` closes listener but retains FGS/notification;
-- `WaitingForTethering`, `WaitingForVpn`, `MultipleVpnCandidates`, `VpnPermissionDenied` and daemon fail-closed have no listener;
-- `stopFeature` closes backend and stops FGS;
-- backend commands are serialized;
-- normal stop is idempotent;
-- emergency close works if controller state is corrupt or missing a handle;
-- structured cleanup report preserves all failures;
-- process death is not treated as guaranteed auto-restart.
+Additional cases:
 
-## 6. Native and host-CI tests
+- emergency close succeeds but firewall stop fails: debt remains;
+- firewall stop succeeds but daemon Clean remains: debt remains;
+- service handle clears independently from firewall handle;
+- feature-stop debt clears only after actual feature stop;
+- failure history is retained/updated with context.
 
-### Prepare hook
+## 9. Unit tests — retry scheduler
+
+- unresolved debt schedules one retry job;
+- retry delay increases with bounded backoff;
+- jitter remains within configured range;
+- duplicate snapshot does not create duplicate retry jobs;
+- stale retry generation ignored;
+- current debt generation accepted;
+- debt clears with no external state change;
+- successful cleanup cancels/resets retry;
+- user disable still allows required safety cleanup;
+- scheduler cancellation during app shutdown still reaches terminal cleanup.
+
+## 10. ProxyService tests
+
+- service activates only with validated grant;
+- service owns backend exclusively;
+- controller has no backend reference;
+- waiting states retain FGS but no listener;
+- pre-activation commands are no-op reports;
+- `startBackend` before activation fails deterministically and is not called by controller;
+- emergency close is idempotent;
+- backend stop is idempotent and structured;
+- feature stop occurs once;
+- background VPN/daemon recovery uses existing FGS;
+- process death is not treated as guaranteed restart.
+
+## 11. Native/host-CI tests
+
+### Socket hook
 
 - exactly once per outbound FD;
 - before TCP connect;
 - before first UDP connect/send;
-- retries and address fallback covered;
-- resolver-created FDs covered when applicable;
-- hook failure closes FD and prevents traffic;
-- Linux host target uses fake bind function;
-- Android instrumentation tests real NDK call.
+- resolver socket paths covered;
+- retries/fallback covered;
+- hook failure closes FD;
+- host target uses injected shim.
 
-### Backend lifecycle
+### Backend
 
 - unique opaque handles;
-- repeated start/stop leaks no FDs or threads;
+- repeated start/stop leaks no FD/thread;
 - no callback after stop;
 - no live network replacement;
-- outbound probe report distinguishes bind/TCP/UDP/DNS/readiness;
-- emergency stop closes all listener/session FDs.
+- typed probe report includes per-kind failures;
+- listener readiness does not traverse downstream firewall.
 
 ### UDP
 
-- control TCP owns association lifetime;
-- source peer enforced;
+- association tied to control TCP;
 - `FRAG != 0` dropped;
-- all ports inside range;
-- effective capacity enforced;
-- exhaustion controlled;
-- debug topology events match packet capture.
+- source peer enforced;
+- relay range enforced;
+- capacity enforced;
+- range exhaustion metric;
+- topology events identify FD roles accurately.
 
-## 7. Rust firewall tests
+## 12. Rust firewall tests
 
-- reuse existing `IptablesRule` and chain abstractions;
-- repeated insertion/deletion idempotent;
-- deterministic Clean removes proxy jumps/chains;
-- IPv4 starts denied and ends in reject;
-- allow requires iface+IPv4+MAC;
-- MAC mismatch denied with matching IP;
-- IPv6 denies TCP and complete UDP range;
-- port/range replacement has no broad allow window;
-- provisional UDP return policy absent without Phase 0 evidence;
-- verified return rule is narrowly encoded and precedes reject;
-- no broad VPN-interface accept exists;
-- failed mutation never broadens access;
-- counters distinguish TCP/UDP and client MAC/downstream.
+- uses existing `IptablesRule` ledger;
+- repeated apply/delete idempotent;
+- explicit `deny_all_ipv4` installs deny independent of ACL contents;
+- explicit `deny_all_ipv6` covers TCP/range;
+- iface+IPv4+MAC required for allow;
+- MAC mismatch denied;
+- IPv4 terminal reject present;
+- proxy jumps/chains included in deterministic Clean;
+- range replacement has no broad allow window;
+- failed mutation never broadens policy;
+- return rule absent without verified topology;
+- verified return rule precedes reject and is narrow;
+- no broad `-i <vpn> -j ACCEPT`;
+- counters distinguish TCP/UDP and MAC/downstream.
 
-## 8. Rooted Android integration tests
+## 13. Rooted Android integration tests
 
-### Direct baseline
+### Baseline direct path
 
-- Proxy-only disabled: tethered client uses physical/carrier IP;
-- phone VPN active: unselected direct client traffic remains physical.
+- ordinary tethering direct IP with Proxy-only disabled;
+- phone VPN does not capture direct laptop traffic in Proxy-only architecture.
 
 ### TCP/DNS proxy
 
@@ -320,7 +395,7 @@ Assertions:
 curl --socks5-hostname USER:PASS@PHONE_IPV4:10808 https://ifconfig.me
 ```
 
-Verify VPN exit IP, authentication behavior, domain resolution through VPN and no physical DNS leak.
+Verify VPN exit IP, auth failure and no physical DNS leak.
 
 ### UDP/WARP
 
@@ -328,77 +403,72 @@ Verify VPN exit IP, authentication behavior, domain resolution through VPN and n
 - DNS over UDP;
 - QUIC where supported;
 - WARP WireGuard through FlClash `dialer-proxy`;
-- returned relay port in range;
+- returned relay port inside range;
 - second client cannot inject;
 - control TCP close destroys association.
 
-### Daemon loss and background recovery
+### Daemon loss and debt
 
-1. Run with allow rules committed.
+1. Start listener with allows committed.
 2. Kill `vpnhotspotd`.
 3. Confirm kernel rules may remain.
-4. Confirm service closes listener and remains foreground fail-closed.
-5. Restore daemon while UI is backgrounded.
-6. Confirm Clean/deny clears debt before backend restart.
-7. Confirm no new FGS start attempt occurs.
+4. Confirm listener closes immediately.
+5. Confirm firewall/Clean debt exists.
+6. Restore daemon while UI remains backgrounded.
+7. Confirm internal retry resolves Clean/stop.
+8. Confirm no new FGS start.
+9. Confirm backend restarts only after debt clears.
 
-### VPN loss and background recovery
+### Quiescent debt retry
 
-1. Start proxy and background UI.
-2. Disable VPN.
-3. Confirm listener closes, FGS remains and notification changes.
-4. Restore VPN.
-5. Confirm existing service validates and recreates backend.
-6. Confirm no `ForegroundServiceStartNotAllowedException`.
+1. Inject transient firewall-stop failure.
+2. Hold settings, VPN, tethering and clients constant.
+3. Confirm `CleanupDegraded`.
+4. Confirm backoff event occurs without external emission.
+5. Remove failure injection.
+6. Confirm retry clears exact firewall debt.
+7. Confirm latest snapshot reconciles and proxy resumes.
+
+### Process restart activation
+
+1. Enable Proxy-only and persist enabled state.
+2. Kill app process.
+3. Allow system/background component to recreate process without UI.
+4. Confirm no FGS start attempt.
+5. Confirm `ActivationRequired` is persisted/exposed when UI opens.
+6. Tap Resume.
+7. Confirm new grant and activation.
 
 ### ACL spoofing
 
-Two clients; block one; reuse/spoof allowed IP from the wrong MAC; confirm denial while legitimate client continues.
+Two clients, block one, reuse allowed IP from wrong MAC, confirm denial.
 
-### Process death/reboot
-
-- process death closes listener;
-- no automatic restart is assumed;
-- next user/policy-compliant start performs Clean/deny first;
-- reboot leaves no active listener;
-- optional future boot restore starts denied and requires separate approval.
-
-## 9. FlClash acceptance
-
-| Route | Expected public IP |
-| --- | --- |
-| `DIRECT` | physical/carrier IP |
-| `PhoneVPN` | phone VPN exit IP |
-| `WARP-via-PhoneVPN` | Cloudflare WARP IP |
-
-For WARP, verify Cloudflare trace, native UDP association state and packet path. `warp=on` alone is insufficient proof.
-
-## 10. Failure matrix
+## 14. Corrected failure matrix
 
 | Failure | Expected result |
 | --- | --- |
-| Disabled settings | no FGS activation, no listener |
-| FGS start disallowed | actionable error, no listener |
-| No/multiple VPNs | waiting/fail-closed, no listener |
-| VPN Hotspot excluded | permission error, no listener |
-| Firewall deny/start fails | backend not exposed |
-| Backend start/probe fails | rollback, cleanup debt if needed |
-| Fast-path replace fails | listener closes, fail-closed recovery |
-| State publication fails | worker continues, resources remain reconciled |
-| Reporter fails | does not kill resource worker |
-| VPN disappears | sessions close, FGS waits, no fallback |
-| DNS blackhole | bounded failure, other sessions responsive |
-| UDP range exhausted | controlled failure, no range expansion |
-| Normal backend stop fails | emergency close attempted; debt recorded |
-| Firewall stop fails | service remains listener-free; debt recorded |
-| Daemon killed | listener closes; stale rules handled on recovery |
-| Parent scope cancelled | terminal cleanup runs |
-| Process killed | listener closes; no assumed resurrection |
+| no root permission | no listener exposure |
+| non-VPN primary | rejected |
+| zero VPN candidates | waiting |
+| multiple VPN candidates | typed fail-closed/waiting state |
+| app excluded by VPN | `VpnPermissionDenied` |
+| persisted enabled without activation grant | `ActivationRequired`, no FGS start |
+| TCP probe failure | typed TCP reason |
+| DNS probe failure | typed DNS reason |
+| UDP failure with UDP enabled | typed UDP reason |
+| UDP failure with UDP disabled | ignored as non-required |
+| deny failure | listener still closed; deny debt retained |
+| backend-stop failure | emergency close attempted; service debt retained |
+| firewall-stop failure | firewall handle/stop debt retained |
+| daemon killed | listener closes; Clean/firewall debt retained |
+| no new external state | internal retry still runs |
+| partial retry success | only successful debt items clear |
+| debt remains | no new runtime start |
+| feature stop failure | one feature-stop debt item retained |
 | IPv6 attempt | rejected |
+| process restart | no automatic background FGS resurrection |
 
-## 11. Build and release gate
-
-Run current repository equivalents of:
+## 15. Build/static validation
 
 ```bash
 git submodule update --init --recursive
@@ -407,19 +477,32 @@ git submodule update --init --recursive
 ./gradlew test
 ```
 
-Also run host-native fork tests, Rust daemon tests, Android lint, release/R8, native sanitizers where practical, license checks and APK native-library inspection.
+Also run:
 
-The experimental feature may ship only after:
+- host-native Hev fork tests;
+- Rust daemon tests;
+- Android lint and release/R8 build;
+- native sanitizers where practical;
+- license/notice verification;
+- APK native-library inspection;
+- manifest/FGS policy validation.
 
-- Phase 0 passes on multiple Android versions/vendors;
-- zero/one/multiple VPN selection is deterministic;
-- app-policy exclusion is safely diagnosed;
-- TCP/UDP/DNS and UDP topology tests pass;
-- IPv6 exposure is fully denied;
-- iface+IP+MAC spoof tests pass;
-- exception/cancellation/cleanup-debt tests pass;
-- daemon-death and background recovery tests pass;
-- FGS type/start-context/store policy is approved;
-- deterministic Clean removes all proxy state;
-- FlClash selective routing and optional WARP interoperate;
-- limitations and troubleshooting are visible.
+## 16. Release gate
+
+The experimental feature may proceed beyond Phase 0 only after:
+
+- exact Hev pin and hook coverage pass;
+- VPN selection/policy matrix passes;
+- activation-grant/process-restart tests pass;
+- typed, config-aware probes pass;
+- UDP topology and return policy are proven;
+- DNS blackhole tests pass;
+- explicit IPv4/IPv6 denial passes;
+- itemized debt creation/partial resolution passes;
+- quiescent retry test passes;
+- no restart over debt is proven;
+- daemon death and background recovery pass;
+- MAC/IP spoof tests pass;
+- deterministic Clean passes;
+- FGS policy is resolved;
+- notices and limitations are complete.
