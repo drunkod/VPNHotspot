@@ -1,8 +1,6 @@
 package be.mygod.vpnhotspot.proxy
 
 import android.net.Network
-import java.net.Inet4Address
-import java.net.InetAddress
 import java.util.UUID
 
 // ---------------------------------------------------------------------------
@@ -57,6 +55,14 @@ data class ProxyVpnUpstream(
     val interfaces: Set<String>,
 )
 
+/**
+ * Stable identity of one running proxy backend.
+ *
+ * R4 fix #3: [daemonGeneration] is included so that a daemon restart always
+ * produces a different key even when all other fields are unchanged. This forces
+ * the controller to destroy any existing firewall runtime that was issued by the
+ * previous daemon generation instead of calling replace() on a stale handle.
+ */
 data class RuntimeKey(
     val tcpPort: Int,
     val udpPortRange: IntRange?,
@@ -65,6 +71,8 @@ data class RuntimeKey(
     /** Sorted list of (interfaceName, sortedCanonicalIpv4) for stable equality. */
     val downstreams: List<Pair<String, List<String>>>,
     val backendVersion: Int,
+    /** Daemon restart epoch; changes on every new daemon generation. */
+    val daemonGeneration: Long,
 )
 
 sealed interface FailClosedReason {
@@ -77,7 +85,11 @@ sealed interface FailClosedReason {
     data class ProbeReportIncomplete(val missing: Set<ProbeKind>) : FailClosedReason
     data class StartupSanitationFailed(val detail: String) : FailClosedReason
     data class InternalFailure(val category: String) : FailClosedReason
-    /** Published when all downstreams lack a routable, non-loopback IPv4 address. */
+    /**
+     * R4 fix #9: published when tethering interfaces are present but none has a
+     * reachable, non-loopback, non-unspecified unicast IPv4 address.
+     * Distinct from WaitingForTethering (no interfaces at all).
+     */
     data object NoReachableDownstreamAddress : FailClosedReason
 }
 
@@ -117,13 +129,23 @@ data class DesiredProxyState(
      * Normalise to a canonical form that prevents irrelevant churn from
      * creating new runtime keys.
      *
-     * R3 fix #4: merge-based deduplication instead of distinctBy.
-     *   - Downstreams with the same interfaceName are merged; the first routable
-     *     IPv4 across all observations is used (so a null-address observation
-     *     cannot discard a later valid one).
-     *   - Clients with the same canonical MAC are merged; IPv4 bindings are
-     *     unioned, validated and sorted.
-     *   - Malformed, loopback and unspecified addresses are rejected.
+     * R3/R4 normalization rules:
+     *   Downstreams
+     *     - Grouped by trimmed interface name.
+     *     - First strictly-routable IPv4 literal across the group is kept.
+     *     - Malformed, loopback, unspecified, multicast and link-local addresses
+     *       are rejected without DNS (strict literal parser).
+     *     - ipv4Address is normalised to dotted-decimal if accepted.
+     *     - ManagedDownstream.ipv4Address is a single nullable field: the
+     *       production adapter must ensure at most one routable IPv4 per
+     *       interface name (see kdoc on ManagedDownstream).
+     *   Clients
+     *     - MAC canonicalized from colon-, dash- or plain-hex by strict byte
+     *       parser; multicast-bit and broadcast MACs are rejected (null return).
+     *     - Invalid MAC → entire client record is dropped.
+     *     - IPv4 addresses filtered with the same strict literal parser.
+     *     - Clients with no remaining valid IPv4 binding are dropped (R4 #7).
+     *     - Duplicate MACs are merged; addresses are unioned, deduplicated, sorted.
      */
     fun normalized(): DesiredProxyState = copy(
         downstreams = downstreams
@@ -131,22 +153,30 @@ data class DesiredProxyState(
             .map { (iface, group) ->
                 ManagedDownstream(
                     interfaceName = iface,
-                    // Take the first routable address found across all observations.
                     ipv4Address = group.mapNotNull { it.ipv4Address }
-                        .firstOrNull { isRoutableIpv4(it) },
+                        .firstOrNull { isRoutableIpv4(it) }
+                        ?.let { normalizeIpv4(it) },
                 )
             }
             .sortedBy { it.interfaceName },
         allowedClients = allowedClients
-            .groupBy { canonicalizeMac(it.mac) }
-            .map { (canonicalMac, group) ->
+            .mapNotNull { client ->
+                val mac = canonicalizeMac(client.mac) ?: return@mapNotNull null
+                val ips = client.ipv4Addresses
+                    .filter { isRoutableIpv4(it) }
+                    .map { normalizeIpv4(it) }
+                    .distinct()
+                    .sorted()
+                // R4 fix #7: drop clients with no valid IPv4 binding.
+                // An empty list is NOT a wildcard; drop to avoid ambiguous ACL semantics.
+                if (ips.isEmpty()) return@mapNotNull null
+                AllowedClient(mac = mac, ipv4Addresses = ips)
+            }
+            .groupBy { it.mac }
+            .map { (mac, group) ->
                 AllowedClient(
-                    mac = canonicalMac,
-                    ipv4Addresses = group.flatMap { it.ipv4Addresses }
-                        .filter { isRoutableIpv4(it) }
-                        .map { normalizeIpv4(it) }
-                        .distinct()
-                        .sorted(),
+                    mac = mac,
+                    ipv4Addresses = group.flatMap { it.ipv4Addresses }.distinct().sorted(),
                 )
             }
             .sortedBy { it.mac },
@@ -155,57 +185,117 @@ data class DesiredProxyState(
 
 // ---------------------------------------------------------------------------
 // Address validation helpers
-// R3 fix #4: reject loopback, unspecified and malformed addresses.
+//
+// R4 fix #5: strict IPv4 literal parser — no DNS, no hostname resolution.
+// InetAddress.getByName() is deliberately NOT used; it may perform DNS on the
+// calling thread and produce nondeterministic, blocking normalisation.
 // ---------------------------------------------------------------------------
 
+/** Four decimal octets, each in 0..255; nothing else. */
+private val IPV4_RE = Regex("""^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$""")
+
 /**
- * Returns true if [address] is a parseable, non-loopback, non-unspecified
- * unicast IPv4 address that a tethered client could plausibly reach.
+ * Parse [address] as a dotted-decimal IPv4 literal.
+ * Returns a 4-element IntArray [o0, o1, o2, o3] on success, null on any parse
+ * or range error. Never performs DNS.
+ */
+private fun parseIpv4Literal(address: String): IntArray? {
+    val m = IPV4_RE.matchEntire(address.trim()) ?: return null
+    val octets = IntArray(4)
+    for (i in 0..3) {
+        val v = m.groupValues[i + 1].toIntOrNull() ?: return null
+        if (v > 255) return null
+        octets[i] = v
+    }
+    return octets
+}
+
+/**
+ * Returns true if [address] is a strict IPv4 literal that a tethered client
+ * could plausibly reach: not loopback, unspecified, multicast, reserved,
+ * link-local or broadcast. No DNS is performed.
  */
 fun isRoutableIpv4(address: String): Boolean {
-    return try {
-        val inet = InetAddress.getByName(address.trim())
-        inet is Inet4Address &&
-            !inet.isLoopbackAddress &&
-            !inet.isAnyLocalAddress &&
-            !inet.isMulticastAddress &&
-            !inet.isLinkLocalAddress
-    } catch (_: Exception) {
-        false
-    }
-}
-
-/** Returns the canonical dotted-decimal form of a parseable IPv4 address. */
-fun normalizeIpv4(address: String): String {
-    return try {
-        InetAddress.getByName(address.trim()).hostAddress ?: address.trim()
-    } catch (_: Exception) {
-        address.trim()
-    }
+    val o = parseIpv4Literal(address) ?: return false
+    if (o[0] == 0) return false                    // 0.0.0.0/8 — unspecified
+    if (o[0] == 127) return false                  // 127.0.0.0/8 — loopback
+    if (o[0] >= 224) return false                  // 224.0.0.0/4 multicast, 240.0.0.0/4 reserved
+    if (o[0] == 169 && o[1] == 254) return false  // 169.254.0.0/16 — link-local
+    if (o[0] == 255 && o[1] == 255 && o[2] == 255 && o[3] == 255) return false // broadcast
+    return true
 }
 
 /**
- * Returns an uppercase colon-separated MAC string for canonical comparison.
- * Accepts colon-, dash- and plain-hex formats.
+ * Returns the canonical dotted-decimal form of a parseable IPv4 literal.
+ * Leading zeros are normalised (e.g. "010.001.002.003" → "10.1.2.3").
+ * Returns the original trimmed string unchanged if parsing fails.
+ * Never performs DNS.
  */
-fun canonicalizeMac(mac: String): String {
-    val hex = mac.trim().replace("[-:]".toRegex(), "").uppercase()
-    return if (hex.length == 12) {
-        hex.chunked(2).joinToString(":")
-    } else {
-        mac.trim().uppercase() // fall back to trimmed upper for unknown format
-    }
+fun normalizeIpv4(address: String): String {
+    val o = parseIpv4Literal(address) ?: return address.trim()
+    return "${o[0]}.${o[1]}.${o[2]}.${o[3]}"
 }
 
 // ---------------------------------------------------------------------------
-// Stubs
+// MAC validation helper
+//
+// R4 fix #6: strict 6-byte parser; multicast-bit and broadcast MACs are
+// rejected; malformed input returns null so the entire client record is dropped
+// rather than retained as an uppercase fallback with undefined semantics.
+// ---------------------------------------------------------------------------
+
+private val HEX_UPPER = "0123456789ABCDEF"
+
+/**
+ * Parse and canonicalize a MAC address from colon-separated (AA:BB:CC:DD:EE:FF),
+ * dash-separated (AA-BB-...) or plain-hex (AABBCCDDEEFF) form.
+ *
+ * Returns an uppercase colon-separated 6-byte string on success, or null when:
+ *   - The input cannot be parsed as exactly 6 hex bytes.
+ *   - The least-significant bit of the first byte (multicast/broadcast flag) is set.
+ *   - All bytes are 0xFF (broadcast).
+ *
+ * Callers MUST drop the entire client record on null return.
+ */
+fun canonicalizeMac(mac: String): String? {
+    val hex = mac.trim().replace("[-:]".toRegex(), "").uppercase()
+    if (hex.length != 12) return null
+    if (hex.any { it !in HEX_UPPER }) return null
+    val bytes = (0 until 6).map { i ->
+        hex.substring(i * 2, i * 2 + 2).toInt(16)
+    }
+    // Reject multicast (LSB of first byte set — covers broadcast-as-group-address).
+    if (bytes[0] and 0x01 != 0) return null
+    // Reject broadcast FF:FF:FF:FF:FF:FF explicitly.
+    if (bytes.all { it == 0xFF }) return null
+    return bytes.joinToString(":") { "%02X".format(it) }
+}
+
+// ---------------------------------------------------------------------------
+// Controller events
 // ---------------------------------------------------------------------------
 
 sealed interface ControllerEvent {
     data class Snapshot(val state: DesiredProxyState) : ControllerEvent
-    data class RetryCleanupDebt(val generation: Long) : ControllerEvent
+    // R4: RetryCleanupDebt removed — cleanup retries are executed directly in
+    // cleanupScope under stateMutex, not via the events channel which has no
+    // consumer after the worker exits.
 }
 
+// ---------------------------------------------------------------------------
+// Supporting domain types
+// ---------------------------------------------------------------------------
+
+/**
+ * One tethering downstream interface.
+ *
+ * [ipv4Address] is a single nullable field by deliberate Phase-0 design.
+ * At the IP routing layer, a tethering interface has exactly one active
+ * DHCP-server IPv4 address at any moment. The production DesiredProxyState
+ * adapter must enforce this one-address invariant; [DesiredProxyState.normalized]
+ * selects the first routable address across duplicate observations of the same
+ * interface and discards the rest without data loss at the routing level.
+ */
 data class ManagedDownstream(
     val interfaceName: String,
     val ipv4Address: String?,

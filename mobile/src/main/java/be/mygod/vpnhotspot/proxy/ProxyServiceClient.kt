@@ -2,7 +2,6 @@ package be.mygod.vpnhotspot.proxy
 
 import android.app.Service
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withTimeoutOrNull
 
 // ---------------------------------------------------------------------------
@@ -17,6 +16,10 @@ import kotlinx.coroutines.withTimeoutOrNull
 //   B3  cleanOrDenyBeforeRestart() returns Long? (null = failure; non-null =
 //       daemon-acknowledged new epoch) so the controller can initialize its
 //       generation counter from the epoch rather than deriving it locally.
+//
+// R4 fix #1: CleanupAccumulator.stepSucceeded catches ordinary (non-cancellation)
+// exceptions and records them as debt rather than propagating and leaving applied
+// handles untracked after applied=null is already cleared.
 // ---------------------------------------------------------------------------
 
 internal const val CLEANUP_STEP_TIMEOUT_MS = 10_000L
@@ -163,16 +166,17 @@ interface ProxyFirewallClient {
     suspend fun stop(handle: ProxyFirewallHandle): CleanupReport
 
     /**
-     * R3 fix #3: perform idempotent proxy-chain sanitation and atomically reset
+     * R3/R4 fix: perform idempotent proxy-chain sanitation and atomically reset
      * the daemon's generation ledger.
      *
-     * @return The daemon-acknowledged new epoch (starting sequence value) to use
-     *         as the base for subsequent firewall-config generation numbers, or
-     *         `null` if sanitation failed.
+     * @return The daemon-acknowledged epoch (last accepted base). The controller
+     *         calls `incrementAndGet()` before each transmission, so the first
+     *         sent generation after init is `epoch + 1`. Returns `null` on
+     *         failure; controller must treat null as a fatal startup gate.
      *
-     * The controller must use this epoch to initialize its generation counter.
-     * Deriving the counter from a locally shifted value without an acknowledgement
-     * can reuse sequences already accepted by a surviving daemon.
+     * The daemon atomically: (1) installs deny-all, (2) resets its ledger to
+     * reject any generation ≤ epoch from prior app-process lifetimes, and (3)
+     * returns the new epoch. Only a successful non-null return proves containment.
      */
     suspend fun cleanOrDenyBeforeRestart(): Long?
 }
@@ -185,7 +189,12 @@ fun Boolean.asCleanupReport() =
 // CleanupAccumulator
 //
 // R3 fix #2: uses withTimeoutOrNull so only the step's own deadline is absorbed.
-// Parent CancellationException propagates naturally — no explicit catch needed.
+// R4 fix #1: catches ordinary exceptions so independent steps still execute.
+//
+// Failure taxonomy:
+//   • Step timeout      → record failure, return false, continue
+//   • Ordinary exception → record failure, return false, continue
+//   • CancellationException → rethrow immediately (outer scope cancelled)
 // ---------------------------------------------------------------------------
 
 class CleanupAccumulator(private val reporter: ProxyErrorReporter? = null) {
@@ -195,22 +204,38 @@ class CleanupAccumulator(private val reporter: ProxyErrorReporter? = null) {
     /**
      * Run [block] under a per-step deadline.
      *
-     * [withTimeoutOrNull] returns `null` only when the block itself exceeds its
-     * own timeout. A parent or outer [CancellationException] is not caught here
-     * and propagates to the caller. This correctly distinguishes inner step
-     * timeouts from outer transaction timeouts.
+     * Returns true iff the step completed within its timeout and produced zero
+     * [CleanupFailure]s. All other outcomes — timeout, ordinary exception, or
+     * non-empty failure list — return false after recording the failure. This
+     * ensures that every independent cleanup step is attempted regardless of
+     * whether a previous step threw.
+     *
+     * A parent [CancellationException] is never caught and always propagates.
      */
     suspend fun stepSucceeded(name: String, block: suspend () -> CleanupReport): Boolean {
-        val r = withTimeoutOrNull(CLEANUP_STEP_TIMEOUT_MS) { block() }
-        if (r == null) {
-            // Only this step's own deadline elapsed.
-            val f = CleanupFailure(name, RuntimeException("step '$name' timed out after ${CLEANUP_STEP_TIMEOUT_MS}ms"))
+        return try {
+            val r = withTimeoutOrNull(CLEANUP_STEP_TIMEOUT_MS) { block() }
+            if (r == null) {
+                val f = CleanupFailure(
+                    name,
+                    RuntimeException("step '$name' timed out after ${CLEANUP_STEP_TIMEOUT_MS}ms"),
+                )
+                failures += f
+                safeReport("proxy.cleanup.$name.timeout", f.cause)
+                false
+            } else {
+                failures += r.failures
+                r.failures.isEmpty()
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled   // outer scope cancellation — never absorb
+        } catch (t: Throwable) {
+            // Ordinary (non-cancellation) exception: record and continue.
+            val f = CleanupFailure(name, t)
             failures += f
-            safeReport("proxy.cleanup.$name.timeout", f.cause)
-            return false
+            safeReport("proxy.cleanup.$name", t)
+            false
         }
-        failures += r.failures
-        return r.failures.isEmpty()
     }
 
     private fun safeReport(category: String, failure: Throwable) {
@@ -298,6 +323,7 @@ abstract class ProxyService : Service() {
                 firewallStopPending = false,
                 daemonCleanPending = false,
                 featureStopPending = false,
+                serviceWasActivated = true,
                 failures = report.failures,
                 generation = 0L,
                 attempt = 0,

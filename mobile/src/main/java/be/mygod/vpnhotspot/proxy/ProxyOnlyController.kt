@@ -9,6 +9,8 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
@@ -18,25 +20,27 @@ import kotlin.math.min
 import kotlin.random.Random
 
 // ---------------------------------------------------------------------------
-// Step 6 + Step 10 — ProxyOnlyController (R3-corrected)
+// Step 6 + Step 10 — ProxyOnlyController (R4-corrected)
 //
-// R3 fixes applied:
-//   B1  Named argument syntax: all firewallConfig() calls use
-//       `generationCounter = firewallGeneration`.
-//   B1  CancellationException is imported; the credential-fetch catch re-throws it.
-//   B2  withTimeoutOrNull used in attempt() and safeEmergencyClose() so only
-//       the step's own deadline is absorbed; outer CancellationException propagates.
-//   B2  NonCancellable removed from RetryCleanupDebt handling; only specific
-//       finalization sub-paths use NonCancellable.
-//   B3  cleanOrDenyBeforeRestart() now returns Long? (daemon-issued epoch).
-//       firewallGeneration is reset from that epoch, not a locally derived shift.
-//   B4  cleanupApplied() is a fully local transaction: it never calls mergeDebt()
-//       internally; it combines primary + emergency debt locally and returns one
-//       CleanupOutcome. The caller merges once.
-//   B5  Terminal debt retries use cleanupScope (separate from the worker scope)
-//       so they survive after the worker's finally block completes.
-//   B6  Credential-fetch catch re-throws CancellationException before mapping
-//       other failures to InternalFailure.
+// R4 fixes applied:
+//   #1  Ordinary cleanup exceptions now record debt and continue (stepSucceeded
+//       in CleanupAccumulator; attempt() in retryCleanupDebtSafely) rather than
+//       escaping and leaving handles untracked after applied=null.
+//   #2  cleanupScope retries execute directly under stateMutex rather than via
+//       the events channel, which has no consumer after the worker exits.
+//       RetryCleanupDebt event type removed.
+//   #3  RuntimeKey includes daemonGeneration so any daemon restart invalidates the
+//       fast path and forces deny-first recreation of the firewall runtime.
+//   #5  Strict literal IPv4 parser (ProxyModels.kt, no DNS).
+//   #6  Strict MAC parser, null → drop client (ProxyModels.kt).
+//   #7  Clients with empty IPv4 lists dropped in normalization (ProxyModels.kt).
+//   #9  Zero valid endpoints after normalization publishes FailClosed
+//       (NoReachableDownstreamAddress) rather than WaitingForTethering.
+//   #10 Emergency close failures NOT added to acc.failures; they are carried
+//       exclusively in the returned emergency debt to avoid duplication.
+//   #11 retryCleanupDebtSafely builds one combined debt locally and commits once.
+//   #12 Successful daemon-clean retry updates sanitizedDaemonGeneration so the
+//       next reconciliation does not re-sanitize the same daemon generation.
 // ---------------------------------------------------------------------------
 
 private const val TRANSACTION_TIMEOUT_MS = 30_000L
@@ -61,34 +65,36 @@ class ProxyOnlyController(
     private val reporter: ProxyErrorReporter,
     private val scope: CoroutineScope,
     /**
-     * R3 fix #5: cleanup retry jobs are launched into this scope, which must
-     * outlive [scope] so that terminal cleanup debt can still be retried after
-     * the worker coroutine's finally block has completed.
+     * R4 fix #2: cleanup retry jobs execute directly in this scope under
+     * [stateMutex], NOT by sending events to the worker channel.
      *
-     * Production callers should supply a scope tied to the application/service
-     * lifecycle rather than the controller coroutine. Defaults to [scope] for
-     * tests that don't need terminal-retry survival.
+     * Must outlive [scope] so terminal cleanup retries survive after the worker
+     * coroutine's finally block has completed. Production callers must supply a
+     * scope tied to the service/application lifecycle.
      */
-    private val cleanupScope: CoroutineScope = scope,
+    private val cleanupScope: CoroutineScope,
 ) {
+    // -----------------------------------------------------------------------
+    // All mutable state is accessed only under stateMutex.
+    // Exception: latestSnapshot is AtomicReference for lock-free snapshot reads
+    // from the collector coroutine.
+    // -----------------------------------------------------------------------
+
+    /**
+     * R4 fix #2: serializes all state mutations between the worker coroutine and
+     * the cleanup retry coroutines launched in cleanupScope.
+     */
+    private val stateMutex = Mutex()
     private val latestSnapshot = AtomicReference<DesiredProxyState?>(null)
     private var sanitizedDaemonGeneration: Long? = null
+    private var firewallGeneration = AtomicLong(0L)
 
     private val events = Channel<ControllerEvent>(Channel.CONFLATED)
     private var serviceActivated = false
     private var applied: AppliedProxyState? = null
     private var cleanupDebt: CleanupDebt? = null
     private var retryJob: Job? = null
-    private var scheduledRetryGeneration: Long? = null
     private var nextDebtGeneration = 1L
-
-    /**
-     * R3 fix #3: initialized from the daemon-acknowledged epoch returned by
-     * cleanOrDenyBeforeRestart(), not from a locally shifted value.
-     * Reset on every new daemon generation so values never go backwards
-     * relative to what the daemon has already accepted.
-     */
-    private var firewallGeneration = AtomicLong(0L)
 
     // -----------------------------------------------------------------------
     // Worker entry point
@@ -103,12 +109,18 @@ class ProxyOnlyController(
             }
         }
         try {
-            for (event in events) runIteration(event)
+            for (event in events) {
+                stateMutex.withLock { runIteration(event) }
+            }
         } finally {
             collector.cancel()
             retryJob?.cancel()
+            // R4 fix #2: final cleanup under stateMutex so it doesn't race with
+            // any in-flight cleanup retry that cleanupScope may be executing.
             withContext(NonCancellable) {
-                terminalStopSafely("controller worker terminated")
+                stateMutex.withLock {
+                    terminalStopSafely("controller worker terminated")
+                }
             }
         }
     }
@@ -118,11 +130,6 @@ class ProxyOnlyController(
             when (event) {
                 is ControllerEvent.Snapshot ->
                     withTimeout(TRANSACTION_TIMEOUT_MS) { reconcile(event.state) }
-                // R3 fix #2: RetryCleanupDebt no longer wrapped in NonCancellable.
-                // Individual steps are bounded by withTimeoutOrNull; parent
-                // cancellation propagates naturally.
-                is ControllerEvent.RetryCleanupDebt ->
-                    withTimeout(TRANSACTION_TIMEOUT_MS) { retryDebtEvent(event) }
             }
         } catch (timeout: TimeoutCancellationException) {
             withContext(NonCancellable) { recoverSafely(timeout) }
@@ -131,30 +138,6 @@ class ProxyOnlyController(
         } catch (failure: Throwable) {
             withContext(NonCancellable) { recoverSafely(failure) }
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // Retry-generation ownership (Step 10 §B)
-    // -----------------------------------------------------------------------
-
-    private suspend fun retryDebtEvent(event: ControllerEvent.RetryCleanupDebt) {
-        retryJob = null
-        scheduledRetryGeneration = null
-
-        val debt = cleanupDebt ?: return
-        if (debt.generation != event.generation) {
-            scheduleDebtRetry(debt)
-            return
-        }
-
-        retryCleanupDebtSafely()
-        val unresolved = cleanupDebt
-        if (unresolved != null) {
-            publishDebt(unresolved)
-            scheduleDebtRetry(unresolved)
-            return
-        }
-        latestSnapshot.get()?.let { reconcile(it) }
     }
 
     // -----------------------------------------------------------------------
@@ -188,6 +171,7 @@ class ProxyOnlyController(
         }
 
         cleanupDebt?.let { debt ->
+            // Attempt to clear outstanding debt before making forward progress.
             retryCleanupDebtSafely()
             cleanupDebt?.let { unresolved ->
                 enterWaitingIfActive(debtState(unresolved))
@@ -228,27 +212,23 @@ class ProxyOnlyController(
             cleanupDebt?.let(::scheduleDebtRetry)
             return
         }
+
         if (sanitizedDaemonGeneration != next.daemonGeneration) {
-            // R3 fix #3: use daemon-acknowledged epoch from cleanOrDenyBeforeRestart().
             val epoch = firewall.cleanOrDenyBeforeRestart()
             if (epoch == null) {
                 mergeDebt(
                     CleanupDebt(
-                        listenerClosePending = false,
-                        serviceHandlePending = null,
-                        firewallHandlePending = null,
-                        firewallDenyPending = false,
-                        firewallStopPending = false,
-                        daemonCleanPending = true,
-                        featureStopPending = false,
+                        listenerClosePending = false, serviceHandlePending = null,
+                        firewallHandlePending = null, firewallDenyPending = false,
+                        firewallStopPending = false, daemonCleanPending = true,
+                        featureStopPending = false, serviceWasActivated = serviceActivated,
                         failures = listOf(
                             CleanupFailure(
                                 "startup_sanitation",
                                 RuntimeException("cleanOrDenyBeforeRestart returned null"),
                             )
                         ),
-                        generation = nextDebtGeneration++,
-                        attempt = 0,
+                        generation = nextDebtGeneration++, attempt = 0,
                     )
                 )
                 val state = cleanupDebt?.let(::debtState)
@@ -259,12 +239,14 @@ class ProxyOnlyController(
                 cleanupDebt?.let(::scheduleDebtRetry)
                 return
             }
-            // Initialize generation counter from daemon-acknowledged epoch.
+            // R4 fix #3: daemon generation change forces a full key change via
+            // RuntimeKey.daemonGeneration, so any existing Applied handle from
+            // the old daemon will be torn down through the key-mismatch path.
             firewallGeneration = AtomicLong(epoch)
             sanitizedDaemonGeneration = next.daemonGeneration
         }
 
-        // R3 fix #4 (H6): require at least one routable downstream address.
+        // Compute downstream endpoints; require at least one routable address.
         val downstreamEndpoints = next.downstreams.mapNotNull { ds ->
             ds.ipv4Address?.takeIf { isRoutableIpv4(it) }?.let { ip ->
                 ProxyEndpoint(
@@ -275,15 +257,22 @@ class ProxyOnlyController(
                 )
             }
         }
+        // R4 fix #9: distinguish "no tethering interfaces" from "interfaces present
+        // but no routable address". Publish FailClosed for the latter.
         if (downstreamEndpoints.isEmpty()) {
-            enterWaiting(next, ProxyOnlyState.WaitingForTethering, "no routable downstream IPv4")
+            enterWaiting(
+                next,
+                ProxyOnlyState.FailClosed(FailClosedReason.NoReachableDownstreamAddress),
+                "no routable downstream IPv4",
+            )
             return
         }
 
+        // R4 fix #3: daemonGeneration is in the key; daemon restart forces full rebuild.
         val key = next.runtimeKey(upstream)
         val current = applied
         if (current?.complete == true && current.key == key) {
-            // R3 fix B1: named argument for generationCounter.
+            // Fast path — runtime key unchanged; replace ACL and firewall config only.
             firewall.replace(
                 current.firewall!!,
                 next.firewallConfig(denyAll = false, generationCounter = firewallGeneration),
@@ -308,12 +297,11 @@ class ProxyOnlyController(
         val partial = AppliedProxyState(key)
         applied = partial
 
-        // R3 fix B1: named argument.
         partial.firewall = firewall.start(
             next.firewallConfig(denyAll = true, generationCounter = firewallGeneration)
         )
 
-        // R3 fix #6: re-throw CancellationException from credential fetch.
+        // R3 fix B6: credential-fetch CancellationException rethrown.
         val credentials = try {
             credentialProvider.credentials()
         } catch (cancelled: CancellationException) {
@@ -354,7 +342,6 @@ class ProxyOnlyController(
             return
         }
 
-        // R3 fix B1: named argument.
         firewall.replace(
             partial.firewall!!,
             next.firewallConfig(denyAll = false, generationCounter = firewallGeneration),
@@ -382,8 +369,11 @@ class ProxyOnlyController(
     }
 
     // -----------------------------------------------------------------------
-    // Cleanup creation — R3 fix #4: fully local transaction, no mergeDebt calls.
-    // Returns one combined CleanupOutcome; caller merges exactly once.
+    // Cleanup creation — fully local transaction; no mergeDebt calls.
+    //
+    // R4 fix #10: emergency close failures are NOT added to acc.failures.
+    //   They are carried exclusively in the returned emergency debt. Adding them
+    //   to acc.failures AND including them in the merged debt duplicated failures.
     // -----------------------------------------------------------------------
 
     private suspend fun cleanupApplied(
@@ -407,12 +397,14 @@ class ProxyOnlyController(
         }
 
         var listenerResolved = serviceResolved
-        // R3 fix #4: collect emergency debt locally; do NOT call mergeDebt here.
+        // R4 fix #10: collect emergency debt locally; do NOT add its failures to
+        // acc.failures. The emergency debt carries its own failure list; merging
+        // them into acc would duplicate them in the combined debt's failure list.
         var emergencyDebt: CleanupDebt? = null
         if (!serviceResolved && serviceActivated) {
             val outcome = safeEmergencyClose(reason)
             listenerResolved = !outcome.report.hasCriticalFailure
-            acc.failures += outcome.report.failures
+            // outcome.report.failures intentionally NOT added to acc.failures
             emergencyDebt = outcome.debt
         }
 
@@ -421,7 +413,7 @@ class ProxyOnlyController(
             val stopped = acc.stepSucceeded("firewall_stop") { firewall.stop(current.firewall!!) }
             if (stopped) {
                 firewallResolved = true
-                denyResolved = true  // §D: firewall stop also clears deny
+                denyResolved = true  // §D: successful stop subsumes deny
             }
         }
 
@@ -433,20 +425,22 @@ class ProxyOnlyController(
             firewallStopPending = current.firewall != null && !firewallResolved,
             daemonCleanPending = current.firewall != null && !daemonAvailable,
             featureStopPending = false,
-            failures = acc.failures,
+            serviceWasActivated = serviceActivated,
+            failures = acc.failures.toList(),
             generation = nextDebtGeneration++,
             attempt = 0,
         ).takeUnless { it.isResolved }
 
-        // R3 fix #4: merge primary and emergency debt locally into one outcome.
+        // R4 fix #11 (partial): combine primary and emergency debt into one outcome
+        // locally so the caller merges exactly once.
         val combinedDebt = when {
             primaryDebt != null && emergencyDebt != null ->
-                primaryDebt.mergeUnresolved(emergencyDebt).copy(
-                    generation = nextDebtGeneration++,
-                    attempt = 0,
-                )
+                primaryDebt.mergeUnresolved(emergencyDebt)
+                    .copy(generation = nextDebtGeneration++, attempt = 0)
             primaryDebt != null -> primaryDebt
-            emergencyDebt != null -> emergencyDebt.copy(generation = nextDebtGeneration++, attempt = 0)
+            emergencyDebt != null -> emergencyDebt.copy(
+                generation = nextDebtGeneration++, attempt = 0,
+            )
             else -> null
         }
 
@@ -454,9 +448,11 @@ class ProxyOnlyController(
     }
 
     // -----------------------------------------------------------------------
-    // Debt retry
-    // R3 fix #2: withTimeoutOrNull in attempt(); no CancellationException catch.
-    // R3 fix #4: emergency debt collected locally, merged after updated is built.
+    // Cleanup debt retry — fully local transaction (R4 fix #11).
+    //
+    // All steps record failures without aborting.
+    // R4 fix #1: attempt() catches ordinary exceptions so independent steps run.
+    // R4 fix #12: successful daemon-clean updates sanitizedDaemonGeneration.
     // -----------------------------------------------------------------------
 
     private suspend fun retryCleanupDebtSafely() {
@@ -464,17 +460,25 @@ class ProxyOnlyController(
         val failures = mutableListOf<CleanupFailure>()
         val daemonHealthy = latestSnapshot.get()?.daemonHealthy == true
 
-        // R3 fix #2: withTimeoutOrNull absorbs only the step's own deadline.
-        // CancellationException propagates naturally without any explicit catch.
+        // R4 fix #1: attempt() catches ordinary exceptions so independent steps run.
         suspend fun attempt(name: String, block: suspend () -> CleanupReport): Boolean {
-            val r = withTimeoutOrNull(CLEANUP_STEP_TIMEOUT_MS) { block() }
-            if (r == null) {
-                failures += CleanupFailure(name, RuntimeException("step '$name' timed out"))
-                safeReport("proxy.cleanup_debt.$name.timeout", RuntimeException("step '$name' timed out"))
-                return false
+            return try {
+                val r = withTimeoutOrNull(CLEANUP_STEP_TIMEOUT_MS) { block() }
+                if (r == null) {
+                    failures += CleanupFailure(name, RuntimeException("step '$name' timed out"))
+                    safeReport("proxy.cleanup_debt.$name.timeout", RuntimeException("step '$name' timed out"))
+                    false
+                } else {
+                    failures += r.failures
+                    r.failures.isEmpty()
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (t: Throwable) {
+                failures += CleanupFailure(name, t)
+                safeReport("proxy.cleanup_debt.$name", t)
+                false
             }
-            failures += r.failures
-            return r.failures.isEmpty()
         }
 
         var serviceHandle = debt.serviceHandlePending
@@ -487,12 +491,14 @@ class ProxyOnlyController(
             }
         }
 
-        // R3 fix #4: collect emergency outcome, merge after updated is built.
+        // R4 fix #11: collect emergency outcome locally; merge after updated is built.
         var emergencyOutcomeDebt: CleanupDebt? = null
         if (listenerPending && serviceActivated) {
             val outcome = safeEmergencyClose("cleanup debt retry")
             if (!outcome.report.hasCriticalFailure) listenerPending = false
-            failures += outcome.report.failures
+            // R4 fix #10: DO NOT add outcome.report.failures to failures here.
+            // They live in emergencyOutcomeDebt and will appear exactly once
+            // in the combined debt after merge.
             emergencyOutcomeDebt = outcome.debt
         }
 
@@ -507,33 +513,41 @@ class ProxyOnlyController(
             if (attempt("firewall_stop") { firewall.stop(firewallHandle!!) }) {
                 stopPending = false
                 firewallHandle = null
-                denyPending = false
+                denyPending = false // §D: successful stop subsumes deny
             }
         }
 
         var daemonCleanPending = debt.daemonCleanPending
         if (daemonCleanPending && daemonHealthy) {
-            val epoch = withTimeoutOrNull(CLEANUP_STEP_TIMEOUT_MS) {
-                firewall.cleanOrDenyBeforeRestart()
+            val epoch = try {
+                withTimeoutOrNull(CLEANUP_STEP_TIMEOUT_MS) { firewall.cleanOrDenyBeforeRestart() }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (t: Throwable) {
+                failures += CleanupFailure("daemon_clean", t)
+                null
             }
             if (epoch != null) {
                 daemonCleanPending = false
                 firewallGeneration = AtomicLong(epoch)
-            } else {
-                failures += CleanupFailure("daemon_clean", RuntimeException("cleanOrDenyBeforeRestart timed out or returned null"))
+                // R4 fix #12: record the sanitized daemon generation so the next
+                // reconciliation does not repeat cleanOrDenyBeforeRestart unnecessarily.
+                sanitizedDaemonGeneration = latestSnapshot.get()?.daemonGeneration
+            } else if (epoch == null) {
+                // null without exception = timeout; already covered by the
+                // outer try/catch block; add a diagnostic failure.
+                if (failures.none { it.step == "daemon_clean" }) {
+                    failures += CleanupFailure("daemon_clean",
+                        RuntimeException("cleanOrDenyBeforeRestart returned null (timed out)"))
+                }
             }
         }
 
         var featureStopPending = debt.featureStopPending
-        // R2 fix #2: feature stop only after service handle and listener are cleared.
         if (featureStopPending && serviceActivated && serviceHandle == null && !listenerPending) {
-            val r = withTimeoutOrNull(CLEANUP_STEP_TIMEOUT_MS) { service.stopFeature("cleanup debt retry") }
-            if (r != null && r.failures.isEmpty()) {
+            if (attempt("feature_stop") { service.stopFeature("cleanup debt retry") }) {
                 featureStopPending = false
                 serviceActivated = false
-            } else {
-                failures += r?.failures
-                    ?: listOf(CleanupFailure("feature_stop", RuntimeException("feature_stop timed out")))
             }
         }
 
@@ -549,24 +563,47 @@ class ProxyOnlyController(
             attempt = debt.attempt + 1,
         )
 
-        // R3 fix #4: commit primary updated debt first, then merge emergency debt.
-        cleanupDebt = updated.takeUnless { it.isResolved }
-        emergencyOutcomeDebt?.let { mergeDebt(it) }
+        // R4 fix #11: single combined commit — build the merged result locally,
+        // then assign cleanupDebt exactly once.
+        val combined = if (emergencyOutcomeDebt != null && !updated.isResolved) {
+            updated.mergeUnresolved(emergencyOutcomeDebt)
+                .copy(generation = nextDebtGeneration++, attempt = 0)
+        } else if (emergencyOutcomeDebt != null) {
+            emergencyOutcomeDebt.copy(generation = nextDebtGeneration++, attempt = 0)
+        } else {
+            updated
+        }
+        cleanupDebt = combined.takeUnless { it.isResolved }
     }
 
     // -----------------------------------------------------------------------
     // Debt retry scheduler
-    // R3 fix #5: uses cleanupScope so retries survive worker termination.
+    //
+    // R4 fix #2: cleanup retries execute directly in cleanupScope under
+    // stateMutex — not via events.send() which routes to a dead channel after
+    // the worker exits.
     // -----------------------------------------------------------------------
 
     private fun scheduleDebtRetry(debt: CleanupDebt) {
-        if (retryJob?.isActive == true && scheduledRetryGeneration == debt.generation) return
         retryJob?.cancel()
-        scheduledRetryGeneration = debt.generation
-        // R3 fix #5: cleanupScope outlives the worker scope.
         retryJob = cleanupScope.launch {
             delay(cleanupBackoff(debt.attempt))
-            events.send(ControllerEvent.RetryCleanupDebt(debt.generation))
+            try {
+                stateMutex.withLock {
+                    retryCleanupDebtSafely()
+                    val unresolved = cleanupDebt
+                    if (unresolved != null) {
+                        publishDebt(unresolved)
+                        scheduleDebtRetry(unresolved)
+                    } else {
+                        // Debt cleared: nudge reconciliation if worker may still be alive.
+                        // trySend on CONFLATED never blocks; harmless if worker has exited.
+                        latestSnapshot.get()?.let { events.trySend(ControllerEvent.Snapshot(it)) }
+                    }
+                }
+            } catch (_: CancellationException) {
+                // Retry job was cancelled (e.g. by a newer scheduleDebtRetry call) — OK.
+            }
         }
     }
 
@@ -576,7 +613,6 @@ class ProxyOnlyController(
         cleanupDebt = merged.copy(generation = nextDebtGeneration++, attempt = 0)
         retryJob?.cancel()
         retryJob = null
-        scheduledRetryGeneration = null
     }
 
     // -----------------------------------------------------------------------
@@ -636,13 +672,14 @@ class ProxyOnlyController(
             } == true
 
             if (hasServiceDebt) {
+                // Defer feature stop until service handle and listener are resolved.
                 mergeDebt(
                     CleanupDebt(
                         listenerClosePending = false, serviceHandlePending = null,
                         firewallHandlePending = null, firewallDenyPending = false,
                         firewallStopPending = false, daemonCleanPending = false,
-                        featureStopPending = true, failures = emptyList(),
-                        generation = nextDebtGeneration++, attempt = 0,
+                        featureStopPending = true, serviceWasActivated = true,
+                        failures = emptyList(), generation = nextDebtGeneration++, attempt = 0,
                     )
                 )
             } else {
@@ -663,14 +700,16 @@ class ProxyOnlyController(
                             listenerClosePending = false, serviceHandlePending = null,
                             firewallHandlePending = null, firewallDenyPending = false,
                             firewallStopPending = false, daemonCleanPending = false,
-                            featureStopPending = true, failures = featureReport.failures,
+                            featureStopPending = true, serviceWasActivated = true,
+                            failures = featureReport.failures,
                             generation = nextDebtGeneration++, attempt = 0,
                         )
                     )
                 }
             }
         }
-        // R3 fix #5: scheduleDebtRetry uses cleanupScope — survives after this finally.
+        // R4 fix #2: scheduleDebtRetry executes directly in cleanupScope, so
+        // terminal debt retries survive after the worker finally block completes.
         cleanupDebt?.let(::scheduleDebtRetry)
     }
 
@@ -678,7 +717,6 @@ class ProxyOnlyController(
     // Helpers
     // -----------------------------------------------------------------------
 
-    /** R3 fix #2: withTimeoutOrNull so outer CancellationException propagates. */
     private suspend fun safeEmergencyClose(reason: String): CleanupOutcome {
         return try {
             withTimeoutOrNull(CLEANUP_STEP_TIMEOUT_MS) {
@@ -693,13 +731,13 @@ class ProxyOnlyController(
                         serviceHandlePending = applied?.service,
                         firewallHandlePending = null, firewallDenyPending = false,
                         firewallStopPending = false, daemonCleanPending = false,
-                        featureStopPending = false, failures = listOf(f),
-                        generation = nextDebtGeneration++, attempt = 0,
+                        featureStopPending = false, serviceWasActivated = serviceActivated,
+                        failures = listOf(f), generation = nextDebtGeneration++, attempt = 0,
                     )
                 )
             }
         } catch (cancelled: CancellationException) {
-            throw cancelled   // R3 fix #2
+            throw cancelled
         } catch (t: Throwable) {
             val f = CleanupFailure("emergency_close", t)
             CleanupOutcome(
@@ -711,6 +749,7 @@ class ProxyOnlyController(
                     firewallDenyPending = applied?.firewall != null,
                     firewallStopPending = applied?.firewall != null,
                     daemonCleanPending = true, featureStopPending = false,
+                    serviceWasActivated = serviceActivated,
                     failures = listOf(f), generation = nextDebtGeneration++, attempt = 0,
                 )
             )
@@ -737,7 +776,6 @@ class ProxyOnlyController(
 
 // ---------------------------------------------------------------------------
 // Extension helpers on DesiredProxyState
-// R3 fix B1: all firewallConfig() calls require named generationCounter.
 // ---------------------------------------------------------------------------
 
 fun DesiredProxyState.runtimeKey(upstream: ProxyVpnUpstream): RuntimeKey =
@@ -750,6 +788,8 @@ fun DesiredProxyState.runtimeKey(upstream: ProxyVpnUpstream): RuntimeKey =
             ds.interfaceName to listOfNotNull(ds.ipv4Address).map { normalizeIpv4(it) }.sorted()
         },
         backendVersion = 1,
+        // R4 fix #3: include daemon generation so key changes on every restart.
+        daemonGeneration = daemonGeneration ?: 0L,
     )
 
 fun DesiredProxyState.firewallConfig(
@@ -779,7 +819,3 @@ fun DesiredProxyState.backendConfig(
     vpnNetworkHandle = upstream.handle,
     backendVersion = 1,
 )
-
-fun Boolean.asCleanupReport() =
-    if (this) CleanupReport.empty()
-    else CleanupReport.failure("operation", RuntimeException("returned false"))

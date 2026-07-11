@@ -10,6 +10,11 @@ package be.mygod.vpnhotspot.proxy
 //   • Successful firewall stop → resolves FIREWALL_RUNTIME + FIREWALL_DENY
 //   • Deny success alone       → does NOT resolve FIREWALL_RUNTIME
 //   • Debt merge               → fresh generation, union of unresolved resources
+//
+// R4 additions:
+//   • serviceWasActivated: required by ProxyCleanupSupervisor to know whether
+//     stopBackend / emergencyCloseListener / stopFeature calls are meaningful.
+//     Set to true in any debt created while serviceActivated=true; merged with OR.
 // ---------------------------------------------------------------------------
 
 data class AppliedProxyState(
@@ -36,6 +41,13 @@ data class CleanupDebt(
     val firewallStopPending: Boolean,
     val daemonCleanPending: Boolean,
     val featureStopPending: Boolean,
+    /**
+     * R4: True when [ProxyService.activateFeature] was called and not yet matched
+     * by a successful [stopFeature]. Required by [ProxyCleanupSupervisor] so it
+     * knows whether service-layer cleanup calls are meaningful after the
+     * controller worker has exited.
+     */
+    val serviceWasActivated: Boolean,
     val failures: List<CleanupFailure>,
     val generation: Long,
     val attempt: Int,
@@ -80,6 +92,7 @@ data class CleanupDebt(
             firewallStopPending = firewallStopPending || other.firewallStopPending,
             daemonCleanPending = daemonCleanPending || other.daemonCleanPending,
             featureStopPending = featureStopPending || other.featureStopPending,
+            serviceWasActivated = serviceWasActivated || other.serviceWasActivated,
             failures = failures + other.failures,
             attempt = 0,
             // Fresh generation assigned by the controller after merge.
