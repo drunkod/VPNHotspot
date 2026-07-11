@@ -149,6 +149,7 @@ data class DesiredProxyState(
      */
     fun normalized(): DesiredProxyState = copy(
         downstreams = downstreams
+            .filter { isValidInterfaceName(it.interfaceName.trim()) }
             .groupBy { it.interfaceName.trim() }
             .map { (iface, group) ->
                 ManagedDownstream(
@@ -268,7 +269,32 @@ fun canonicalizeMac(mac: String): String? {
     if (bytes[0] and 0x01 != 0) return null
     // Reject broadcast FF:FF:FF:FF:FF:FF explicitly.
     if (bytes.all { it == 0xFF }) return null
+    // R5 fix #6: reject all-zero MAC (00:00:00:00:00:00) — not a valid unicast source.
+    if (bytes.all { it == 0x00 }) return null
     return bytes.joinToString(":") { "%02X".format(it) }
+}
+
+// ---------------------------------------------------------------------------
+// Interface name validation
+//
+// R5 fix #6: reject empty or oversized interface names before they reach
+// firewall configuration. Linux IFNAMSIZ is 16 (including NUL terminator),
+// so valid names are 1–15 characters.
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns true if [name] is a plausible Linux network interface name:
+ * non-empty, at most 15 characters, and composed only of printable ASCII
+ * that does not include whitespace or shell-sensitive characters.
+ *
+ * This is a conservative allow-list; production adapters should validate
+ * against the actual system interface list before constructing DesiredProxyState.
+ */
+fun isValidInterfaceName(name: String): Boolean {
+    if (name.isEmpty() || name.length > 15) return false
+    return name.all { c ->
+        c.isLetterOrDigit() || c == '_' || c == '-' || c == '.' || c == ':' || c == '@'
+    }
 }
 
 // ---------------------------------------------------------------------------
