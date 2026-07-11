@@ -110,3 +110,44 @@ Stop paths must report each failed cleanup step with context. A backend-stop fai
 ## Approval boundary
 
 After the documents incorporate the required change and amendments above, the design is approved to begin Phase 0 only. This is not approval to merge UI, production firewall commands or release code before the Phase 0 exit criteria pass.
+
+## Post-review consistency audit
+
+A final comparison of the rewritten plans and sketches identified four additional consistency requirements. They do not change the product direction, but they must be part of the Phase 0 controller/service contract.
+
+### Service activation must follow enabled state
+
+The reconciler must inspect `settings.enabled` before requesting foreground-service activation. A disabled snapshot must never call `ensureServiceActive()` or attempt an FGS start. Enabling must originate from a user-approved foreground action; background dependency changes may only operate an already-active service.
+
+### Waiting states require an explicit service command
+
+Publishing `WaitingForVpn`, `WaitingForTethering` or `FailClosed` is not enough. The controller must call a service operation such as `enterWaiting(state)` that:
+
+- closes any listener and sessions;
+- keeps the already-started FGS alive;
+- updates its persistent notification;
+- records that no backend handle is active.
+
+User disable uses a distinct terminal `stopFeature()` operation that closes the backend and stops the FGS.
+
+### Parent cancellation must not be swallowed
+
+The worker distinguishes transaction timeout from parent-job cancellation:
+
+- `TimeoutCancellationException` is handled as an iteration failure and enters fail-closed recovery;
+- a parent `CancellationException` is rethrown so the worker reaches its `finally` block;
+- terminal cleanup then runs in `NonCancellable` context.
+
+A broad `catch (Throwable)` without this distinction is not an approved implementation.
+
+### Failed cleanup creates cleanup debt
+
+If deny, backend stop, emergency listener close or firewall stop fails, the system records structured cleanup debt rather than discarding the handles and reporting only a log entry. While cleanup debt exists:
+
+- no new backend may start;
+- emergency listener closure is retried where applicable;
+- daemon recovery runs deterministic Clean or explicit deny reconciliation;
+- the UI/notification remains fail-closed and reports degraded cleanup;
+- successful cleanup clears the debt before normal reconciliation resumes.
+
+This prevents a failed stop from becoming an untracked state that later restarts over stale native or firewall resources.
