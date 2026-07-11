@@ -53,10 +53,13 @@ data class RuntimeKey(
 
 sealed interface FailClosedReason {
     data object RootDaemonUnavailable : FailClosedReason
+    data class BindProbeFailed(val detail: String) : FailClosedReason
     data class TcpProbeFailed(val detail: String) : FailClosedReason
     data class UdpProbeFailed(val detail: String) : FailClosedReason
     data class DnsProbeFailed(val detail: String) : FailClosedReason
     data class ListenerNotReady(val detail: String) : FailClosedReason
+    data class ProbeReportIncomplete(val missing: Set<ProbeKind>) : FailClosedReason
+    data class StartupSanitationFailed(val detail: String) : FailClosedReason
     data class InternalFailure(val category: String) : FailClosedReason
 }
 
@@ -91,6 +94,7 @@ data class DesiredProxyState(
     val downstreams: List<ManagedDownstream>,
     val allowedClients: List<AllowedClient>,
     val daemonHealthy: Boolean,
+    val daemonGeneration: Long?,
 )
 
 sealed interface ControllerEvent {
@@ -100,3 +104,10 @@ sealed interface ControllerEvent {
 ```
 
 Snapshots are normalized before entering the controller channel. Client ordering and irrelevant `LinkProperties` churn must not alter the runtime key.
+
+## 1.3 Cold-start sanitation invariant
+
+`CleanupDebt` is process memory and cannot be trusted to survive process death. Before the
+first proxy-firewall runtime starts in each observed daemon generation, the controller
+must complete an idempotent proxy-firewall Clean/deny sanitation pass. A persisted
+`enabled=true` setting or a fresh activation grant does not bypass this gate.
