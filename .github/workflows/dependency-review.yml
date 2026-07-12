@@ -18,3 +18,8 @@ jobs:
         uses: actions/dependency-review-action@v5
         with:
           fail-on-severity: moderate
+          # Gradle snapshots are submitted by dependency-submission.yml on push.
+          # A PR run can start before that push workflow finishes, so wait rather
+          # than treating the temporary snapshot warning as a policy failure.
+          retry-on-snapshot-warnings: true
+          retry-on-snapshot-warnings-timeout: 600
