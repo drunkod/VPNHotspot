@@ -20,7 +20,7 @@ import kotlin.math.min
 import kotlin.random.Random
 
 // ---------------------------------------------------------------------------
-// Step 6 + Step 10 — ProxyOnlyController (R9-corrected)
+// Step 6 + Step 10 — ProxyOnlyController (R10-corrected)
 //
 // R8 fixes (retained):
 //   #1 partial.firewall assigned before session/epoch validation.
@@ -28,25 +28,29 @@ import kotlin.random.Random
 //   #3 debt-retry sanitation captures generation before IPC.
 //   #4 fast-path replace() requires exact (sessionId, epoch) match.
 //
-// R9 fixes applied over R8 baseline:
+// R9 fixes (retained):
+//   #1 service-handle conflict discards both handles; feature_stop reachable.
+//   #2 primary sanitation gate captures + revalidates daemon generation.
+//   #3 deny-to-allow replace() checks generation after probes.
 //
-//   Blocker #1 (service-handle conflict deadlock): CleanupDebt.mergeUnresolved()
-//     now discards BOTH conflicting service handles, sets listenerClosePending
-//     and featureStopPending. retryCleanupDebtSafely() allows feature_stop when
-//     serviceHandlePending is null regardless of listenerPending — ProxyService
-//     .stopFeature() performs authoritative teardown using its own internal
-//     backend handle, breaking the R8 deadlock.
+// R10 fixes applied over R9 baseline:
 //
-//   Blocker #2 (primary sanitation generation race): reconcile() now captures
-//     next.daemonGeneration before cleanOrDenyBeforeRestart() IPC and re-reads
-//     latestSnapshot after the call. If the generation changed during IPC, the
-//     acknowledgement is discarded as a primary_sanitation_race failure and
-//     daemonCleanPending debt is recorded; no startup proceeds.
+//   Blocker #1 (successful feature_stop resurrects stale emergency debt):
+//     retryCleanupDebtSafely() now discards emergencyOutcomeDebt on successful
+//     feature_stop. Authoritative service teardown dominates all service/listener
+//     observations from the same transaction; emergency debt is not merged back.
 //
-//   Blocker #3 (per-command provenance before final replace): the deny-to-allow
-//     firewall.replace() after probes now validates that latestSnapshot daemon
-//     generation has not changed during startup/probing. A generation change
-//     triggers cleanupApplied(daemonAvailable=false) and returns.
+//   Blocker #2 (fast-path crosses daemon restart): fast-path replace() now also
+//     requires latestSnapshot.daemonGeneration == next.daemonGeneration ==
+//     sanitizedDaemonGeneration. A generation mismatch nulls session/epoch markers
+//     and triggers cleanupApplied(daemonAvailable=false) → daemonCleanPending.
+//
+//   Blocker #3 (cleanup/retry IPC can target a restarted daemon):
+//     cleanupApplied() classifies a handle as current only when the latest observed
+//     generation equals sanitizedDaemonGeneration in addition to session/epoch match.
+//     retryCleanupDebtSafely() classifies a handle as current only when
+//     capturedDaemonGeneration == newSanitizedDaemonGen in addition to epoch match.
+//     Generation mismatch falls through to the handleStale path → daemonCleanPending.
 // ---------------------------------------------------------------------------
 
 private const val TRANSACTION_TIMEOUT_MS = 30_000L
@@ -352,16 +356,49 @@ class ProxyOnlyController(
         // in addition to RuntimeKey equality. A surviving applied runtime whose
         // firewall handle has wrong provenance (after recovery) falls through to
         // the key-change cleanup path below.
+        // R10 blocker #2: also require that latestSnapshot.daemonGeneration still equals
+        // both the reconciliation snapshot's generation and sanitizedDaemonGeneration.
+        // The collector updates latestSnapshot outside stateMutex, so G2 can be observed
+        // while G1 reconciliation owns the mutex. A stale G1 handle must not be submitted
+        // via replace() to a transport now connected to G2.
+        val latestGenFast = latestSnapshot.get()?.daemonGeneration
         if (current?.complete == true && current.key == key &&
             currentFw != null &&
             currentFw.sessionId == sanitizedSessionId &&
-            currentFw.epoch == sanitizedEpoch) {
+            currentFw.epoch == sanitizedEpoch &&
+            latestGenFast == next.daemonGeneration &&
+            latestGenFast == sanitizedDaemonGeneration) {
             firewall.replace(
                 currentFw,
                 next.firewallConfig(denyAll = false, generationCounter = firewallGeneration),
             )
             service.replaceAcl(current.service!!, next.allowedClients)
             publishSafely(ProxyOnlyState.Running(downstreamEndpoints))
+            return
+        }
+        // Fast-path generation mismatch: treat handle as unknown provenance.
+        if (current?.complete == true && current.key == key &&
+            currentFw != null &&
+            currentFw.sessionId == sanitizedSessionId &&
+            currentFw.epoch == sanitizedEpoch &&
+            (latestGenFast != next.daemonGeneration || latestGenFast != sanitizedDaemonGeneration)) {
+            sanitizedSessionId = null
+            sanitizedEpoch = null
+            withContext(NonCancellable) {
+                cleanupApplied(
+                    "fast-path daemon generation mismatch: snapshot=$latestGenFast " +
+                        "reconciliation=${next.daemonGeneration} " +
+                        "sanitized=$sanitizedDaemonGeneration",
+                    daemonAvailable = false,
+                )
+            }
+            val state = cleanupDebt?.let(::debtState)
+                ?: ProxyOnlyState.FailClosed(
+                    FailClosedReason.StartupSanitationFailed("fast-path daemon generation mismatch")
+                )
+            enterWaitingIfActive(state)
+            publishSafely(state)
+            cleanupDebt?.let(::scheduleDebtRetry)
             return
         }
 
@@ -512,10 +549,18 @@ class ProxyOnlyController(
     // is always cleared in the same call. Callers do NOT call mergeDebt()
     // separately after this function.
     //
-    // Handle disposition (R7 blocker #2 / R8):
-    //   A. (sessionId == sId && epoch == sEpoch) → current: IPC allowed.
-    //   B. (sessionId == sId && epoch <  sEpoch) → dominated: resolved, no IPC.
-    //   C. any other combination                  → conflict/unknown: daemonCleanPending.
+    // Handle disposition:
+    //   A. (sessionId==sId && epoch==sEpoch && latestGen==sanitizedDaemonGen)
+    //      → current: IPC allowed when daemonAvailable.
+    //   B. (sessionId==sId && epoch<sEpoch)
+    //      → dominated: resolved without IPC (sanitation covered it).
+    //   C. any other combination, including generation mismatch
+    //      → conflict/unknown: daemonCleanPending, no IPC.
+    //
+    // R10 blocker #3: firewall handle IPC (denyAll, stop) is only issued when
+    // the latest observed daemon generation equals sanitizedDaemonGeneration.
+    // A mismatched generation classifies even a session/epoch-matched handle as
+    // unknown-provenance, preventing G1 IPC from reaching G2.
     // -----------------------------------------------------------------------
 
     private suspend fun cleanupApplied(
@@ -530,10 +575,17 @@ class ProxyOnlyController(
         val sId = sanitizedSessionId
         val sEpoch = sanitizedEpoch
 
+        // R10 blocker #3: snapshot generation before any IPC.
+        val latestGen = latestSnapshot.get()?.daemonGeneration
+        val generationSafe = latestGen != null && latestGen == sanitizedDaemonGeneration
+
         val sameSession = fw != null && sId != null && fw.sessionId == sId
-        val firewallCurrent = sameSession && sEpoch != null && fw!!.epoch == sEpoch   // case A
-        val firewallDominated = sameSession && sEpoch != null && fw!!.epoch < sEpoch  // case B
-        val firewallNeedsClean = fw != null && !firewallCurrent && !firewallDominated // case C
+        // Case A: current handle — session+epoch match AND generation is safe.
+        val firewallCurrent = sameSession && sEpoch != null && fw!!.epoch == sEpoch && generationSafe
+        // Case B: dominated — same session, older epoch. Safe to skip IPC.
+        val firewallDominated = sameSession && sEpoch != null && fw!!.epoch < sEpoch
+        // Case C: conflict/unknown or generation mismatch — requires re-sanitation.
+        val firewallNeedsClean = fw != null && !firewallCurrent && !firewallDominated
 
         var denyResolved = fw == null || firewallDominated
         var firewallResolved = fw == null || firewallDominated
@@ -664,12 +716,19 @@ class ProxyOnlyController(
         val handleSameSession = firewallHandle != null &&
             newSanitizedSessionId != null &&
             firewallHandle!!.sessionId == newSanitizedSessionId
-        val handleCurrent = handleSameSession &&
+        val handleEpochCurrent = handleSameSession &&
             newSanitizedEpoch != null &&
             firewallHandle!!.epoch == newSanitizedEpoch
         val handleDominated = handleSameSession &&
             newSanitizedEpoch != null &&
             firewallHandle!!.epoch < newSanitizedEpoch
+        // R10 blocker #3: also require that the captured snapshot generation equals the
+        // generation that produced the current sanitation acknowledgement. If they differ,
+        // the collector has observed a new daemon generation while the handle refers to the
+        // old one; submitting IPC would cross a daemon restart boundary.
+        val generationSafe = capturedDaemonGeneration != null &&
+            capturedDaemonGeneration == newSanitizedDaemonGen
+        val handleCurrent = handleEpochCurrent && generationSafe
         val handleStale = firewallHandle != null && !handleCurrent
 
         var daemonCleanPending = debt.daemonCleanPending
@@ -731,17 +790,21 @@ class ProxyOnlyController(
         }
 
         var featureStopPending = debt.featureStopPending
-        // R9 blocker #1: when service handles conflict, mergeUnresolved() clears both
-        // handles (serviceHandlePending = null) and sets featureStopPending + listenerPending.
-        // ProxyService.stopFeature() performs authoritative teardown using its internal
-        // backend handle, so feature_stop is allowed whenever serviceHandlePending is null —
-        // it does NOT require listenerPending to be false first. This breaks the R8 deadlock
-        // where retaining a stale handle permanently blocked featureStopPending.
+        // R9 blocker #1 / R10 blocker #1:
+        // feature_stop is allowed whenever serviceHandlePending is null; ProxyService
+        // .stopFeature() uses its own internal backend handle authoritatively.
+        // R10: on successful feature_stop, authoritative teardown dominates all earlier
+        // emergency service/listener debt from this transaction — emergencyOutcomeDebt is
+        // discarded so stale handles and listener flags are not reintroduced by the later
+        // merge. A failed feature_stop retains emergencyOutcomeDebt for further retry.
         if (featureStopPending && newServiceActivated && serviceHandle == null) {
             if (attempt("feature_stop") { service.stopFeature("cleanup debt retry") }) {
                 featureStopPending = false
                 listenerPending = false
                 newServiceActivated = false
+                // Authoritative teardown dominates: discard emergency debt so it is not
+                // merged back and cannot resurrect stale service/listener items.
+                emergencyOutcomeDebt = null
             }
         }
 
