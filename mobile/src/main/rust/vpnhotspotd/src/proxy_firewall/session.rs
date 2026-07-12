@@ -186,8 +186,6 @@ impl ProxySession {
 #[cfg(test)]
 mod tests {
     use std::process::{Command, Stdio};
-    use std::process::{Command, Stdio};
-    use std::process::{Command, Stdio};
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -218,126 +216,6 @@ mod tests {
         assert_eq!(second, 2);
         assert_eq!(third, 3);
         assert_eq!(fs::read_to_string(store.path()).unwrap().trim(), "3");
-
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn file_store_removes_stale_temporary_files_under_lock() {
-        let (directory, store) = temporary_store("stale-temp");
-        fs::create_dir_all(&directory).unwrap();
-        let stale = store.path().with_file_name("counter.tmp-stale");
-        fs::write(&stale, "partial").unwrap();
-
-        assert_eq!(store.next_session_id().unwrap(), 1);
-        assert!(!stale.exists());
-
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn file_store_process_helper() {
-        let Some(path) = std::env::var_os("VPNHOTSPOTD_SESSION_STORE_HELPER") else {
-            return;
-        };
-        let value = FileSessionStore::new(path).next_session_id().unwrap();
-        println!("SESSION_ID={value}");
-    }
-
-    #[test]
-    fn file_store_serializes_concurrent_processes() {
-        let (directory, store) = temporary_store("processes");
-        let executable = std::env::current_exe().unwrap();
-        let test_name = "proxy_firewall::session::tests::file_store_process_helper";
-        let mut children = Vec::new();
-        for _ in 0..8 {
-            children.push(
-                Command::new(&executable)
-                    .args(["--exact", test_name, "--nocapture"])
-                    .env("VPNHOTSPOTD_SESSION_STORE_HELPER", store.path())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap(),
-            );
-        }
-        let mut values = children
-            .into_iter()
-            .map(|child| {
-                let output = child.wait_with_output().unwrap();
-                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-                String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .find_map(|line| line.strip_prefix("SESSION_ID="))
-                    .unwrap()
-                    .parse::<u64>()
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        values.sort_unstable();
-
-        assert_eq!(values, (1..=8).collect::<Vec<_>>());
-        assert_eq!(fs::read_to_string(store.path()).unwrap().trim(), "8");
-
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn file_store_removes_stale_temporary_files_under_lock() {
-        let (directory, store) = temporary_store("stale-temp");
-        fs::create_dir_all(&directory).unwrap();
-        let stale = store.path().with_file_name("counter.tmp-stale");
-        fs::write(&stale, "partial").unwrap();
-
-        assert_eq!(store.next_session_id().unwrap(), 1);
-        assert!(!stale.exists());
-
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn file_store_process_helper() {
-        let Some(path) = std::env::var_os("VPNHOTSPOTD_SESSION_STORE_HELPER") else {
-            return;
-        };
-        let value = FileSessionStore::new(path).next_session_id().unwrap();
-        println!("SESSION_ID={value}");
-    }
-
-    #[test]
-    fn file_store_serializes_concurrent_processes() {
-        let (directory, store) = temporary_store("processes");
-        let executable = std::env::current_exe().unwrap();
-        let test_name = "proxy_firewall::session::tests::file_store_process_helper";
-        let mut children = Vec::new();
-        for _ in 0..8 {
-            children.push(
-                Command::new(&executable)
-                    .args(["--exact", test_name, "--nocapture"])
-                    .env("VPNHOTSPOTD_SESSION_STORE_HELPER", store.path())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap(),
-            );
-        }
-        let mut values = children
-            .into_iter()
-            .map(|child| {
-                let output = child.wait_with_output().unwrap();
-                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-                String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .find_map(|line| line.strip_prefix("SESSION_ID="))
-                    .unwrap()
-                    .parse::<u64>()
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        values.sort_unstable();
-
-        assert_eq!(values, (1..=8).collect::<Vec<_>>());
-        assert_eq!(fs::read_to_string(store.path()).unwrap().trim(), "8");
 
         fs::remove_dir_all(directory).unwrap();
     }
