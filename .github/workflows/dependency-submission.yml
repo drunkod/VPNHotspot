@@ -1,0 +1,36 @@
+name: Dependency Submission
+
+on:
+  push:
+  workflow_dispatch:
+
+# Dependency snapshots are repository metadata. Keep write permission isolated
+# from the pull-request review job, which remains read-only.
+permissions:
+  contents: write
+
+concurrency:
+  group: dependency-submission-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gradle-dependency-submission:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Generate and submit Gradle dependency graph
+        uses: gradle/actions/dependency-submission@v6
