@@ -53,7 +53,10 @@ jobs:
 
       - name: Run Rust daemon clippy
         working-directory: mobile/src/main/rust/vpnhotspotd
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: |
+          mkdir -p ../../../../build/reports
+          cargo clippy --locked --all-targets -- -D warnings 2>&1 | tee ../../../../build/reports/clippy.log
+          test "${PIPESTATUS[0]}" -eq 0
 
       - name: Audit Rust daemon dependencies
         working-directory: mobile/src/main/rust/vpnhotspotd
