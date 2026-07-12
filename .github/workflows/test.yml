@@ -30,6 +30,7 @@ jobs:
           set +e
           {
             python3 .github/scripts/apply_track_c.py
+            git checkout -- .github/workflows/test.yml
             git diff --check
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
