@@ -3,6 +3,7 @@ package be.mygod.vpnhotspot.proxy
 import be.mygod.vpnhotspot.proxy.proto.DaemonIdentity
 import be.mygod.vpnhotspot.proxy.proto.ProxyFirewallAck
 import be.mygod.vpnhotspot.proxy.proto.ProxyFirewallCommand
+import java.io.IOException
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -14,12 +15,12 @@ class DaemonProxyFirewallClientTest {
     @Test
     fun sanitationThenStart_usesAndReturnsOnlyDaemonIssuedIdentity() = runBlocking {
         val rpc = FakeRpc(
-            ack(ProxyFirewallAck.Status.OK, session = 11, epoch = 4),
-            ack(ProxyFirewallAck.Status.OK, session = 11, epoch = 4, handle = 99),
+            ack(ProxyFirewallAck.Status.OK, session = 11, epoch = 4, generation = 17),
+            ack(ProxyFirewallAck.Status.OK, session = 11, epoch = 4, generation = 17, handle = 99),
         )
         val client = client(rpc)
 
-        assertEquals(SanitationResult(11, 4), client.cleanOrDenyBeforeRestart())
+        assertEquals(SanitationResult(11, 4, 17), client.cleanOrDenyBeforeRestart())
         val handle = client.start(config(generation = 5, deny = true))
 
         assertEquals(ProxyFirewallHandle(11, 4, 99), handle)
@@ -35,6 +36,22 @@ class DaemonProxyFirewallClientTest {
         assertEquals(5L, start.config!!.generation)
         assertTrue(start.config!!.deny_all_ipv4)
         assertTrue(start.config!!.deny_all_ipv6)
+    }
+
+    @Test
+    fun sanitationTransportFailure_returnsNullAndClearsPreviouslySuccessfulToken() = runBlocking {
+        val rpc = FakeRpc(
+            ack(ProxyFirewallAck.Status.OK, session = 7, epoch = 1, generation = 9),
+        )
+        val client = client(rpc)
+
+        assertEquals(SanitationResult(7, 1, 9), client.cleanOrDenyBeforeRestart())
+        rpc.failure = IOException("daemon channel disconnected")
+
+        assertNull(client.cleanOrDenyBeforeRestart())
+        val failure = runCatching { client.start(config(generation = 2, deny = true)) }.exceptionOrNull()
+        assertTrue(failure is IllegalStateException)
+        assertEquals(2, rpc.commands.size)
     }
 
     @Test
@@ -89,7 +106,7 @@ class DaemonProxyFirewallClientTest {
         )
         val client = client(rpc)
 
-        assertEquals(SanitationResult(7, 1), client.cleanOrDenyBeforeRestart())
+        assertEquals(SanitationResult(7, 1, 7), client.cleanOrDenyBeforeRestart())
         assertNull(client.cleanOrDenyBeforeRestart())
         val failure = runCatching { client.start(config(generation = 2, deny = true)) }.exceptionOrNull()
         assertTrue(failure is IllegalStateException)
@@ -124,9 +141,11 @@ class DaemonProxyFirewallClientTest {
     private class FakeRpc(vararg acks: ProxyFirewallAck) : ProxyFirewallRpc {
         val commands = mutableListOf<ProxyFirewallCommand>()
         private val responses = ArrayDeque(acks.toList())
+        var failure: IOException? = null
 
         override suspend fun execute(command: ProxyFirewallCommand): ProxyFirewallAck {
             commands += command
+            failure?.let { throw it }
             return responses.removeFirst()
         }
     }
@@ -135,6 +154,7 @@ class DaemonProxyFirewallClientTest {
         status: ProxyFirewallAck.Status,
         session: Long,
         epoch: Long,
+        generation: Long = session,
         handle: Long = 0,
         detail: String = "",
     ): ProxyFirewallAck = ProxyFirewallAck(
@@ -142,7 +162,7 @@ class DaemonProxyFirewallClientTest {
         identity = DaemonIdentity(
             session_id = session,
             epoch = epoch,
-            generation = session,
+            generation = generation,
         ),
         handle_id = handle,
         detail = detail,
