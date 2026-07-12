@@ -1,69 +1,22 @@
 name: Test
 
 on:
+  push:
   pull_request:
   workflow_dispatch:
-
-permissions:
-  contents: write
 
 concurrency:
   group: test-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  apply-proxy-tracks-de:
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Check out source branch
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.pull_request.head.ref }}
-          fetch-depth: 0
-
-      - name: Decode reviewed implementation
-        env:
-          OUTPUT_PATH: ${{ runner.temp }}/apply_proxy_tracks_de.py
-        run: |
-          python - <<'PY'
-          import base64
-          import gzip
-          import os
-          from pathlib import Path
-
-          parts = sorted(Path("tools/proxy-track-payload").glob("part*"))
-          encoded = "".join(part.read_text() for part in parts)
-          print(f"payload chunks: {len(parts)}; encoded bytes: {len(encoded)}")
-          if len(parts) != 5 or len(encoded) != 7480:
-              raise RuntimeError("incomplete proxy track payload")
-          decoded = base64.b64decode(encoded, validate=True)
-          Path(os.environ["OUTPUT_PATH"]).write_bytes(gzip.decompress(decoded))
-          PY
-
-      - name: Apply Tracks D and E plus Track C review fixes
-        run: python "${RUNNER_TEMP}/apply_proxy_tracks_de.py"
-
-      - name: Commit implementation
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add mobile/src/main mobile/src/test
-          git diff --cached --check
-          git commit -m "Implement proxy cleanup history and normalization diagnostics"
-          git push origin HEAD:${{ github.event.pull_request.head.ref }}
-
   test:
-    needs: apply-proxy-tracks-de
-    if: always() && needs.apply-proxy-tracks-de.result == 'success'
     runs-on: ubuntu-latest
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.ref }}
           submodules: true
 
       - name: Set up Java
