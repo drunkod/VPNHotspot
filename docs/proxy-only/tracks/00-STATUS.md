@@ -4,11 +4,11 @@ Single source of truth for what is **done**, **in progress**, and **not started*
 in the proxy-only Phase 0 spike. Supersedes the scattered status notes across the
 12 implementation-review rounds.
 
-- Latest reviewed source commit: `379352e8e9a769624f29946c050e2a97e3f8c077`
+- Latest reviewed controller source: `379352e8e9a769624f29946c050e2a97e3f8c077`
 - Latest review commit: `821cb681901f07aa496ff0df0a056f27d137fb0b` (round 12)
-- Track A/F implementation head: `d2b814ea7f9539ecd53f1b9099fad12904ab93f9`
+- Track B verified implementation head: `229a7459f3d0ce1587e0cdf2a39225d8437cb782`
 - Branch: `agent/proxy-only-design`
-- PR state: **draft** (correctly held; structural integration gaps remain)
+- PR state: **draft** (correctly held; Tracks C–E and production service/backend integration remain)
 
 ## Legend
 
@@ -17,115 +17,101 @@ in the proxy-only Phase 0 spike. Supersedes the scattered status notes across th
 - ⬜ not started
 - 🔴 blocked / failing
 
-## What actually exists in the tree
+## What exists in the tree
 
 | Area | File(s) | State |
 | --- | --- | --- |
-| Controller reconciliation + cleanup-debt loop | `mobile/src/main/java/be/mygod/vpnhotspot/proxy/ProxyOnlyController.kt` | 🟡 iterated through R12 |
+| Controller reconciliation + cleanup-debt loop | `proxy/ProxyOnlyController.kt` | 🟡 iterated through R12; concrete supervisor remains Track C |
 | Itemized cleanup debt model | `proxy/CleanupDebt.kt` | 🟡 logic complete, history unbounded (Track D) |
 | Domain models + normalization | `proxy/ProxyModels.kt` | 🟡 works; silent drops, no diagnostics (Track E) |
 | Service/firewall client interfaces | `proxy/ProxyServiceClient.kt` | ✅ interfaces defined |
 | VPN selector | `proxy/ProxyVpnSelector.kt` | 🟡 selection logic present |
-| Probe types | `proxy/Probes.kt` | 🟡 typed results present |
-| UDP topology types | `proxy/UdpTopology.kt` | 🟡 scaffolding |
-| Firewall proto | `mobile/src/main/proto/proxy_firewall.proto` | 🟡 messages only; no acks/session/epoch (Track B) |
-| **Rust daemon proxy-firewall** | — | ⬜ **not implemented** (only `nat66/tproxy.rs` exists) |
+| Probe and UDP topology types | `proxy/Probes.kt`, `proxy/UdpTopology.kt` | 🟡 scaffolding/integration pending |
+| Proxy firewall wire protocol | `mobile/src/main/proto/proxy_firewall.proto`, `daemon.proto` | ✅ command envelope, authoritative identity and typed acks |
+| Rust daemon proxy firewall | `rust/vpnhotspotd/src/proxy_firewall/`, `proxy_firewall_kernel.rs` | ✅ enforced token boundary, ledger, persistent session store and iptables backend |
+| Kotlin daemon firewall adapter | `proxy/DaemonProxyFirewallClient.kt` | ✅ Wire mapping and stale-token handling; concrete service composition remains |
+| Proxy controller/protocol tests | `mobile/src/test/java/be/mygod/vpnhotspot/proxy/` | ✅ Tracks A and B focused tests |
+| Dependency graph submission/review | `.github/workflows/` | ✅ submission and moderate-severity review green |
 | **ProxyService (foreground service)** | — | ⬜ not implemented |
-| **Hev backend / native hook** | — | ⬜ no submodule pinned, no `HevProxyBackend`/`ProxyNative` |
-| **Proxy controller tests** | `mobile/src/test/java/be/mygod/vpnhotspot/proxy/` | ✅ Track A: generation matrix, teardown dominance, restart races, typed debt conflicts |
-| Dependency graph submission | `.github/workflows/dependency-submission.yml` | ✅ workflow added; requires repository Dependency graph to be enabled |
-| Dependency Review | `.github/workflows/dependency-review.yml` | 🔴 policy intact, blocked by dependency-graph API HTTP 403 |
+| **Hev backend / native hook integration** | — | ⬜ no pinned backend/JNI production integration |
 
 ## Track A result — complete
 
-Track A added a test-only reflection harness and four focused suites without changing
-production behavior:
+Track A covers the six-row generation/session/epoch matrices, authoritative teardown
+dominance, daemon restart races and typed cleanup-debt conflicts. The follow-up merge
+invariant is fixed and regression-tested.
 
-- six-row generation/session/epoch matrix against `cleanupApplied()`;
-- the same six rows against cleanup-debt retry;
-- authoritative `stopFeature()` teardown dominance, including simultaneous firewall debt;
-- G1-handle/G2-daemon fast-path and cleanup races;
-- typed service/firewall handle-conflict behavior.
+## Track B result — complete
 
-The first CI artifact showed every intended matrix/race/teardown test passing. Its only
-failure was an extra merge assertion outside current Track D semantics; that assertion
-was removed in `4da05cf068f14bf3724533636ec186d374a87d98`. The subsequent `assembleDebug check`
-step completed successfully.
+Track B moved session/epoch enforcement into the root daemon:
 
-## Track F result — diagnosed and blocked on repository setting
+- every start/replace/deny/stop request carries the daemon-issued `(session_id, epoch)`;
+- validation and kernel mutation are serialized under one daemon-side mutex;
+- stale session/epoch commands return typed acknowledgements before any kernel mutation;
+- sanitation installs explicit deny containment before clearing the ledger and advancing the epoch;
+- session IDs are crash-persistent, fsync'd and protected by an inter-process file lock;
+- proxy chains participate in daemon-wide cleanup;
+- IPv4 rules require downstream interface + client IP + MAC and end in reject;
+- IPv6 listener/relay ports remain denied;
+- Kotlin trusts only acknowledgement-issued identity/handles and maps stale cleanup acks to non-resolving failures;
+- Rust check/tests/clippy/audit, Android `assembleDebug check`, release R8 verification and Dependency Review passed at `229a7459`.
 
-The root cause is **configuration (Track F cause A)**, not a named vulnerable dependency:
+The concrete foreground-service implementation that supplies the RPC transport and
+containment configuration remains production integration, not part of the daemon
+protocol enforcement track.
 
-```text
-Dependency graph compare API HTTP status: 403
-{"message":"Forbidden", ...}
-```
+## Track F result — complete
 
-Implemented safeguards:
+Dependency graph submission and read-only PR Dependency Review are operational.
+`fail-on-severity: moderate` remains enforced; no warning-only bypass or blanket
+suppression was added.
 
-- added a separate push-triggered Gradle dependency-submission workflow with narrowly
-  scoped `contents: write` permission;
-- kept the PR Dependency Review job read-only;
-- preserved `fail-on-severity: moderate` with no `warn-only` or `continue-on-error`;
-- enabled snapshot-warning retry for submission timing races;
-- added an explicit preflight error that reports how to enable the missing graph;
-- added per-PR concurrency so superseded CI runs are cancelled.
-
-Repository action still required:
-
-1. Open **Settings → Code security and analysis**.
-2. Enable **Dependency graph**.
-3. Re-run **Dependency Submission**, then **Dependency Review**.
-
-Until that setting is enabled, the check should remain red rather than silently bypassing
-the security policy.
-
-## Phase 0 exit criteria (from IMPLEMENTATION_PLAN.md)
+## Phase 0 exit criteria
 
 | Criterion | State | Track |
 | --- | --- | --- |
-| Exact Hev pin and maintainable fork delta | ⬜ | (Phase 1) |
-| Complete per-FD hook coverage in host CI | ⬜ | (Phase 1) |
-| Real Android binding through selected VPN | ⬜ | (Phase 1) |
-| Zero/one/multiple VPN behavior | 🟡 selector code; broader selector tests still open | future integration tests |
-| Per-app VPN include/exclude behavior | 🟡 | future integration tests |
+| Exact Hev pin and maintainable fork delta | ⬜ | Phase 1/backend |
+| Complete per-FD hook coverage in host CI | ⬜ | Phase 1/backend |
+| Real Android binding through selected VPN | ⬜ | Phase 1/backend |
+| Zero/one/multiple VPN behavior | 🟡 selector + focused controller coverage | integration tests |
+| Per-app VPN include/exclude behavior | 🟡 | integration tests |
 | Activation-grant + process-restart behavior | 🟡 controller path | C / integration tests |
 | Typed, config-aware TCP/UDP/DNS/readiness probes | 🟡 | backend integration tests |
-| UDP topology + safe firewall return-policy evidence | ⬜ | (Phase 0.5) |
-| Bounded VPN-aware DNS under blackhole | ⬜ | (Phase 0.6) |
-| Explicit IPv4/IPv6 denial | 🟡 proto flags only | B |
-| Itemized cleanup debt + partial resolution | ✅ logic + focused Track A tests | A, D |
-| Self-triggered backoff retry, quiescent external state | 🟡 logic present; supervisor tests remain | C |
-| No restart over unresolved firewall debt | ✅ focused generation/race tests | A |
-| Repeated start/stop without FD/thread leaks | ⬜ | needs backend |
+| UDP topology + safe firewall return-policy evidence | ⬜ | Phase 0.5 |
+| Bounded VPN-aware DNS under blackhole | ⬜ | Phase 0.6 |
+| Explicit IPv4/IPv6 denial | ✅ daemon-enforced proxy chains | B |
+| Authoritative stale-token rejection | ✅ zero-mutation Rust tests | B |
+| Crash-persistent unique daemon session identity | ✅ serial + concurrent store tests | B |
+| Itemized cleanup debt + partial resolution | ✅ focused Track A tests | A, D |
+| Self-triggered backoff retry, quiescent external state | 🟡 concrete supervisor remains | C |
+| No restart over unresolved firewall debt | ✅ focused generation/race tests | A, B |
+| Repeated start/stop without FD/thread leaks | ⬜ | backend/service integration |
 
-## Open blockers after Tracks A and F
+## Open blockers after Tracks A, B and F
 
 | # | Blocker | Track | Priority |
 | --- | --- | --- | --- |
-| 1 | Daemon does not enforce session/epoch/acks/stale-token rejection | **B** | P0 — security boundary remains Kotlin-only |
-| 2 | `cleanupScope` is an abstract lifetime contract, not a real supervisor | **C** | P1 |
-| 3 | `mergeUnresolved()` concatenates ordinary failure lists → unbounded growth | **D** | P1 |
-| 4 | Normalization silently drops records; downstream IPv4 pick is order-dependent | **E** | P2 |
-| 5 | Repository Dependency graph is disabled/unavailable (HTTP 403) | **F** | external configuration blocker |
+| 1 | `cleanupScope` is an abstract lifetime contract, not a real service-owned supervisor | **C** | P1 |
+| 2 | `mergeUnresolved()` ordinary failure history can grow without bound | **D** | P1 |
+| 3 | Normalization silently drops records and downstream IPv4 selection is order-dependent | **E** | P2 |
+| 4 | Foreground service, real RPC composition, Hev backend/JNI and device verification are absent | production phases | P0 before release |
 
 ## Recommended sequencing
 
-1. Enable the repository **Dependency graph** and re-run Track F workflows.
-2. Begin **Track B** — the long pole and security boundary.
-3. Run **Tracks C, D, E** alongside B; Track A now protects their controller changes.
+1. Implement **Track C** so cleanup ownership survives controller worker cancellation.
+2. Implement **Track D** and **Track E** in parallel under Track A regression coverage.
+3. Build the real foreground service/RPC composition and backend integration, then run physical-device verification.
 
 ## Track index
 
 - ✅ [Track A — generation/session/epoch matrix tests](TRACK-A-generation-matrix-tests.md)
-- ⬜ [Track B — daemon protocol enforcement](TRACK-B-daemon-protocol-enforcement.md)
+- ✅ [Track B — daemon protocol enforcement](TRACK-B-daemon-protocol-enforcement.md)
 - ⬜ [Track C — service-owned cleanup supervisor](TRACK-C-cleanup-supervisor.md)
 - ⬜ [Track D — bounded failure history](TRACK-D-bounded-failure-history.md)
 - ⬜ [Track E — normalization diagnostics + deterministic selection](TRACK-E-normalization-diagnostics.md)
-- 🔴 [Track F — Dependency Review CI fix](TRACK-F-dependency-review-ci.md) — implementation ready; repository setting required
+- ✅ [Track F — Dependency Review CI fix](TRACK-F-dependency-review-ci.md)
 
 ## Definition of done for Phase 0 sign-off
 
-Tracks B, C, D and E complete with tests green, Track F check green after Dependency
-graph enablement, and the Phase 0 security rows above showing no ⬜/🟡. Only then does
-the PR leave draft.
+Tracks C, D and E must complete with tests green, followed by concrete service/backend
+composition and the remaining Phase 0 evidence rows. Only then should the PR leave draft.
