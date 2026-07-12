@@ -28,7 +28,8 @@ message ProxyFirewallConfig {
   // than the currently applied configuration generation.
   uint64 generation = 6;
 
-  // Start must be deny-first. Empty allowed_clients is never a deny signal.
+  // Start and Sanitize must be deny-first. Empty allowed_clients is never a
+  // deny signal.
   bool deny_all_ipv4 = 7;
   bool deny_all_ipv6 = 8;
 
@@ -79,6 +80,10 @@ message ProxyFirewallCommand {
 
 message SanitizeRequest {
   string reason = 1;
+
+  // Desired downstream/listener containment. The daemon installs this explicit
+  // deny-only configuration before clearing its ledger and advancing epoch.
+  ProxyFirewallConfig containment_config = 2;
 }
 
 message StartRequest {
