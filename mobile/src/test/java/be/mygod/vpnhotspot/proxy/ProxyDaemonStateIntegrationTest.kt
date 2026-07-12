@@ -4,8 +4,12 @@ import be.mygod.vpnhotspot.proxy.proto.DaemonIdentity
 import be.mygod.vpnhotspot.proxy.proto.ProxyFirewallAck
 import be.mygod.vpnhotspot.proxy.proto.ProxyFirewallCommand
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
@@ -64,6 +68,50 @@ class ProxyDaemonStateIntegrationTest {
             rawDesired.value.daemonGeneration,
         )
         assertEquals(3, rpc.commands.count { it.sanitize != null })
+    }
+
+    @Test
+    fun bootstrapAndControllerFirewallOperationsAreSerialized() = runBlocking {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val calls = AtomicInteger()
+        val active = AtomicInteger()
+        val maxActive = AtomicInteger()
+        val rpc = object : ProxyFirewallRpc {
+            override suspend fun execute(command: ProxyFirewallCommand): ProxyFirewallAck {
+                val call = calls.incrementAndGet()
+                val nowActive = active.incrementAndGet()
+                maxActive.updateAndGet { previous -> maxOf(previous, nowActive) }
+                return try {
+                    if (call == 1) {
+                        entered.complete(Unit)
+                        release.await()
+                    }
+                    ack(session = call.toLong(), epoch = 1, generation = call.toLong())
+                } finally {
+                    active.decrementAndGet()
+                }
+            }
+        }
+        val composition = composition(rpc)
+
+        val controllerSanitation = launch {
+            composition.firewallClient.cleanOrDenyBeforeRestart()
+        }
+        entered.await()
+        val reconnectBootstrap = launch { composition.bootstrap() }
+        delay(50L)
+
+        assertEquals(1, calls.get())
+        assertEquals(1, maxActive.get())
+
+        release.complete(Unit)
+        controllerSanitation.join()
+        reconnectBootstrap.join()
+
+        assertEquals(2, calls.get())
+        assertEquals(1, maxActive.get())
+        assertEquals(2L, composition.daemonState.value.sessionId)
     }
 
     @Test
