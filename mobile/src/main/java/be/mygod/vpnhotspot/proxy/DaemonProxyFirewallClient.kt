@@ -33,7 +33,7 @@ class StaleProxyFirewallTokenException(
         append(status)
         identity?.let {
             append(" current=")
-            append(it.sessionId)
+            append(it.session_id)
             append('/')
             append(it.epoch)
         }
@@ -62,8 +62,6 @@ class DaemonProxyFirewallClient(
     private val containmentConfig: suspend () -> ProxyFirewallConfig,
 ) : ProxyFirewallClient {
     override suspend fun cleanOrDenyBeforeRestart(): SanitationResult? {
-        // A failed or cancelled sanitation must never leave a previous token
-        // available for a subsequent start call.
         latestSanitation = null
         val config = containmentConfig()
         require(config.denyAllIpv4 && config.denyAllIpv6) {
@@ -76,7 +74,7 @@ class DaemonProxyFirewallClient(
             ProxyFirewallCommand(
                 sanitize = SanitizeRequest(
                     reason = "controller sanitation gate",
-                    containmentConfig = config.toProto(),
+                    containment_config = config.toProto(),
                 ),
             ),
         )
@@ -84,7 +82,7 @@ class DaemonProxyFirewallClient(
         if (ack.status != ProxyFirewallAck.Status.OK || identity == null) return null
         return recordSanitation(
             SanitationResult(
-                sessionId = identity.sessionId,
+                sessionId = identity.session_id,
                 epoch = identity.epoch,
             ),
         )
@@ -96,18 +94,18 @@ class DaemonProxyFirewallClient(
             ProxyFirewallCommand(
                 start = StartRequest(
                     config = config.toProto(),
-                    expectedSessionId = sanitation.sessionId,
-                    expectedEpoch = sanitation.epoch,
+                    expected_session_id = sanitation.sessionId,
+                    expected_epoch = sanitation.epoch,
                 ),
             ),
         )
         requireOk("start", ack)
-        require(ack.handleId != 0L) { "daemon returned zero proxy firewall handle" }
+        require(ack.handle_id != 0L) { "daemon returned zero proxy firewall handle" }
         val identity = requireIdentity(ack)
         return ProxyFirewallHandle(
-            sessionId = identity.sessionId,
+            sessionId = identity.session_id,
             epoch = identity.epoch,
-            id = ack.handleId,
+            id = ack.handle_id,
         )
     }
 
@@ -115,10 +113,10 @@ class DaemonProxyFirewallClient(
         val ack = rpc.execute(
             ProxyFirewallCommand(
                 replace = ReplaceRequest(
-                    handleId = handle.id,
+                    handle_id = handle.id,
                     config = config.toProto(),
-                    expectedSessionId = handle.sessionId,
-                    expectedEpoch = handle.epoch,
+                    expected_session_id = handle.sessionId,
+                    expected_epoch = handle.epoch,
                 ),
             ),
         )
@@ -130,9 +128,9 @@ class DaemonProxyFirewallClient(
         ack = rpc.execute(
             ProxyFirewallCommand(
                 deny = DenyRequest(
-                    handleId = handle.id,
-                    expectedSessionId = handle.sessionId,
-                    expectedEpoch = handle.epoch,
+                    handle_id = handle.id,
+                    expected_session_id = handle.sessionId,
+                    expected_epoch = handle.epoch,
                 ),
             ),
         ),
@@ -143,15 +141,14 @@ class DaemonProxyFirewallClient(
         ack = rpc.execute(
             ProxyFirewallCommand(
                 stop = StopRequest(
-                    handleId = handle.id,
-                    expectedSessionId = handle.sessionId,
-                    expectedEpoch = handle.epoch,
+                    handle_id = handle.id,
+                    expected_session_id = handle.sessionId,
+                    expected_epoch = handle.epoch,
                 ),
             ),
         ),
     )
 
-    /** Most recent successful daemon sanitation token, used only by Start. */
     private var latestSanitation: SanitationResult? = null
 
     private fun requireSanitationToken(): SanitationResult = latestSanitation
@@ -207,22 +204,22 @@ class DaemonProxyFirewallClient(
     private fun ProxyFirewallConfig.toProto(): WireProxyFirewallConfig = WireProxyFirewallConfig(
         downstreams = downstreams.map { downstream ->
             ProxyDownstream(
-                interfaceName = downstream.interfaceName,
-                ipv4Addresses = downstream.ipv4Addresses.map { parseIpv4(it).toByteString() },
+                interface_name = downstream.interfaceName,
+                ipv4_addresses = downstream.ipv4Addresses.map { parseIpv4(it).toByteString() },
             )
         },
-        tcpPort = tcpPort,
-        udpPortRangeStart = udpPortRangeStart,
-        udpPortRangeEnd = udpPortRangeEnd,
-        allowedClients = allowedClients.map { client ->
+        tcp_port = tcpPort,
+        udp_port_range_start = udpPortRangeStart,
+        udp_port_range_end = udpPortRangeEnd,
+        allowed_clients = allowedClients.map { client ->
             ProxyClient(
                 mac = parseMac(client.mac).toByteString(),
                 ipv4 = client.ipv4Addresses.map { parseIpv4(it).toByteString() },
             )
         },
         generation = generation,
-        denyAllIpv4 = denyAllIpv4,
-        denyAllIpv6 = denyAllIpv6,
+        deny_all_ipv4 = denyAllIpv4,
+        deny_all_ipv6 = denyAllIpv6,
     )
 
     private fun parseIpv4(value: String): ByteArray {
