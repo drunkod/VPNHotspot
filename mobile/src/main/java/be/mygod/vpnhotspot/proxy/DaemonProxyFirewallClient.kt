@@ -1,23 +1,31 @@
 package be.mygod.vpnhotspot.proxy
 
-import be.mygod.vpnhotspot.proxy.proto.ProxyFirewallProto
-import com.google.protobuf.ByteString
+import be.mygod.vpnhotspot.proxy.proto.DaemonIdentity
+import be.mygod.vpnhotspot.proxy.proto.DenyRequest
+import be.mygod.vpnhotspot.proxy.proto.ProxyClient
+import be.mygod.vpnhotspot.proxy.proto.ProxyDownstream
+import be.mygod.vpnhotspot.proxy.proto.ProxyFirewallAck
+import be.mygod.vpnhotspot.proxy.proto.ProxyFirewallCommand
+import be.mygod.vpnhotspot.proxy.proto.ProxyFirewallConfig as WireProxyFirewallConfig
+import be.mygod.vpnhotspot.proxy.proto.ReplaceRequest
+import be.mygod.vpnhotspot.proxy.proto.SanitizeRequest
+import be.mygod.vpnhotspot.proxy.proto.StartRequest
+import be.mygod.vpnhotspot.proxy.proto.StopRequest
 import java.io.IOException
+import okio.ByteString.Companion.toByteString
 
 /**
  * Transport seam for the existing root-daemon request/reply channel.
- * Implementations wrap [ProxyFirewallProto.ProxyFirewallCommand] in the daemon
- * ClientEnvelope and return the typed ProxyFirewallAck reply payload.
+ * Implementations wrap [ProxyFirewallCommand] in the daemon ClientEnvelope and
+ * return the typed [ProxyFirewallAck] reply payload.
  */
 interface ProxyFirewallRpc {
-    suspend fun execute(
-        command: ProxyFirewallProto.ProxyFirewallCommand,
-    ): ProxyFirewallProto.ProxyFirewallAck
+    suspend fun execute(command: ProxyFirewallCommand): ProxyFirewallAck
 }
 
 class StaleProxyFirewallTokenException(
-    val status: ProxyFirewallProto.ProxyFirewallAck.Status,
-    val identity: ProxyFirewallProto.DaemonIdentity?,
+    val status: ProxyFirewallAck.Status,
+    val identity: DaemonIdentity?,
     detail: String,
 ) : IOException(
     buildString {
@@ -65,22 +73,19 @@ class DaemonProxyFirewallClient(
             "sanitation containment must not include allowed clients"
         }
         val ack = rpc.execute(
-            ProxyFirewallProto.ProxyFirewallCommand.newBuilder()
-                .setSanitize(
-                    ProxyFirewallProto.SanitizeRequest.newBuilder()
-                        .setReason("controller sanitation gate")
-                        .setContainmentConfig(config.toProto())
-                        .build(),
-                )
-                .build(),
+            ProxyFirewallCommand(
+                sanitize = SanitizeRequest(
+                    reason = "controller sanitation gate",
+                    containmentConfig = config.toProto(),
+                ),
+            ),
         )
-        if (ack.status != ProxyFirewallProto.ProxyFirewallAck.Status.OK || !ack.hasIdentity()) {
-            return null
-        }
+        val identity = ack.identity
+        if (ack.status != ProxyFirewallAck.Status.OK || identity == null) return null
         return recordSanitation(
             SanitationResult(
-                sessionId = ack.identity.sessionId,
-                epoch = ack.identity.epoch,
+                sessionId = identity.sessionId,
+                epoch = identity.epoch,
             ),
         )
     }
@@ -88,15 +93,13 @@ class DaemonProxyFirewallClient(
     override suspend fun start(config: ProxyFirewallConfig): ProxyFirewallHandle {
         val sanitation = requireSanitationToken()
         val ack = rpc.execute(
-            ProxyFirewallProto.ProxyFirewallCommand.newBuilder()
-                .setStart(
-                    ProxyFirewallProto.StartRequest.newBuilder()
-                        .setConfig(config.toProto())
-                        .setExpectedSessionId(sanitation.sessionId)
-                        .setExpectedEpoch(sanitation.epoch)
-                        .build(),
-                )
-                .build(),
+            ProxyFirewallCommand(
+                start = StartRequest(
+                    config = config.toProto(),
+                    expectedSessionId = sanitation.sessionId,
+                    expectedEpoch = sanitation.epoch,
+                ),
+            ),
         )
         requireOk("start", ack)
         require(ack.handleId != 0L) { "daemon returned zero proxy firewall handle" }
@@ -110,16 +113,14 @@ class DaemonProxyFirewallClient(
 
     override suspend fun replace(handle: ProxyFirewallHandle, config: ProxyFirewallConfig) {
         val ack = rpc.execute(
-            ProxyFirewallProto.ProxyFirewallCommand.newBuilder()
-                .setReplace(
-                    ProxyFirewallProto.ReplaceRequest.newBuilder()
-                        .setHandleId(handle.id)
-                        .setConfig(config.toProto())
-                        .setExpectedSessionId(handle.sessionId)
-                        .setExpectedEpoch(handle.epoch)
-                        .build(),
-                )
-                .build(),
+            ProxyFirewallCommand(
+                replace = ReplaceRequest(
+                    handleId = handle.id,
+                    config = config.toProto(),
+                    expectedSessionId = handle.sessionId,
+                    expectedEpoch = handle.epoch,
+                ),
+            ),
         )
         requireOk("replace", ack)
     }
@@ -127,30 +128,26 @@ class DaemonProxyFirewallClient(
     override suspend fun denyAll(handle: ProxyFirewallHandle): CleanupReport = cleanupAck(
         step = "deny",
         ack = rpc.execute(
-            ProxyFirewallProto.ProxyFirewallCommand.newBuilder()
-                .setDeny(
-                    ProxyFirewallProto.DenyRequest.newBuilder()
-                        .setHandleId(handle.id)
-                        .setExpectedSessionId(handle.sessionId)
-                        .setExpectedEpoch(handle.epoch)
-                        .build(),
-                )
-                .build(),
+            ProxyFirewallCommand(
+                deny = DenyRequest(
+                    handleId = handle.id,
+                    expectedSessionId = handle.sessionId,
+                    expectedEpoch = handle.epoch,
+                ),
+            ),
         ),
     )
 
     override suspend fun stop(handle: ProxyFirewallHandle): CleanupReport = cleanupAck(
         step = "firewall_stop",
         ack = rpc.execute(
-            ProxyFirewallProto.ProxyFirewallCommand.newBuilder()
-                .setStop(
-                    ProxyFirewallProto.StopRequest.newBuilder()
-                        .setHandleId(handle.id)
-                        .setExpectedSessionId(handle.sessionId)
-                        .setExpectedEpoch(handle.epoch)
-                        .build(),
-                )
-                .build(),
+            ProxyFirewallCommand(
+                stop = StopRequest(
+                    handleId = handle.id,
+                    expectedSessionId = handle.sessionId,
+                    expectedEpoch = handle.epoch,
+                ),
+            ),
         ),
     )
 
@@ -160,93 +157,73 @@ class DaemonProxyFirewallClient(
     private fun requireSanitationToken(): SanitationResult = latestSanitation
         ?: throw IllegalStateException("proxy firewall start requires successful sanitation")
 
-    private fun cleanupAck(
-        step: String,
-        ack: ProxyFirewallProto.ProxyFirewallAck,
-    ): CleanupReport = when (ack.status) {
-        ProxyFirewallProto.ProxyFirewallAck.Status.OK -> CleanupReport.empty()
-        ProxyFirewallProto.ProxyFirewallAck.Status.STALE_SESSION,
-        ProxyFirewallProto.ProxyFirewallAck.Status.STALE_EPOCH -> CleanupReport.failure(
+    private fun cleanupAck(step: String, ack: ProxyFirewallAck): CleanupReport = when (ack.status) {
+        ProxyFirewallAck.Status.OK -> CleanupReport.empty()
+        ProxyFirewallAck.Status.STALE_SESSION,
+        ProxyFirewallAck.Status.STALE_EPOCH -> CleanupReport.failure(
             "${step}_stale",
             staleException(ack),
         )
-        ProxyFirewallProto.ProxyFirewallAck.Status.INVALID -> CleanupReport.failure(
+        ProxyFirewallAck.Status.INVALID -> CleanupReport.failure(
             "${step}_invalid",
             IllegalStateException(ack.detail.ifBlank { "daemon rejected proxy firewall command" }),
         )
-        ProxyFirewallProto.ProxyFirewallAck.Status.IO_ERROR -> CleanupReport.failure(
+        ProxyFirewallAck.Status.IO_ERROR -> CleanupReport.failure(
             "${step}_io",
             IOException(ack.detail.ifBlank { "proxy firewall kernel mutation failed" }),
         )
-        ProxyFirewallProto.ProxyFirewallAck.Status.UNRECOGNIZED -> CleanupReport.failure(
+        is ProxyFirewallAck.Status.Unrecognized -> CleanupReport.failure(
             "${step}_protocol",
-            IOException("unrecognized proxy firewall acknowledgement status ${ack.statusValue}"),
+            IOException("unrecognized proxy firewall acknowledgement status ${ack.status.value}"),
         )
     }
 
-    private fun requireOk(
-        step: String,
-        ack: ProxyFirewallProto.ProxyFirewallAck,
-    ) {
+    private fun requireOk(step: String, ack: ProxyFirewallAck) {
         when (ack.status) {
-            ProxyFirewallProto.ProxyFirewallAck.Status.OK -> Unit
-            ProxyFirewallProto.ProxyFirewallAck.Status.STALE_SESSION,
-            ProxyFirewallProto.ProxyFirewallAck.Status.STALE_EPOCH -> throw staleException(ack)
-            ProxyFirewallProto.ProxyFirewallAck.Status.INVALID -> throw IllegalStateException(
+            ProxyFirewallAck.Status.OK -> Unit
+            ProxyFirewallAck.Status.STALE_SESSION,
+            ProxyFirewallAck.Status.STALE_EPOCH -> throw staleException(ack)
+            ProxyFirewallAck.Status.INVALID -> throw IllegalStateException(
                 ack.detail.ifBlank { "$step rejected by proxy firewall daemon" },
             )
-            ProxyFirewallProto.ProxyFirewallAck.Status.IO_ERROR -> throw IOException(
+            ProxyFirewallAck.Status.IO_ERROR -> throw IOException(
                 ack.detail.ifBlank { "$step proxy firewall mutation failed" },
             )
-            ProxyFirewallProto.ProxyFirewallAck.Status.UNRECOGNIZED -> throw IOException(
-                "unrecognized proxy firewall acknowledgement status ${ack.statusValue}",
+            is ProxyFirewallAck.Status.Unrecognized -> throw IOException(
+                "unrecognized proxy firewall acknowledgement status ${ack.status.value}",
             )
         }
     }
 
-    private fun requireIdentity(
-        ack: ProxyFirewallProto.ProxyFirewallAck,
-    ): ProxyFirewallProto.DaemonIdentity {
-        check(ack.hasIdentity()) { "proxy firewall acknowledgement missing daemon identity" }
-        return ack.identity
-    }
+    private fun requireIdentity(ack: ProxyFirewallAck): DaemonIdentity =
+        checkNotNull(ack.identity) { "proxy firewall acknowledgement missing daemon identity" }
 
-    private fun staleException(
-        ack: ProxyFirewallProto.ProxyFirewallAck,
-    ) = StaleProxyFirewallTokenException(
+    private fun staleException(ack: ProxyFirewallAck) = StaleProxyFirewallTokenException(
         status = ack.status,
-        identity = ack.identity.takeIf { ack.hasIdentity() },
+        identity = ack.identity,
         detail = ack.detail,
     )
 
-    private fun ProxyFirewallConfig.toProto(): ProxyFirewallProto.ProxyFirewallConfig {
-        val builder = ProxyFirewallProto.ProxyFirewallConfig.newBuilder()
-            .setTcpPort(tcpPort)
-            .setUdpPortRangeStart(udpPortRangeStart)
-            .setUdpPortRangeEnd(udpPortRangeEnd)
-            .setGeneration(generation)
-            .setDenyAllIpv4(denyAllIpv4)
-            .setDenyAllIpv6(denyAllIpv6)
-        downstreams.forEach { downstream ->
-            builder.addDownstreams(
-                ProxyFirewallProto.ProxyDownstream.newBuilder()
-                    .setInterfaceName(downstream.interfaceName)
-                    .addAllIpv4Addresses(
-                        downstream.ipv4Addresses.map { ByteString.copyFrom(parseIpv4(it)) },
-                    )
-                    .build(),
+    private fun ProxyFirewallConfig.toProto(): WireProxyFirewallConfig = WireProxyFirewallConfig(
+        downstreams = downstreams.map { downstream ->
+            ProxyDownstream(
+                interfaceName = downstream.interfaceName,
+                ipv4Addresses = downstream.ipv4Addresses.map { parseIpv4(it).toByteString() },
             )
-        }
-        allowedClients.forEach { client ->
-            builder.addAllowedClients(
-                ProxyFirewallProto.ProxyClient.newBuilder()
-                    .setMac(ByteString.copyFrom(parseMac(client.mac)))
-                    .addAllIpv4(client.ipv4Addresses.map { ByteString.copyFrom(parseIpv4(it)) })
-                    .build(),
+        },
+        tcpPort = tcpPort,
+        udpPortRangeStart = udpPortRangeStart,
+        udpPortRangeEnd = udpPortRangeEnd,
+        allowedClients = allowedClients.map { client ->
+            ProxyClient(
+                mac = parseMac(client.mac).toByteString(),
+                ipv4 = client.ipv4Addresses.map { parseIpv4(it).toByteString() },
             )
-        }
-        return builder.build()
-    }
+        },
+        generation = generation,
+        denyAllIpv4 = denyAllIpv4,
+        denyAllIpv6 = denyAllIpv6,
+    )
 
     private fun parseIpv4(value: String): ByteArray {
         val parts = value.split('.')
