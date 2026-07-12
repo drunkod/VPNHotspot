@@ -87,35 +87,65 @@ data class CleanupDebt(
     /**
      * Merge [other] into this debt, preserving concrete surviving handles.
      *
-     * Conflicting live handles with different epochs represent runtimes from
-     * distinct sanitation epochs and are a fatal invariant violation — the
-     * daemon must be sanitized before a new runtime is started.
+     * R8 blocker #2: non-throwing typed conflict resolution.
+     *
+     * Firewall handle conflict (both non-null, different): drop both handles and
+     * set [daemonCleanPending]. The daemon must re-sanitize before any new IPC
+     * against either handle. Conflict details are recorded as [CleanupFailure]s.
+     *
+     * Service handle conflict (both non-null, different): keep the existing
+     * handle and set [featureStopPending] so the full service is torn down. The
+     * stale handle will produce a no-op or stale-handle failure on the next retry,
+     * which is safe and observable.
+     *
+     * No throws: the invariant violation is recorded in [failures] rather than
+     * propagated. This ensures that [applied] can always be cleared atomically
+     * after the global debt merge (see [ProxyOnlyController.cleanupApplied]).
      */
     fun mergeUnresolved(other: CleanupDebt): CleanupDebt {
-        require(
-            serviceHandlePending == null ||
-                other.serviceHandlePending == null ||
-                serviceHandlePending == other.serviceHandlePending
-        ) { "conflicting live service handles: $serviceHandlePending vs ${other.serviceHandlePending}" }
-        require(
-            firewallHandlePending == null ||
-                other.firewallHandlePending == null ||
-                firewallHandlePending == other.firewallHandlePending
-        ) {
-            "conflicting live firewall handles (epoch mismatch or different ids): " +
-                "$firewallHandlePending vs ${other.firewallHandlePending}"
+        val firewallConflict = firewallHandlePending != null &&
+            other.firewallHandlePending != null &&
+            firewallHandlePending != other.firewallHandlePending
+        val serviceConflict = serviceHandlePending != null &&
+            other.serviceHandlePending != null &&
+            serviceHandlePending != other.serviceHandlePending
+
+        val conflictFailures = buildList {
+            if (firewallConflict) add(
+                CleanupFailure(
+                    "firewall_handle_conflict",
+                    IllegalStateException(
+                        "conflicting firewall handles: $firewallHandlePending " +
+                            "vs ${other.firewallHandlePending} — dropped both, daemonCleanPending"
+                    )
+                )
+            )
+            if (serviceConflict) add(
+                CleanupFailure(
+                    "service_handle_conflict",
+                    IllegalStateException(
+                        "conflicting service handles: $serviceHandlePending " +
+                            "vs ${other.serviceHandlePending} — featureStopPending set"
+                    )
+                )
+            )
         }
 
         return copy(
             listenerClosePending = listenerClosePending || other.listenerClosePending,
+            // Service conflict: keep existing handle; featureStopPending forces teardown.
             serviceHandlePending = serviceHandlePending ?: other.serviceHandlePending,
-            firewallHandlePending = firewallHandlePending ?: other.firewallHandlePending,
-            firewallDenyPending = firewallDenyPending || other.firewallDenyPending,
-            firewallStopPending = firewallStopPending || other.firewallStopPending,
-            daemonCleanPending = daemonCleanPending || other.daemonCleanPending,
-            featureStopPending = featureStopPending || other.featureStopPending,
+            // Firewall conflict: drop both; no IPC, re-sanitation required.
+            firewallHandlePending = if (firewallConflict) null
+                                    else firewallHandlePending ?: other.firewallHandlePending,
+            firewallDenyPending = if (firewallConflict) false
+                                  else firewallDenyPending || other.firewallDenyPending,
+            firewallStopPending = if (firewallConflict) false
+                                  else firewallStopPending || other.firewallStopPending,
+            daemonCleanPending = daemonCleanPending || other.daemonCleanPending || firewallConflict,
+            featureStopPending = featureStopPending || other.featureStopPending || serviceConflict,
             serviceWasActivated = serviceWasActivated || other.serviceWasActivated,
-            failures = failures + other.failures,
+            failures = failures + other.failures + conflictFailures,
             attempt = 0,
             // Fresh generation assigned by the controller after merge.
             generation = generation,
