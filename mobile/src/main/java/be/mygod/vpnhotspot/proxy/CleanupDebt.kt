@@ -115,7 +115,9 @@ data class CleanupDebt(
      * [ProxyService.stopFeature] uses the service's own internal backend handle
      * and does not require the controller to hold a specific [serviceHandlePending].
      * This breaks the R8 deadlock where retaining a stale handle permanently
-     * blocked [featureStopPending].
+     * blocked [featureStopPending]. Once authoritative feature teardown is pending,
+     * later merges must not re-adopt a concrete service handle: doing so would
+     * suppress stopFeature() behind a newly observed, non-authoritative handle.
      *
      * Conflict failures are deduplicated by step name: a given conflict type is
      * appended at most once, preventing unbounded history growth under repeated
@@ -132,6 +134,8 @@ data class CleanupDebt(
         val serviceConflict = serviceHandlePending != null &&
             other.serviceHandlePending != null &&
             serviceHandlePending != other.serviceHandlePending
+        val authoritativeFeatureStop = featureStopPending || other.featureStopPending ||
+            serviceConflict
 
         // Deduplicate: append a conflict failure only if not already present.
         val existingSteps = (failures + other.failures).map { it.step }.toHashSet()
@@ -161,8 +165,9 @@ data class CleanupDebt(
             // Service conflict: mark listener unknown (two backends = unknown listener).
             listenerClosePending = listenerClosePending || other.listenerClosePending ||
                 serviceConflict,
-            // Service conflict: discard both handles; featureStopPending forces teardown.
-            serviceHandlePending = if (serviceConflict) null
+            // Authoritative feature teardown owns service cleanup. Never re-adopt a
+            // concrete handle once that path is pending, even from a later merge.
+            serviceHandlePending = if (authoritativeFeatureStop) null
                                    else serviceHandlePending ?: other.serviceHandlePending,
             // Firewall conflict: drop both; no IPC, re-sanitation required.
             firewallHandlePending = if (firewallConflict) null
@@ -172,8 +177,7 @@ data class CleanupDebt(
             firewallStopPending = if (firewallConflict) false
                                   else firewallStopPending || other.firewallStopPending,
             daemonCleanPending = daemonCleanPending || other.daemonCleanPending || firewallConflict,
-            featureStopPending = featureStopPending || other.featureStopPending ||
-                serviceConflict,
+            featureStopPending = authoritativeFeatureStop,
             serviceWasActivated = serviceWasActivated || other.serviceWasActivated,
             failures = failures + other.failures + conflictFailures,
             attempt = 0,
