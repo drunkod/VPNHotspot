@@ -17,10 +17,7 @@ impl KernelFirewall for AndroidProxyFirewall {
         &'a mut self,
         containment: &'a ProxyFirewallConfig,
     ) -> KernelFuture<'a, ()> {
-        Box::pin(async move {
-            clean_proxy_chains().await?;
-            apply_config(containment, true).await
-        })
+        Box::pin(async move { apply_config(containment).await })
     }
 
     fn start<'a>(
@@ -28,10 +25,7 @@ impl KernelFirewall for AndroidProxyFirewall {
         _handle_id: u64,
         config: &'a ProxyFirewallConfig,
     ) -> KernelFuture<'a, ()> {
-        Box::pin(async move {
-            clean_proxy_chains().await?;
-            apply_config(config, true).await
-        })
+        Box::pin(async move { apply_config(config).await })
     }
 
     fn replace<'a>(
@@ -39,7 +33,7 @@ impl KernelFirewall for AndroidProxyFirewall {
         _handle_id: u64,
         config: &'a ProxyFirewallConfig,
     ) -> KernelFuture<'a, ()> {
-        Box::pin(async move { apply_config(config, false).await })
+        Box::pin(async move { apply_config(config).await })
     }
 
     fn deny<'a>(
@@ -47,7 +41,7 @@ impl KernelFirewall for AndroidProxyFirewall {
         _handle_id: u64,
         config: &'a ProxyFirewallConfig,
     ) -> KernelFuture<'a, ()> {
-        Box::pin(async move { apply_config(config, false).await })
+        Box::pin(async move { apply_config(config).await })
     }
 
     fn stop<'a>(&'a mut self, _handle_id: u64) -> KernelFuture<'a, ()> {
@@ -84,11 +78,37 @@ async fn clean_chain(target: IptablesTarget, chain: &'static str) -> io::Result<
     firewall::restore(target, &flush_delete).await
 }
 
-async fn apply_config(config: &ProxyFirewallConfig, install_jump: bool) -> io::Result<()> {
-    let ipv4 = render_ipv4(config, install_jump)?;
-    let ipv6 = render_ipv6(config, install_jump)?;
-    firewall::restore(IptablesTarget::Ipv4, &ipv4).await?;
-    firewall::restore(IptablesTarget::Ipv6, &ipv6).await
+async fn apply_config(config: &ProxyFirewallConfig) -> io::Result<()> {
+    // Check-only commands do not mutate kernel state. Under the daemon's proxy
+    // mutex this determines whether chain creation and jump insertion must be
+    // included in the same restore transaction as the new rules.
+    let ipv4_jump = firewall::rule_exists(
+        IptablesTarget::Ipv4,
+        "filter",
+        "INPUT",
+        &["-j", IPV4_CHAIN],
+    )
+    .await?;
+    let ipv6_jump = firewall::rule_exists(
+        IptablesTarget::Ipv6,
+        "filter",
+        "INPUT",
+        &["-j", IPV6_CHAIN],
+    )
+    .await?;
+
+    let ipv4 = render_ipv4(config, !ipv4_jump)?;
+    let ipv6 = render_ipv6(config, !ipv6_jump)?;
+
+    if config.deny_all_ipv4 {
+        // During sanitation/deny, contain the primary IPv4 exposure first.
+        firewall::restore(IptablesTarget::Ipv4, &ipv4).await?;
+        firewall::restore(IptablesTarget::Ipv6, &ipv6).await
+    } else {
+        // During allow transition, establish IPv6 rejection before IPv4 opens.
+        firewall::restore(IptablesTarget::Ipv6, &ipv6).await?;
+        firewall::restore(IptablesTarget::Ipv4, &ipv4).await
+    }
 }
 
 fn render_ipv4(config: &ProxyFirewallConfig, install_jump: bool) -> io::Result<String> {
