@@ -37,6 +37,7 @@ impl FileSessionStore {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(lock_path)?;
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
         if result == -1 {
@@ -190,7 +191,7 @@ mod tests {
         let store = Arc::new(store);
         let mut threads = Vec::new();
         for _ in 0..8 {
-            let store = store.clone();
+            let store = Arc::clone(&store);
             threads.push(std::thread::spawn(move || store.next_session_id().unwrap()));
         }
         let mut values = threads
