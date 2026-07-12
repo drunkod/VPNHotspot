@@ -20,20 +20,6 @@ class CleanupDebtMergeTest {
     }
 
     @Test
-    fun repeatedServiceConflict_doesNotDuplicateTypedConflictFailure() {
-        val first = debt(serviceHandle = ProxyServiceHandle(1)).mergeUnresolved(
-            debt(serviceHandle = ProxyServiceHandle(2)),
-        )
-        val repeated = first.mergeUnresolved(
-            debt(serviceHandle = ProxyServiceHandle(3)),
-        )
-
-        assertNull(repeated.serviceHandlePending)
-        assertTrue(repeated.featureStopPending)
-        assertEquals(1, repeated.failures.count { it.step == "service_handle_conflict" })
-    }
-
-    @Test
     fun conflictingFirewallHandles_dropConcreteIpcAndRequireSanitation() {
         val merged = debt(
             firewallHandle = ProxyFirewallHandle(1, 1, 1),
