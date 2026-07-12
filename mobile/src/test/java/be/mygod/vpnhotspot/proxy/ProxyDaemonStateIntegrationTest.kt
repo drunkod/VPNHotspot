@@ -21,11 +21,8 @@ class ProxyDaemonStateIntegrationTest {
             desiredStateForTest(daemonGeneration = 999).copy(daemonHealthy = true),
         )
         val rpc = FakeRpc(
-            // Pre-controller deny-first bootstrap.
             ack(session = 11, epoch = 1, generation = 17),
-            // Controller's own sanitation gate after it observes generation 17.
             ack(session = 11, epoch = 2, generation = 17),
-            // Root daemon restart and reconnect bootstrap.
             ack(session = 12, epoch = 1, generation = 18),
         )
         val composition = composition(rpc)
@@ -67,6 +64,25 @@ class ProxyDaemonStateIntegrationTest {
             rawDesired.value.daemonGeneration,
         )
         assertEquals(3, rpc.commands.count { it.sanitize != null })
+    }
+
+    @Test
+    fun failedSanitationAcknowledgementNeverPublishesHealthyState() = runBlocking {
+        val rawDesired = MutableStateFlow(desiredStateForTest(daemonGeneration = 999))
+        val rpc = FakeRpc(
+            ack(
+                session = 7,
+                epoch = 0,
+                generation = 9,
+                status = ProxyFirewallAck.Status.IO_ERROR,
+            ),
+        )
+        val composition = composition(rpc)
+        val composed = composition.desiredStates(rawDesired)
+
+        assertEquals(ProxyDaemonState.Unavailable, composition.bootstrap())
+        assertEquals(ProxyDaemonState.Unavailable, composition.daemonState.value)
+        assertFalse(composed.first().daemonHealthy)
     }
 
     @Test
@@ -137,8 +153,9 @@ class ProxyDaemonStateIntegrationTest {
         session: Long,
         epoch: Long,
         generation: Long,
+        status: ProxyFirewallAck.Status = ProxyFirewallAck.Status.OK,
     ) = ProxyFirewallAck(
-        status = ProxyFirewallAck.Status.OK,
+        status = status,
         identity = DaemonIdentity(
             session_id = session,
             epoch = epoch,
