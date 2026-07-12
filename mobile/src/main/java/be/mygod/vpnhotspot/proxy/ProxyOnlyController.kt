@@ -582,9 +582,13 @@ class ProxyOnlyController(
         val sameSession = fw != null && sId != null && fw.sessionId == sId
         // Case A: current handle — session+epoch match AND generation is safe.
         val firewallCurrent = sameSession && sEpoch != null && fw!!.epoch == sEpoch && generationSafe
-        // Case B: dominated — same session, older epoch. Safe to skip IPC.
-        val firewallDominated = sameSession && sEpoch != null && fw!!.epoch < sEpoch
-        // Case C: conflict/unknown or generation mismatch — requires re-sanitation.
+        // Case B: dominated — same session, older epoch, AND generation is safe.
+        // R11: generationSafe is required here too. A lower-epoch handle from a different
+        // daemon generation is not dominated by the current sanitation — the daemon restart
+        // invalidates all prior handles regardless of epoch ordering. Without generationSafe,
+        // a G2 session/G1 handle combination would fall into case B and skip daemonCleanPending.
+        val firewallDominated = generationSafe && sameSession && sEpoch != null && fw!!.epoch < sEpoch
+        // Case C: conflict/unknown or any generation mismatch — requires re-sanitation.
         val firewallNeedsClean = fw != null && !firewallCurrent && !firewallDominated
 
         var denyResolved = fw == null || firewallDominated
@@ -716,18 +720,22 @@ class ProxyOnlyController(
         val handleSameSession = firewallHandle != null &&
             newSanitizedSessionId != null &&
             firewallHandle!!.sessionId == newSanitizedSessionId
+        // R10/R11: generation safety — the generation captured before this retry must equal
+        // the generation that produced the current sanitation acknowledgement. A mismatch
+        // means the daemon restarted since the last sanitation; all handles from the prior
+        // generation are invalid regardless of session/epoch values.
+        val generationSafe = capturedDaemonGeneration != null &&
+            capturedDaemonGeneration == newSanitizedDaemonGen
         val handleEpochCurrent = handleSameSession &&
             newSanitizedEpoch != null &&
             firewallHandle!!.epoch == newSanitizedEpoch
-        val handleDominated = handleSameSession &&
+        // R11: handleDominated also requires generationSafe. A lower-epoch handle from a
+        // different daemon generation is not dominated by current sanitation — the daemon
+        // restart invalidates all prior handles regardless of epoch ordering. Without
+        // generationSafe here, a generation-mismatched handle would suppress daemonCleanPending.
+        val handleDominated = generationSafe && handleSameSession &&
             newSanitizedEpoch != null &&
             firewallHandle!!.epoch < newSanitizedEpoch
-        // R10 blocker #3: also require that the captured snapshot generation equals the
-        // generation that produced the current sanitation acknowledgement. If they differ,
-        // the collector has observed a new daemon generation while the handle refers to the
-        // old one; submitting IPC would cross a daemon restart boundary.
-        val generationSafe = capturedDaemonGeneration != null &&
-            capturedDaemonGeneration == newSanitizedDaemonGen
         val handleCurrent = handleEpochCurrent && generationSafe
         val handleStale = firewallHandle != null && !handleCurrent
 
