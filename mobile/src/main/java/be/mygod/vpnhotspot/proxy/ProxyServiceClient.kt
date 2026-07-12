@@ -79,7 +79,19 @@ data class SanitationResult(
 // Report types
 // ---------------------------------------------------------------------------
 
-data class CleanupFailure(val step: String, val cause: Throwable)
+data class CleanupFailure(
+    val step: String,
+    val cause: Throwable,
+) {
+    /** Stable failure class identity without depending on Throwable.equals(). */
+    val kind: String get() = cause.javaClass.name
+
+    /**
+     * Bounded deduplication key. The message prefix distinguishes root causes on the
+     * same cleanup step without allowing arbitrarily long messages to grow the key.
+     */
+    val key: String get() = "$step|$kind|${cause.message.orEmpty().take(120)}"
+}
 
 data class CleanupReport(
     val failures: List<CleanupFailure> = emptyList(),

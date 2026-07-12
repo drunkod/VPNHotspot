@@ -139,11 +139,11 @@ class ProxyOnlyController(
             }
         } finally {
             collector.cancel()
-            retryJob?.cancel()
-            retryJob = null
-            scheduledRetryGeneration = null
             withContext(NonCancellable) {
                 stateMutex.withLock {
+                    retryJob?.cancel()
+                    retryJob = null
+                    scheduledRetryGeneration = null
                     terminalStopSafely("controller worker terminated")
                 }
             }
@@ -655,7 +655,7 @@ class ProxyOnlyController(
             daemonCleanPending = firewallNeedsClean,
             featureStopPending = false,
             serviceWasActivated = serviceActivated,
-            failures = acc.failures.toList(),
+            failures = mergeFailures(emptyList(), acc.failures),
             generation = nextDebtGeneration++,
             attempt = 0,
         ).takeUnless { it.isResolved }
@@ -861,7 +861,7 @@ class ProxyOnlyController(
             firewallStopPending = stopPending,
             daemonCleanPending = daemonCleanPending,
             featureStopPending = featureStopPending,
-            failures = failures,
+            failures = mergeFailures(emptyList(), failures),
             attempt = debt.attempt + 1,
         )
 
@@ -931,8 +931,10 @@ class ProxyOnlyController(
                         if (preserved != null) {
                             val faulted = preserved.copy(
                                 attempt = preserved.attempt + 1,
-                                failures = preserved.failures +
-                                    CleanupFailure("retry_transaction", t),
+                                failures = mergeFailures(
+                                    preserved.failures,
+                                    listOf(CleanupFailure("retry_transaction", t)),
+                                ),
                             )
                             cleanupDebt = faulted
                             publishDebt(faulted)

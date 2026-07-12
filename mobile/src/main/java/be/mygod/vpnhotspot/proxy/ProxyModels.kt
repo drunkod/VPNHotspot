@@ -132,9 +132,10 @@ data class DesiredProxyState(
      * R3/R4 normalization rules:
      *   Downstreams
      *     - Grouped by trimmed interface name.
-     *     - First strictly-routable IPv4 literal across the group is kept.
+     *     - The numerically smallest strictly-routable IPv4 literal across the
+     *       group is selected, independent of observation order.
      *     - Malformed, loopback, unspecified, multicast and link-local addresses
-     *       are rejected without DNS (strict literal parser).
+     *       are rejected without DNS (strict literal parser) and reported.
      *     - ipv4Address is normalised to dotted-decimal if accepted.
      *     - ManagedDownstream.ipv4Address is a single nullable field: the
      *       production adapter must ensure at most one routable IPv4 per
@@ -147,30 +148,83 @@ data class DesiredProxyState(
      *     - Clients with no remaining valid IPv4 binding are dropped (R4 #7).
      *     - Duplicate MACs are merged; addresses are unioned, deduplicated, sorted.
      */
-    fun normalized(): DesiredProxyState = copy(
-        downstreams = downstreams
-            .filter { isValidInterfaceName(it.interfaceName.trim()) }
-            .groupBy { it.interfaceName.trim() }
-            .map { (iface, group) ->
-                ManagedDownstream(
-                    interfaceName = iface,
-                    ipv4Address = group.mapNotNull { it.ipv4Address }
-                        .firstOrNull { isRoutableIpv4(it) }
-                        ?.let { normalizeIpv4(it) },
-                )
+    fun normalized(): DesiredProxyState = normalizedWithReport().state
+
+    fun normalizedWithReport(): NormalizationOutput {
+        val droppedDownstreams = mutableListOf<ProxyNormalizationReport.Dropped>()
+        val droppedClients = mutableListOf<ProxyNormalizationReport.Dropped>()
+        val addressChoices = mutableListOf<ProxyNormalizationReport.AddressChoice>()
+
+        val normalizedDownstreams = downstreams
+            .mapNotNull { downstream ->
+                val iface = downstream.interfaceName.trim()
+                if (!isValidInterfaceName(iface)) {
+                    droppedDownstreams += ProxyNormalizationReport.Dropped(
+                        identity = downstream.interfaceName,
+                        reason = ProxyNormalizationReport.Reason.INVALID_INTERFACE_NAME,
+                    )
+                    null
+                } else {
+                    iface to downstream
+                }
             }
-            .sortedBy { it.interfaceName },
-        allowedClients = allowedClients
+            .groupBy(keySelector = { it.first }, valueTransform = { it.second })
+            .map { (iface, group) ->
+                val candidates = group.mapNotNull { it.ipv4Address }.map { it.trim() }
+                candidates.filterNot(::isRoutableIpv4).forEach { rejected ->
+                    droppedDownstreams += ProxyNormalizationReport.Dropped(
+                        identity = "$iface|$rejected",
+                        reason = ProxyNormalizationReport.Reason.NON_ROUTABLE_IPV4_FILTERED,
+                    )
+                }
+                val chosen = chooseDownstreamIpv4(candidates)
+                addressChoices += ProxyNormalizationReport.AddressChoice(
+                    interfaceName = iface,
+                    candidates = candidates.map(::normalizeIpv4).distinct().sorted(),
+                    chosen = chosen,
+                    policy = DOWNSTREAM_ADDRESS_POLICY,
+                )
+                if (candidates.isNotEmpty() && chosen == null) {
+                    droppedDownstreams += ProxyNormalizationReport.Dropped(
+                        identity = iface,
+                        reason = ProxyNormalizationReport.Reason.NO_ROUTABLE_IPV4,
+                    )
+                }
+                ManagedDownstream(interfaceName = iface, ipv4Address = chosen)
+            }
+            .sortedBy { it.interfaceName }
+
+        val normalizedClients = allowedClients
             .mapNotNull { client ->
-                val mac = canonicalizeMac(client.mac) ?: return@mapNotNull null
+                val mac = canonicalizeMac(client.mac)
+                if (mac == null) {
+                    droppedClients += ProxyNormalizationReport.Dropped(
+                        identity = client.mac,
+                        reason = ProxyNormalizationReport.Reason.INVALID_MAC,
+                    )
+                    return@mapNotNull null
+                }
+
+                client.ipv4Addresses.filterNot(::isRoutableIpv4).forEach { rejected ->
+                    droppedClients += ProxyNormalizationReport.Dropped(
+                        identity = "$mac|${rejected.trim()}",
+                        reason = ProxyNormalizationReport.Reason.NON_ROUTABLE_IPV4_FILTERED,
+                    )
+                }
                 val ips = client.ipv4Addresses
-                    .filter { isRoutableIpv4(it) }
-                    .map { normalizeIpv4(it) }
+                    .filter(::isRoutableIpv4)
+                    .map(::normalizeIpv4)
                     .distinct()
                     .sorted()
                 // R4 fix #7: drop clients with no valid IPv4 binding.
                 // An empty list is NOT a wildcard; drop to avoid ambiguous ACL semantics.
-                if (ips.isEmpty()) return@mapNotNull null
+                if (ips.isEmpty()) {
+                    droppedClients += ProxyNormalizationReport.Dropped(
+                        identity = mac,
+                        reason = ProxyNormalizationReport.Reason.NO_ROUTABLE_IPV4,
+                    )
+                    return@mapNotNull null
+                }
                 AllowedClient(mac = mac, ipv4Addresses = ips)
             }
             .groupBy { it.mac }
@@ -180,8 +234,20 @@ data class DesiredProxyState(
                     ipv4Addresses = group.flatMap { it.ipv4Addresses }.distinct().sorted(),
                 )
             }
-            .sortedBy { it.mac },
-    )
+            .sortedBy { it.mac }
+
+        return NormalizationOutput(
+            state = copy(
+                downstreams = normalizedDownstreams,
+                allowedClients = normalizedClients,
+            ),
+            report = ProxyNormalizationReport(
+                droppedDownstreams = droppedDownstreams,
+                droppedClients = droppedClients,
+                downstreamAddressChoices = addressChoices,
+            ),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +301,22 @@ fun isRoutableIpv4(address: String): Boolean {
 fun normalizeIpv4(address: String): String {
     val o = parseIpv4Literal(address) ?: return address.trim()
     return "${o[0]}.${o[1]}.${o[2]}.${o[3]}"
+}
+
+/** Deterministic, order-independent downstream address policy. */
+private fun chooseDownstreamIpv4(candidates: List<String>): String? =
+    candidates.asSequence()
+        .filter(::isRoutableIpv4)
+        .map(::normalizeIpv4)
+        .distinct()
+        .minByOrNull(::ipv4ToLong)
+
+private fun ipv4ToLong(address: String): Long {
+    val o = requireNotNull(parseIpv4Literal(address))
+    return (o[0].toLong() shl 24) or
+        (o[1].toLong() shl 16) or
+        (o[2].toLong() shl 8) or
+        o[3].toLong()
 }
 
 // ---------------------------------------------------------------------------
@@ -326,8 +408,8 @@ sealed interface ControllerEvent {
  * At the IP routing layer, a tethering interface has exactly one active
  * DHCP-server IPv4 address at any moment. The production DesiredProxyState
  * adapter must enforce this one-address invariant; [DesiredProxyState.normalized]
- * selects the first routable address across duplicate observations of the same
- * interface and discards the rest without data loss at the routing level.
+ * deterministically selects the numerically smallest routable address across duplicate
+ * observations and reports rejected candidates through [normalizedWithReport].
  */
 data class ManagedDownstream(
     val interfaceName: String,

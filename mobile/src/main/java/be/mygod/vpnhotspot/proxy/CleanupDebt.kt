@@ -57,6 +57,24 @@ enum class CleanupResource {
     FEATURE_SERVICE,
 }
 
+internal const val MAX_FAILURE_HISTORY = 32
+
+/**
+ * Merge cleanup failures in first-seen order, collapse duplicates by stable
+ * [CleanupFailure.key], and retain only the newest distinct entries on overflow.
+ */
+internal fun mergeFailures(
+    a: List<CleanupFailure>,
+    b: List<CleanupFailure>,
+): List<CleanupFailure> {
+    val seen = LinkedHashMap<String, CleanupFailure>()
+    for (failure in a) seen.putIfAbsent(failure.key, failure)
+    for (failure in b) seen.putIfAbsent(failure.key, failure)
+    val distinct = seen.values.toList()
+    return if (distinct.size <= MAX_FAILURE_HISTORY) distinct
+    else distinct.takeLast(MAX_FAILURE_HISTORY)
+}
+
 data class CleanupDebt(
     val listenerClosePending: Boolean,
     /**
@@ -179,7 +197,7 @@ data class CleanupDebt(
             daemonCleanPending = daemonCleanPending || other.daemonCleanPending || firewallConflict,
             featureStopPending = authoritativeFeatureStop,
             serviceWasActivated = serviceWasActivated || other.serviceWasActivated,
-            failures = failures + other.failures + conflictFailures,
+            failures = mergeFailures(failures, other.failures + conflictFailures),
             attempt = 0,
             // Fresh generation assigned by the controller after merge.
             generation = generation,
