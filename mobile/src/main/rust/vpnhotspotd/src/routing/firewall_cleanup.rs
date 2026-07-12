@@ -1,3 +1,5 @@
+use std::io;
+
 use crate::{
     firewall::{self, IptablesTarget},
     proxy_firewall_kernel,
@@ -11,13 +13,11 @@ use super::Runtime;
 // Clean uses iptables-restore through `firewall::restore`. Android 10's bundled
 // iptables-restore supports `-w --noflush`, and with `--noflush`, `:chain - [0:0]`
 // flushes an existing user chain or creates a missing one before the following `-X chain`.
-pub(super) async fn clean() {
-    // Track B: daemon-wide cleanup owns proxy chains too. The control dispatcher
-    // holds the proxy state lock while routing::clean runs, then advances the
-    // sanitation epoch only after this kernel cleanup has completed.
-    if let Err(e) = proxy_firewall_kernel::clean_proxy_chains().await {
-        report::io("routing.clean_firewall.proxy", e);
-    }
+pub(super) async fn clean() -> io::Result<()> {
+    // Track B: this result is propagated to routing::clean. The control
+    // dispatcher advances the authoritative sanitation epoch only after this
+    // proxy-chain cleanup succeeds while holding the proxy state mutex.
+    proxy_firewall_kernel::clean_proxy_chains().await?;
 
     delete_iptables_repeated(
         IptablesTarget::Ipv4,
@@ -92,4 +92,5 @@ COMMIT
     if let Err(e) = firewall::restore(IptablesTarget::Ipv6, &ip6tables_clean_input).await {
         report::io("routing.clean_firewall.ip6tables_restore", e);
     }
+    Ok(())
 }
