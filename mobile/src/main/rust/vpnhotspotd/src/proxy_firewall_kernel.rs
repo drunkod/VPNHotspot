@@ -13,8 +13,14 @@ const IPV6_CHAIN: &str = "vpnhotspot_proxy6";
 pub(crate) struct AndroidProxyFirewall;
 
 impl KernelFirewall for AndroidProxyFirewall {
-    fn sanitize<'a>(&'a mut self) -> KernelFuture<'a, ()> {
-        Box::pin(async move { clean_proxy_chains().await })
+    fn sanitize<'a>(
+        &'a mut self,
+        containment: &'a ProxyFirewallConfig,
+    ) -> KernelFuture<'a, ()> {
+        Box::pin(async move {
+            clean_proxy_chains().await?;
+            apply_config(containment, true).await
+        })
     }
 
     fn start<'a>(
@@ -197,6 +203,7 @@ fn render_ipv6(config: &ProxyFirewallConfig, install_jump: bool) -> io::Result<S
     Ok(firewall::restore_input("filter", &lines))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_accept_rule(
     lines: &mut Vec<String>,
     chain: &str,
@@ -207,24 +214,26 @@ fn push_accept_rule(
     port_start: u32,
     port_end: Option<u32>,
 ) -> io::Result<()> {
-    let mut args = vec![
-        "-i".to_owned(),
-        interface.to_owned(),
-        "-s".to_owned(),
-        source.to_owned(),
-        "-m".to_owned(),
-        "mac".to_owned(),
-        "--mac-source".to_owned(),
-        mac.to_owned(),
-        "-p".to_owned(),
-        protocol.to_owned(),
-        "--dport".to_owned(),
-        port_spec(port_start, port_end),
-        "-j".to_owned(),
-        "ACCEPT".to_owned(),
-    ];
-    lines.push(firewall::restore_line("-A", chain, &args)?);
-    args.clear();
+    lines.push(firewall::restore_line(
+        "-A",
+        chain,
+        &[
+            "-i".to_owned(),
+            interface.to_owned(),
+            "-s".to_owned(),
+            source.to_owned(),
+            "-m".to_owned(),
+            "mac".to_owned(),
+            "--mac-source".to_owned(),
+            mac.to_owned(),
+            "-p".to_owned(),
+            protocol.to_owned(),
+            "--dport".to_owned(),
+            port_spec(port_start, port_end),
+            "-j".to_owned(),
+            "ACCEPT".to_owned(),
+        ],
+    )?);
     Ok(())
 }
 
