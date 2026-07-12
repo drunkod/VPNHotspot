@@ -9,9 +9,9 @@ use ledger::AppliedLedger;
 pub use session::{FileSessionStore, ProxySession, SessionStore, Validation};
 
 use crate::shared::proto::proxy::{
-    self, proxy_firewall_ack, proxy_firewall_command, DaemonIdentity, DenyRequest,
-    ProxyFirewallAck, ProxyFirewallCommand, ProxyFirewallConfig, ReplaceRequest, StartRequest,
-    StopRequest,
+    proxy_firewall_ack, proxy_firewall_command, DaemonIdentity, DenyRequest,
+    ProxyFirewallAck, ProxyFirewallCommand, ProxyFirewallConfig, ReplaceRequest,
+    SanitizeRequest, StartRequest, StopRequest,
 };
 
 pub type KernelFuture<'a, T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + 'a>>;
@@ -20,7 +20,10 @@ pub type KernelFuture<'a, T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send
 /// the full lifetime of each future, making token validation and mutation one
 /// serialized check-and-use transaction.
 pub trait KernelFirewall: Send {
-    fn sanitize<'a>(&'a mut self) -> KernelFuture<'a, ()>;
+    fn sanitize<'a>(
+        &'a mut self,
+        containment: &'a ProxyFirewallConfig,
+    ) -> KernelFuture<'a, ()>;
     fn start<'a>(
         &'a mut self,
         handle_id: u64,
@@ -67,7 +70,7 @@ impl<K: KernelFirewall> ProxyFirewall<K> {
             );
         };
         match kind {
-            proxy_firewall_command::Kind::Sanitize(_) => self.sanitize().await,
+            proxy_firewall_command::Kind::Sanitize(request) => self.sanitize(request).await,
             proxy_firewall_command::Kind::Start(request) => self.start(request).await,
             proxy_firewall_command::Kind::Replace(request) => self.replace(request).await,
             proxy_firewall_command::Kind::Deny(request) => self.deny(request).await,
@@ -83,8 +86,28 @@ impl<K: KernelFirewall> ProxyFirewall<K> {
         Ok(())
     }
 
-    async fn sanitize(&mut self) -> ProxyFirewallAck {
-        match self.kernel.sanitize().await {
+    async fn sanitize(&mut self, request: SanitizeRequest) -> ProxyFirewallAck {
+        let Some(config) = request.containment_config else {
+            return self.ack(
+                proxy_firewall_ack::Status::Invalid,
+                0,
+                "missing sanitation containment config",
+            );
+        };
+        if let Err(detail) = validate_config(&config, true, false) {
+            return self.ack(proxy_firewall_ack::Status::Invalid, 0, detail);
+        }
+        if !config.allowed_clients.is_empty() {
+            return self.ack(
+                proxy_firewall_ack::Status::Invalid,
+                0,
+                "sanitation containment config must not contain allowed clients",
+            );
+        }
+
+        // Security ordering: kernel deny containment must succeed before the
+        // ledger is cleared and before the new epoch becomes observable.
+        match self.kernel.sanitize(&config).await {
             Ok(()) => {
                 self.ledger.clear();
                 match self.session.bump_epoch() {
@@ -103,7 +126,7 @@ impl<K: KernelFirewall> ProxyFirewall<K> {
         let Some(config) = request.config else {
             return self.ack(proxy_firewall_ack::Status::Invalid, 0, "missing start config");
         };
-        if let Err(detail) = validate_config(&config, true) {
+        if let Err(detail) = validate_config(&config, true, true) {
             return self.ack(proxy_firewall_ack::Status::Invalid, 0, detail);
         }
         if !self.ledger.is_empty() {
@@ -133,7 +156,7 @@ impl<K: KernelFirewall> ProxyFirewall<K> {
         let Some(config) = request.config else {
             return self.ack(proxy_firewall_ack::Status::Invalid, 0, "missing replace config");
         };
-        if let Err(detail) = validate_config(&config, false) {
+        if let Err(detail) = validate_config(&config, false, true) {
             return self.ack(proxy_firewall_ack::Status::Invalid, 0, detail);
         }
         let Some(current) = self.ledger.get(request.handle_id) else {
@@ -230,7 +253,11 @@ impl<K: KernelFirewall> ProxyFirewall<K> {
     }
 }
 
-fn validate_config(config: &ProxyFirewallConfig, require_deny_first: bool) -> Result<(), String> {
+fn validate_config(
+    config: &ProxyFirewallConfig,
+    require_deny_first: bool,
+    require_downstream: bool,
+) -> Result<(), String> {
     if config.tcp_port == 0 || config.tcp_port > u16::MAX as u32 {
         return Err("tcp_port must be in 1..=65535".to_owned());
     }
@@ -244,11 +271,11 @@ fn validate_config(config: &ProxyFirewallConfig, require_deny_first: bool) -> Re
     if config.generation == 0 {
         return Err("configuration generation must be non-zero".to_owned());
     }
-    if config.downstreams.is_empty() {
+    if require_downstream && config.downstreams.is_empty() {
         return Err("at least one downstream is required".to_owned());
     }
     if require_deny_first && (!config.deny_all_ipv4 || !config.deny_all_ipv6) {
-        return Err("start must use explicit IPv4 and IPv6 deny-first configuration".to_owned());
+        return Err("operation requires explicit IPv4 and IPv6 deny-first configuration".to_owned());
     }
     if !config.deny_all_ipv6 {
         return Err("IPv6 allow mode is unsupported; deny_all_ipv6 must remain true".to_owned());
@@ -286,6 +313,8 @@ fn valid_interface_name(name: &str) -> bool {
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use crate::shared::proto::proxy;
+
     use super::*;
 
     #[derive(Default)]
@@ -304,8 +333,14 @@ mod tests {
     }
 
     impl KernelFirewall for SpyKernel {
-        fn sanitize<'a>(&'a mut self) -> KernelFuture<'a, ()> {
+        fn sanitize<'a>(
+            &'a mut self,
+            containment: &'a ProxyFirewallConfig,
+        ) -> KernelFuture<'a, ()> {
             Box::pin(async move {
+                assert!(containment.deny_all_ipv4);
+                assert!(containment.deny_all_ipv6);
+                assert!(containment.allowed_clients.is_empty());
                 self.calls.push("sanitize");
                 if self.fail_sanitize {
                     Err(io::Error::other("sanitize failed"))
@@ -384,6 +419,15 @@ mod tests {
         }
     }
 
+    fn sanitize_command() -> ProxyFirewallCommand {
+        ProxyFirewallCommand {
+            kind: Some(proxy_firewall_command::Kind::Sanitize(SanitizeRequest {
+                reason: "test".to_owned(),
+                containment_config: Some(config(1, true)),
+            })),
+        }
+    }
+
     #[tokio::test]
     async fn stale_session_command_makes_no_kernel_change() {
         let store = MemoryStore::default();
@@ -431,29 +475,34 @@ mod tests {
         )
         .unwrap();
         let before = firewall.identity();
-        let ack = firewall
-            .handle(ProxyFirewallCommand {
-                kind: Some(proxy_firewall_command::Kind::Sanitize(proxy::SanitizeRequest {
-                    reason: "test".to_owned(),
-                })),
-            })
-            .await;
+        let ack = firewall.handle(sanitize_command()).await;
         assert_eq!(status(&ack), proxy_firewall_ack::Status::IoError);
         assert_eq!(before.epoch, firewall.identity().epoch);
         assert_eq!(firewall.kernel.calls, vec!["sanitize"]);
     }
 
     #[tokio::test]
-    async fn sanitize_then_start_issues_authoritative_handle() {
+    async fn sanitation_rejects_non_deny_containment_without_kernel_change() {
         let store = MemoryStore::default();
         let mut firewall = ProxyFirewall::boot(&store, SpyKernel::default()).unwrap();
-        let sanitize = firewall
+        let ack = firewall
             .handle(ProxyFirewallCommand {
-                kind: Some(proxy_firewall_command::Kind::Sanitize(proxy::SanitizeRequest {
-                    reason: "test".to_owned(),
+                kind: Some(proxy_firewall_command::Kind::Sanitize(SanitizeRequest {
+                    reason: "bad".to_owned(),
+                    containment_config: Some(config(1, false)),
                 })),
             })
             .await;
+        assert_eq!(status(&ack), proxy_firewall_ack::Status::Invalid);
+        assert!(firewall.kernel.calls.is_empty());
+        assert_eq!(firewall.identity().epoch, 0);
+    }
+
+    #[tokio::test]
+    async fn sanitize_then_start_issues_authoritative_handle() {
+        let store = MemoryStore::default();
+        let mut firewall = ProxyFirewall::boot(&store, SpyKernel::default()).unwrap();
+        let sanitize = firewall.handle(sanitize_command()).await;
         assert_eq!(status(&sanitize), proxy_firewall_ack::Status::Ok);
         let identity = sanitize.identity.unwrap();
         assert_eq!(identity.epoch, 1);
@@ -461,7 +510,7 @@ mod tests {
         let start = firewall
             .handle(ProxyFirewallCommand {
                 kind: Some(proxy_firewall_command::Kind::Start(StartRequest {
-                    config: Some(config(1, true)),
+                    config: Some(config(2, true)),
                     expected_session_id: identity.session_id,
                     expected_epoch: identity.epoch,
                 })),
