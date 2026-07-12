@@ -8,6 +8,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * Authoritative root-daemon availability and boot identity for proxy-only composition.
@@ -60,9 +62,8 @@ class ProxyDaemonStateTracker {
 /**
  * RPC decorator that makes acknowledgement identity the authoritative health/generation source.
  *
- * Successful and stale-token acknowledgements publish identity. Stale acknowledgements are
- * intentionally observed because they identify the newer daemon boot. INVALID/IO_ERROR responses
- * do not publish a transient usable state, and transport [IOException] clears the tracker.
+ * Successful and stale-token acknowledgements publish identity. INVALID/IO_ERROR responses do not
+ * publish a transient usable state, and transport [IOException] clears the tracker.
  */
 class TrackingProxyFirewallRpc(
     private val delegate: ProxyFirewallRpc,
@@ -94,25 +95,44 @@ class TrackingProxyFirewallRpc(
  * Concrete production composition for proxy firewall RPC and daemon health identity.
  *
  * The same private tracker feeds both [firewallClient] and [desiredStates]. Call [bootstrap]
- * before starting the controller and again after the root transport reconnects. Bootstrap uses
- * the existing deny-first sanitation command, so identity becomes visible only after containment
- * succeeds. The controller still performs its own sanitation gate afterward.
+ * before starting the controller and again after the root transport reconnects. All bootstrap and
+ * controller firewall operations are serialized through one mutex so the client's latest sanitation
+ * token cannot be overwritten out of acknowledgement order.
  */
 class ProxyDaemonComposition(
     rpc: ProxyFirewallRpc,
     containmentConfig: suspend () -> ProxyFirewallConfig,
 ) {
     private val tracker = ProxyDaemonStateTracker()
-    val daemonState: StateFlow<ProxyDaemonState> get() = tracker.state
-    val firewallClient: DaemonProxyFirewallClient = DaemonProxyFirewallClient(
+    private val operations = Mutex()
+    private val delegate = DaemonProxyFirewallClient(
         rpc = TrackingProxyFirewallRpc(rpc, tracker),
         containmentConfig = containmentConfig,
     )
 
-    suspend fun bootstrap(): ProxyDaemonState {
-        val sanitation = firewallClient.cleanOrDenyBeforeRestart()
+    val daemonState: StateFlow<ProxyDaemonState> get() = tracker.state
+    val firewallClient: ProxyFirewallClient = object : ProxyFirewallClient {
+        override suspend fun start(config: ProxyFirewallConfig): ProxyFirewallHandle =
+            operations.withLock { delegate.start(config) }
+
+        override suspend fun replace(handle: ProxyFirewallHandle, config: ProxyFirewallConfig) {
+            operations.withLock { delegate.replace(handle, config) }
+        }
+
+        override suspend fun denyAll(handle: ProxyFirewallHandle): CleanupReport =
+            operations.withLock { delegate.denyAll(handle) }
+
+        override suspend fun stop(handle: ProxyFirewallHandle): CleanupReport =
+            operations.withLock { delegate.stop(handle) }
+
+        override suspend fun cleanOrDenyBeforeRestart(): SanitationResult? =
+            operations.withLock { delegate.cleanOrDenyBeforeRestart() }
+    }
+
+    suspend fun bootstrap(): ProxyDaemonState = operations.withLock {
+        val sanitation = delegate.cleanOrDenyBeforeRestart()
         if (sanitation == null) tracker.disconnected()
-        return tracker.state.value
+        tracker.state.value
     }
 
     fun transportDisconnected() {
@@ -123,9 +143,7 @@ class ProxyDaemonComposition(
         source.withAcknowledgedDaemonState(tracker.state)
 }
 
-/**
- * Replace any independently supplied daemon health clock with acknowledgement-backed state.
- */
+/** Replace any independently supplied daemon health clock with acknowledgement-backed state. */
 fun Flow<DesiredProxyState>.withAcknowledgedDaemonState(
     daemonState: Flow<ProxyDaemonState>,
 ): Flow<DesiredProxyState> = combine(daemonState) { desired, daemon ->
