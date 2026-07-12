@@ -1,0 +1,37 @@
+name: Apply proxy Tracks D and E
+
+on:
+  push:
+    branches:
+      - agent/proxy-only-design
+    paths:
+      - .github/workflows/apply-proxy-tracks-de.yml
+      - tools/apply_proxy_tracks_de.py.gz.b64
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out target branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/proxy-only-design
+          fetch-depth: 0
+
+      - name: Decode reviewed implementation
+        run: base64 --decode tools/apply_proxy_tracks_de.py.gz.b64 | gzip --decompress > "${RUNNER_TEMP}/apply_proxy_tracks_de.py"
+
+      - name: Apply reviewed source changes
+        run: python "${RUNNER_TEMP}/apply_proxy_tracks_de.py"
+
+      - name: Commit implementation
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add mobile/src/main mobile/src/test
+          git diff --cached --check
+          git commit -m "Implement proxy cleanup history and normalization diagnostics"
+          git push origin HEAD:agent/proxy-only-design
