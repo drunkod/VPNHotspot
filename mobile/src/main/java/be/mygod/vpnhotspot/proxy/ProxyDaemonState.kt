@@ -39,13 +39,7 @@ data class ProxyDaemonState(
     }
 }
 
-/**
- * Single source of truth for the daemon identity used by [DesiredProxyState].
- *
- * The production RPC transport owns this tracker. Every typed daemon acknowledgement with an
- * identity refreshes it; an I/O disconnect clears it. The controller therefore observes the
- * same generation that the firewall client later validates during sanitation.
- */
+/** Single source of truth for daemon identity used by [DesiredProxyState]. */
 class ProxyDaemonStateTracker {
     private val mutableState = MutableStateFlow(ProxyDaemonState.Unavailable)
     val state: StateFlow<ProxyDaemonState> get() = mutableState
@@ -66,9 +60,9 @@ class ProxyDaemonStateTracker {
 /**
  * RPC decorator that makes acknowledgement identity the authoritative health/generation source.
  *
- * Stale-session acknowledgements are intentionally observed as well: they are the daemon telling
- * the client that a newer boot identity exists. Only transport [IOException] marks the daemon
- * unavailable; protocol/kernel errors still prove that the daemon process replied.
+ * Successful and stale-token acknowledgements publish identity. Stale acknowledgements are
+ * intentionally observed because they identify the newer daemon boot. INVALID/IO_ERROR responses
+ * do not publish a transient usable state, and transport [IOException] clears the tracker.
  */
 class TrackingProxyFirewallRpc(
     private val delegate: ProxyFirewallRpc,
@@ -76,11 +70,18 @@ class TrackingProxyFirewallRpc(
 ) : ProxyFirewallRpc {
     override suspend fun execute(command: ProxyFirewallCommand): ProxyFirewallAck = try {
         delegate.execute(command).also { acknowledgement ->
-            acknowledgement.identity?.let { identity ->
-                tracker.acknowledge(
-                    sessionId = identity.session_id,
-                    generation = identity.generation,
-                )
+            when (acknowledgement.status) {
+                ProxyFirewallAck.Status.OK,
+                ProxyFirewallAck.Status.STALE_SESSION,
+                ProxyFirewallAck.Status.STALE_EPOCH -> acknowledgement.identity?.let { identity ->
+                    tracker.acknowledge(
+                        sessionId = identity.session_id,
+                        generation = identity.generation,
+                    )
+                }
+                ProxyFirewallAck.Status.INVALID,
+                ProxyFirewallAck.Status.IO_ERROR,
+                is ProxyFirewallAck.Status.Unrecognized -> Unit
             }
         }
     } catch (failure: IOException) {
@@ -92,14 +93,10 @@ class TrackingProxyFirewallRpc(
 /**
  * Concrete production composition for proxy firewall RPC and daemon health identity.
  *
- * The same private tracker feeds both [firewallClient] and [desiredStates]. This prevents callers
- * from accidentally wiring the controller to one generation source while firewall acknowledgements
- * are validated against another.
- *
- * Call [bootstrap] before starting the controller and again after the root transport reconnects.
- * Bootstrap uses the existing deny-first sanitation command, so identity becomes visible only after
- * the daemon has proved containment. The controller deliberately performs its own sanitation gate
- * afterward; the duplicate pre-runtime sanitation is idempotent and advances no active handle.
+ * The same private tracker feeds both [firewallClient] and [desiredStates]. Call [bootstrap]
+ * before starting the controller and again after the root transport reconnects. Bootstrap uses
+ * the existing deny-first sanitation command, so identity becomes visible only after containment
+ * succeeds. The controller still performs its own sanitation gate afterward.
  */
 class ProxyDaemonComposition(
     rpc: ProxyFirewallRpc,
@@ -128,9 +125,6 @@ class ProxyDaemonComposition(
 
 /**
  * Replace any independently supplied daemon health clock with acknowledgement-backed state.
- *
- * Production code should normally use [ProxyDaemonComposition.desiredStates], which guarantees
- * that this flow and the firewall client share the same tracker.
  */
 fun Flow<DesiredProxyState>.withAcknowledgedDaemonState(
     daemonState: Flow<ProxyDaemonState>,
