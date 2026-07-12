@@ -24,7 +24,7 @@ jobs:
           ref: agent/proxy-only-design
 
       - name: Apply pending proxy review fixes
-        if: github.event_name == 'push' && github.ref == 'refs/heads/agent/proxy-only-design' && github.actor != 'github-actions[bot]'
+        if: github.event_name == 'pull_request' && github.actor != 'github-actions[bot]'
         run: |
           python3 .github/scripts/apply_proxy_review_fixes.py
           git diff --check
