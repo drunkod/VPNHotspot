@@ -26,10 +26,6 @@ pub(super) async fn handle(
     state.lock().await.handle(command).await
 }
 
-pub(super) async fn record_external_clean(state: &Mutex<State>) -> io::Result<()> {
-    state.lock().await.record_external_clean()
-}
-
 pub(super) fn reply_frame(id: u64, ack: proxy::ProxyFirewallAck) -> Vec<u8> {
     daemon::DaemonEnvelope {
         frame: Some(daemon::daemon_envelope::Frame::Reply(daemon::ReplyFrame {
