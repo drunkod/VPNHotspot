@@ -36,6 +36,8 @@ class StaleProxyFirewallTokenException(
             append(it.session_id)
             append('/')
             append(it.epoch)
+            append(" generation=")
+            append(it.generation)
         }
         if (detail.isNotBlank()) {
             append(" (")
@@ -46,9 +48,9 @@ class StaleProxyFirewallTokenException(
 )
 
 /**
- * Track B client mapping. Session IDs, epochs and runtime IDs are populated
- * only from daemon acknowledgements; no local `.copy()` or inferred token is
- * permitted. Every handle mutation sends the exact daemon-issued token.
+ * Track B client mapping. Session IDs, epochs, daemon generations and runtime IDs
+ * are populated only from daemon acknowledgements; no local `.copy()` or inferred
+ * token is permitted. Every handle mutation sends the exact daemon-issued token.
  *
  * [containmentConfig] is evaluated immediately before sanitation. Its result
  * must describe the current downstream/listener ports with both deny flags set
@@ -62,6 +64,8 @@ class DaemonProxyFirewallClient(
     private val containmentConfig: suspend () -> ProxyFirewallConfig,
 ) : ProxyFirewallClient {
     override suspend fun cleanOrDenyBeforeRestart(): SanitationResult? {
+        // A failed, cancelled or transport-disconnected sanitation must never leave
+        // a previous token available for a subsequent start call.
         latestSanitation = null
         val config = containmentConfig()
         require(config.denyAllIpv4 && config.denyAllIpv6) {
@@ -70,20 +74,29 @@ class DaemonProxyFirewallClient(
         require(config.allowedClients.isEmpty()) {
             "sanitation containment must not include allowed clients"
         }
-        val ack = rpc.execute(
-            ProxyFirewallCommand(
-                sanitize = SanitizeRequest(
-                    reason = "controller sanitation gate",
-                    containment_config = config.toProto(),
+        val ack = try {
+            rpc.execute(
+                ProxyFirewallCommand(
+                    sanitize = SanitizeRequest(
+                        reason = "controller sanitation gate",
+                        containment_config = config.toProto(),
+                    ),
                 ),
-            ),
-        )
+            )
+        } catch (_: IOException) {
+            // Preserve the ProxyFirewallClient null contract so the controller
+            // records daemonCleanPending and re-sanitizes before any future start.
+            return null
+        }
         val identity = ack.identity
         if (ack.status != ProxyFirewallAck.Status.OK || identity == null) return null
+        require(identity.session_id != 0L) { "daemon returned zero proxy firewall session ID" }
+        require(identity.generation != 0L) { "daemon returned zero generation" }
         return recordSanitation(
             SanitationResult(
                 sessionId = identity.session_id,
                 epoch = identity.epoch,
+                daemonGeneration = identity.generation,
             ),
         )
     }
@@ -102,6 +115,12 @@ class DaemonProxyFirewallClient(
         requireOk("start", ack)
         require(ack.handle_id != 0L) { "daemon returned zero proxy firewall handle" }
         val identity = requireIdentity(ack)
+        require(identity.session_id == sanitation.sessionId && identity.epoch == sanitation.epoch) {
+            "daemon start acknowledgement identity changed after sanitation"
+        }
+        require(identity.generation == sanitation.daemonGeneration) {
+            "daemon start acknowledgement generation changed after sanitation"
+        }
         return ProxyFirewallHandle(
             sessionId = identity.session_id,
             epoch = identity.epoch,
