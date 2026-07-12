@@ -75,14 +75,8 @@ message ProxyFirewallCommand {
     ReplaceRequest replace = 3;
     DenyRequest deny = 4;
     StopRequest stop = 5;
-
-    // Non-mutating bootstrap/health handshake. The acknowledgement identity is
-    // the only permitted source for DesiredProxyState.daemonGeneration.
-    IdentityRequest identity = 6;
   }
 }
-
-message IdentityRequest {}
 
 message SanitizeRequest {
   string reason = 1;
