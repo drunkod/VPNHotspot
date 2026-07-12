@@ -1,6 +1,8 @@
 package be.mygod.vpnhotspot.proxy
 
-import be.mygod.vpnhotspot.proxy.proto.ProxyFirewallProto
+import be.mygod.vpnhotspot.proxy.proto.DaemonIdentity
+import be.mygod.vpnhotspot.proxy.proto.ProxyFirewallAck
+import be.mygod.vpnhotspot.proxy.proto.ProxyFirewallCommand
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -13,12 +15,12 @@ class DaemonProxyFirewallClientTest {
     fun sanitationThenStart_usesAndReturnsOnlyDaemonIssuedIdentity() = runBlocking {
         val rpc = FakeRpc(
             ack(
-                status = ProxyFirewallProto.ProxyFirewallAck.Status.OK,
+                status = ProxyFirewallAck.Status.OK,
                 session = 11,
                 epoch = 4,
             ),
             ack(
-                status = ProxyFirewallProto.ProxyFirewallAck.Status.OK,
+                status = ProxyFirewallAck.Status.OK,
                 session = 11,
                 epoch = 4,
                 handle = 99,
@@ -30,25 +32,25 @@ class DaemonProxyFirewallClientTest {
         val handle = client.start(config(generation = 5, deny = true))
 
         assertEquals(ProxyFirewallHandle(11, 4, 99), handle)
-        val sanitize = rpc.commands.single { it.hasSanitize() }.sanitize
-        assertTrue(sanitize.hasContainmentConfig())
-        assertTrue(sanitize.containmentConfig.denyAllIpv4)
-        assertTrue(sanitize.containmentConfig.denyAllIpv6)
-        assertEquals(0, sanitize.containmentConfig.allowedClientsCount)
+        val sanitize = rpc.commands.single { it.sanitize != null }.sanitize!!
+        assertNotNull(sanitize.containmentConfig)
+        assertTrue(sanitize.containmentConfig!!.denyAllIpv4)
+        assertTrue(sanitize.containmentConfig!!.denyAllIpv6)
+        assertEquals(0, sanitize.containmentConfig!!.allowedClients.size)
 
-        val start = rpc.commands.single { it.hasStart() }.start
+        val start = rpc.commands.single { it.start != null }.start!!
         assertEquals(11L, start.expectedSessionId)
         assertEquals(4L, start.expectedEpoch)
-        assertEquals(5L, start.config.generation)
-        assertTrue(start.config.denyAllIpv4)
-        assertTrue(start.config.denyAllIpv6)
+        assertEquals(5L, start.config!!.generation)
+        assertTrue(start.config!!.denyAllIpv4)
+        assertTrue(start.config!!.denyAllIpv6)
     }
 
     @Test
     fun staleDenyAck_isCriticalNonResolvingFailureAndCarriesHandleToken() = runBlocking {
         val rpc = FakeRpc(
             ack(
-                status = ProxyFirewallProto.ProxyFirewallAck.Status.STALE_SESSION,
+                status = ProxyFirewallAck.Status.STALE_SESSION,
                 session = 12,
                 epoch = 1,
                 detail = "old session",
@@ -64,7 +66,7 @@ class DaemonProxyFirewallClientTest {
         val failure = report.failures.single().cause as? StaleProxyFirewallTokenException
         assertNotNull(failure)
         assertEquals(12L, failure!!.identity?.sessionId)
-        val deny = rpc.commands.single().deny
+        val deny = rpc.commands.single().deny!!
         assertEquals(99L, deny.handleId)
         assertEquals(11L, deny.expectedSessionId)
         assertEquals(4L, deny.expectedEpoch)
@@ -74,7 +76,7 @@ class DaemonProxyFirewallClientTest {
     fun failedSanitation_returnsNullAndDoesNotPermitFirstStart() = runBlocking {
         val rpc = FakeRpc(
             ack(
-                status = ProxyFirewallProto.ProxyFirewallAck.Status.IO_ERROR,
+                status = ProxyFirewallAck.Status.IO_ERROR,
                 session = 7,
                 epoch = 0,
                 detail = "iptables failed",
@@ -91,8 +93,8 @@ class DaemonProxyFirewallClientTest {
     @Test
     fun secondFailedSanitation_clearsPreviouslySuccessfulToken() = runBlocking {
         val rpc = FakeRpc(
-            ack(ProxyFirewallProto.ProxyFirewallAck.Status.OK, session = 7, epoch = 1),
-            ack(ProxyFirewallProto.ProxyFirewallAck.Status.IO_ERROR, session = 7, epoch = 1),
+            ack(ProxyFirewallAck.Status.OK, session = 7, epoch = 1),
+            ack(ProxyFirewallAck.Status.IO_ERROR, session = 7, epoch = 1),
         )
         val client = client(rpc)
 
@@ -107,7 +109,7 @@ class DaemonProxyFirewallClientTest {
     fun replaceSerializesPackedAddressesAndMac() = runBlocking {
         val rpc = FakeRpc(
             ack(
-                status = ProxyFirewallProto.ProxyFirewallAck.Status.OK,
+                status = ProxyFirewallAck.Status.OK,
                 session = 2,
                 epoch = 3,
                 handle = 4,
@@ -118,47 +120,47 @@ class DaemonProxyFirewallClientTest {
 
         client.replace(handle, config(generation = 8, deny = false))
 
-        val replace = rpc.commands.single().replace
-        assertEquals(listOf<Byte>(192.toByte(), 168.toByte(), 43, 1),
-            replace.config.downstreamsList.single().ipv4AddressesList.single().toByteArray().toList())
-        assertEquals(listOf<Byte>(0x02, 0, 0, 0, 0, 1),
-            replace.config.allowedClientsList.single().mac.toByteArray().toList())
+        val replace = rpc.commands.single().replace!!
+        assertEquals(
+            listOf<Byte>(192.toByte(), 168.toByte(), 43, 1),
+            replace.config!!.downstreams.single().ipv4Addresses.single().toByteArray().toList(),
+        )
+        assertEquals(
+            listOf<Byte>(0x02, 0, 0, 0, 0, 1),
+            replace.config!!.allowedClients.single().mac.toByteArray().toList(),
+        )
     }
 
     private fun client(rpc: FakeRpc) = DaemonProxyFirewallClient(rpc) {
         config(generation = 1, deny = true)
     }
 
-    private class FakeRpc(vararg acks: ProxyFirewallProto.ProxyFirewallAck) : ProxyFirewallRpc {
-        val commands = mutableListOf<ProxyFirewallProto.ProxyFirewallCommand>()
+    private class FakeRpc(vararg acks: ProxyFirewallAck) : ProxyFirewallRpc {
+        val commands = mutableListOf<ProxyFirewallCommand>()
         private val responses = ArrayDeque(acks.toList())
 
-        override suspend fun execute(
-            command: ProxyFirewallProto.ProxyFirewallCommand,
-        ): ProxyFirewallProto.ProxyFirewallAck {
+        override suspend fun execute(command: ProxyFirewallCommand): ProxyFirewallAck {
             commands += command
             return responses.removeFirst()
         }
     }
 
     private fun ack(
-        status: ProxyFirewallProto.ProxyFirewallAck.Status,
+        status: ProxyFirewallAck.Status,
         session: Long,
         epoch: Long,
         handle: Long = 0,
         detail: String = "",
-    ): ProxyFirewallProto.ProxyFirewallAck = ProxyFirewallProto.ProxyFirewallAck.newBuilder()
-        .setStatus(status)
-        .setIdentity(
-            ProxyFirewallProto.DaemonIdentity.newBuilder()
-                .setSessionId(session)
-                .setEpoch(epoch)
-                .setGeneration(session)
-                .build(),
-        )
-        .setHandleId(handle)
-        .setDetail(detail)
-        .build()
+    ): ProxyFirewallAck = ProxyFirewallAck(
+        status = status,
+        identity = DaemonIdentity(
+            sessionId = session,
+            epoch = epoch,
+            generation = session,
+        ),
+        handleId = handle,
+        detail = detail,
+    )
 
     private fun config(generation: Long, deny: Boolean) = ProxyFirewallConfig(
         downstreams = listOf(
