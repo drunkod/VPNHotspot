@@ -1,10 +1,11 @@
 # Proxy-only mode design
 
 Status: **Phase 0 in progress** — controller reconciliation + itemized cleanup-debt loop
-implemented and reviewed through implementation round 12; daemon protocol enforcement,
-service/backend, and the test suite are still outstanding. PR held as **draft**.  
-Latest reviewed source commit: `379352e8e9a769624f29946c050e2a97e3f8c077`  
-Latest review: round 12 (`821cb681901f07aa496ff0df0a056f27d137fb0b`)  
+implemented and reviewed through implementation round 13; Track B daemon protocol
+enforcement and its follow-up review are complete. Service/backend integration and the
+remaining Tracks C–E are still outstanding. PR held as **draft**.  
+Latest verified clean source commit: `e2492a5e3838013b089600f7b9631f9f6be01cee`  
+Latest review: round 13 (`8189193a0b640d6ab3ee5649be605c8bb22870ce`)  
 Target branch: `agent/proxy-only-design`
 
 **Current work breakdown and next steps: [tracks/00-STATUS.md](tracks/00-STATUS.md)**
@@ -235,10 +236,10 @@ iptables rules can survive daemon death. If the long-lived daemon channel breaks
 - [Round-3 lifecycle review](REVIEW_ROUND3.md)
 - [Post-split review](POST_SPLIT_REVIEW.md)
 
-**Implementation reviews (rounds 1–12)**
+**Implementation reviews (rounds 1–13)**
 
-- Latest: [round 12](REVIEW_IMPLEMENTATION_ROUND12.md) (generation-dominance remediation)
-- Prior: `REVIEW_IMPLEMENTATION_ROUND1.md` … `ROUND11.md` in this directory.
+- Latest: [round 13](REVIEW_IMPLEMENTATION_ROUND13.md) (Track B follow-up remediation)
+- Prior: `REVIEW_IMPLEMENTATION_ROUND1.md` … `ROUND12.md` in this directory.
 
 ## Non-goals for the first version
 
@@ -269,4 +270,6 @@ iptables rules can survive daemon death. If the long-lived daemon channel breaks
 
 ## Approval boundary
 
-After the round-3 corrections above, the design is approved to begin **Phase 0 feasibility work only**. UI, production firewall integration and release code remain blocked until the Phase 0 exit criteria pass.
+The design is approved to continue Phase 0 feasibility work only. The daemon protocol
+boundary and its round-13 follow-up are verified, but the PR remains draft until Tracks
+C–E, production service/backend integration and the remaining Phase 0 exit evidence pass.
