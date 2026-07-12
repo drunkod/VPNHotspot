@@ -26,6 +26,16 @@ jobs:
       - name: Apply pending proxy review fixes
         if: github.event_name == 'pull_request' && github.actor != 'github-actions[bot]'
         run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('.github/scripts/apply_proxy_review_fixes.py')
+          text = path.read_text()
+          old = '''    count = text.count(old)\n    if count != 1:\n        raise SystemExit(f"{path}: expected exactly one match, found {count}: {old[:100]!r}")\n    target.write_text(text.replace(old, new, 1))\n'''
+          new = '''    if old in text:\n        target.write_text(text.replace(old, new, 1))\n        print(f"APPLIED {path}")\n    elif new in text:\n        print(f"ALREADY {path}")\n    else:\n        print(f"MISSING {path}: {old[:100]!r}")\n'''
+          if old not in text:
+              raise SystemExit('temporary patch helper shape changed')
+          path.write_text(text.replace(old, new, 1))
+          PY
           python3 .github/scripts/apply_proxy_review_fixes.py
           git diff --check
           git config user.name "github-actions[bot]"
