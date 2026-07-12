@@ -14,17 +14,8 @@ class DaemonProxyFirewallClientTest {
     @Test
     fun sanitationThenStart_usesAndReturnsOnlyDaemonIssuedIdentity() = runBlocking {
         val rpc = FakeRpc(
-            ack(
-                status = ProxyFirewallAck.Status.OK,
-                session = 11,
-                epoch = 4,
-            ),
-            ack(
-                status = ProxyFirewallAck.Status.OK,
-                session = 11,
-                epoch = 4,
-                handle = 99,
-            ),
+            ack(ProxyFirewallAck.Status.OK, session = 11, epoch = 4),
+            ack(ProxyFirewallAck.Status.OK, session = 11, epoch = 4, handle = 99),
         )
         val client = client(rpc)
 
@@ -33,17 +24,17 @@ class DaemonProxyFirewallClientTest {
 
         assertEquals(ProxyFirewallHandle(11, 4, 99), handle)
         val sanitize = rpc.commands.single { it.sanitize != null }.sanitize!!
-        assertNotNull(sanitize.containmentConfig)
-        assertTrue(sanitize.containmentConfig!!.denyAllIpv4)
-        assertTrue(sanitize.containmentConfig!!.denyAllIpv6)
-        assertEquals(0, sanitize.containmentConfig!!.allowedClients.size)
+        assertNotNull(sanitize.containment_config)
+        assertTrue(sanitize.containment_config!!.deny_all_ipv4)
+        assertTrue(sanitize.containment_config!!.deny_all_ipv6)
+        assertEquals(0, sanitize.containment_config!!.allowed_clients.size)
 
         val start = rpc.commands.single { it.start != null }.start!!
-        assertEquals(11L, start.expectedSessionId)
-        assertEquals(4L, start.expectedEpoch)
+        assertEquals(11L, start.expected_session_id)
+        assertEquals(4L, start.expected_epoch)
         assertEquals(5L, start.config!!.generation)
-        assertTrue(start.config!!.denyAllIpv4)
-        assertTrue(start.config!!.denyAllIpv6)
+        assertTrue(start.config!!.deny_all_ipv4)
+        assertTrue(start.config!!.deny_all_ipv6)
     }
 
     @Test
@@ -65,11 +56,11 @@ class DaemonProxyFirewallClientTest {
         assertEquals("deny_stale", report.failures.single().step)
         val failure = report.failures.single().cause as? StaleProxyFirewallTokenException
         assertNotNull(failure)
-        assertEquals(12L, failure!!.identity?.sessionId)
+        assertEquals(12L, failure!!.identity?.session_id)
         val deny = rpc.commands.single().deny!!
-        assertEquals(99L, deny.handleId)
-        assertEquals(11L, deny.expectedSessionId)
-        assertEquals(4L, deny.expectedEpoch)
+        assertEquals(99L, deny.handle_id)
+        assertEquals(11L, deny.expected_session_id)
+        assertEquals(4L, deny.expected_epoch)
     }
 
     @Test
@@ -108,12 +99,7 @@ class DaemonProxyFirewallClientTest {
     @Test
     fun replaceSerializesPackedAddressesAndMac() = runBlocking {
         val rpc = FakeRpc(
-            ack(
-                status = ProxyFirewallAck.Status.OK,
-                session = 2,
-                epoch = 3,
-                handle = 4,
-            ),
+            ack(ProxyFirewallAck.Status.OK, session = 2, epoch = 3, handle = 4),
         )
         val client = client(rpc)
         val handle = ProxyFirewallHandle(2, 3, 4)
@@ -123,11 +109,11 @@ class DaemonProxyFirewallClientTest {
         val replace = rpc.commands.single().replace!!
         assertEquals(
             listOf<Byte>(192.toByte(), 168.toByte(), 43, 1),
-            replace.config!!.downstreams.single().ipv4Addresses.single().toByteArray().toList(),
+            replace.config!!.downstreams.single().ipv4_addresses.single().toByteArray().toList(),
         )
         assertEquals(
             listOf<Byte>(0x02, 0, 0, 0, 0, 1),
-            replace.config!!.allowedClients.single().mac.toByteArray().toList(),
+            replace.config!!.allowed_clients.single().mac.toByteArray().toList(),
         )
     }
 
@@ -154,11 +140,11 @@ class DaemonProxyFirewallClientTest {
     ): ProxyFirewallAck = ProxyFirewallAck(
         status = status,
         identity = DaemonIdentity(
-            sessionId = session,
+            session_id = session,
             epoch = epoch,
             generation = session,
         ),
-        handleId = handle,
+        handle_id = handle,
         detail = detail,
     )
 
