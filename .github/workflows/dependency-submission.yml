@@ -32,5 +32,8 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-36.1" "build-tools;36.0.0"
+
       - name: Generate and submit Gradle dependency graph
         uses: gradle/actions/dependency-submission@v6
