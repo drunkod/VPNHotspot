@@ -30,12 +30,19 @@ jobs:
             --header 'X-GitHub-Api-Version: 2022-11-28' \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/dependency-graph/compare/${BASE_SHA}...${HEAD_SHA}")
           echo "Dependency graph compare API HTTP status: ${status}"
-          if [ "${status}" != "200" ]; then
-            echo 'Dependency graph compare response:'
-            head --bytes=4000 "${response_file}" || true
-            echo '::error title=Dependency graph unavailable::Enable Dependency graph under Settings > Code security and analysis, then re-run this workflow. The vulnerability threshold remains moderate.'
-            exit 1
+          if [ "${status}" = "200" ]; then
+            exit 0
           fi
+
+          echo 'Dependency graph compare response:'
+          head --bytes=4000 "${response_file}" || true
+
+          if [ "${status}" = "403" ]; then
+            echo '::error title=Dependency graph forbidden::The dependency graph compare API returned HTTP 403. Enable Dependency graph under Settings > Code security and analysis, verify repository access, then re-run this workflow. The vulnerability threshold remains moderate.'
+          else
+            echo "::error title=Dependency graph API failure::The dependency graph compare API returned HTTP ${status}. Inspect the response above for invalid refs, transient API errors, or repository configuration problems."
+          fi
+          exit 1
 
       - name: Check out repository
         uses: actions/checkout@v7
