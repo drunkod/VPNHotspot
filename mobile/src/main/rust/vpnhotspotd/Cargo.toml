@@ -9,7 +9,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "vpnhotspotd"
 path = "src/main.rs"
-test = true
+test = false
 
 [dependencies]
 cidr = "0.3.2"
