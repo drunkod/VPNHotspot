@@ -1,8 +1,14 @@
 # Proxy-only mode design
 
-Status: round-3 corrected design; approved to begin **Phase 0 feasibility work only**  
-Target repository snapshot: `drunkod/VPNHotspot@9b6354c69cbe42c87c8d3a28add8405c3ae79b8d`  
+Status: **Phase 0 in progress** — controller reconciliation + itemized cleanup-debt loop
+implemented and reviewed through implementation round 12; daemon protocol enforcement,
+service/backend, and the test suite are still outstanding. PR held as **draft**.  
+Latest reviewed source commit: `379352e8e9a769624f29946c050e2a97e3f8c077`  
+Latest review: round 12 (`821cb681901f07aa496ff0df0a056f27d137fb0b`)  
 Target branch: `agent/proxy-only-design`
+
+**Current work breakdown and next steps: [tracks/00-STATUS.md](tracks/00-STATUS.md)**
+(live status tracker + Tracks A–F). This supersedes the scattered per-round status notes.
 
 ## Goal
 
@@ -209,15 +215,30 @@ iptables rules can survive daemon death. If the long-lived daemon channel breaks
 
 ## Documents
 
-- [Round-1 structural review](REVIEW.md)
-- [Round-2 resolution audit](REVIEW_ROUND2.md)
-- [Round-3 lifecycle review](REVIEW_ROUND3.md)
+**Current status and next steps**
+
+- [Phase 0 status tracker + Tracks A–F](tracks/00-STATUS.md) — start here
+
+**Design**
+
 - [Research decisions](RESEARCH_DECISIONS.md)
 - [Architecture](ARCHITECTURE.md)
 - [Implementation plan](IMPLEMENTATION_PLAN.md)
-- [Code sketches](CODE_SKETCHES.md)
+- [Code sketches](CODE_SKETCHES.md) and [step files](sketches/)
 - [Security and test plan](TEST_PLAN.md)
 - [FlClash configuration example](FLCLASH_EXAMPLE.md)
+
+**Design reviews (rounds 1–3)**
+
+- [Round-1 structural review](REVIEW.md)
+- [Round-2 resolution audit](REVIEW_ROUND2.md)
+- [Round-3 lifecycle review](REVIEW_ROUND3.md)
+- [Post-split review](POST_SPLIT_REVIEW.md)
+
+**Implementation reviews (rounds 1–12)**
+
+- Latest: [round 12](REVIEW_IMPLEMENTATION_ROUND12.md) (generation-dominance remediation)
+- Prior: `REVIEW_IMPLEMENTATION_ROUND1.md` … `ROUND11.md` in this directory.
 
 ## Non-goals for the first version
 
