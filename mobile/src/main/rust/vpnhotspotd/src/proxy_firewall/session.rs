@@ -1,5 +1,6 @@
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -29,6 +30,31 @@ impl FileSessionStore {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    fn lock(&self) -> io::Result<FileLock> {
+        let lock_path = self.path.with_extension("lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if result == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(FileLock(file))
+    }
+}
+
+struct FileLock(File);
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // Best-effort unlock; closing the descriptor also releases flock.
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
 }
 
 impl SessionStore for FileSessionStore {
@@ -36,6 +62,7 @@ impl SessionStore for FileSessionStore {
         if let Some(parent) = self.path.parent().filter(|path| !path.as_os_str().is_empty()) {
             fs::create_dir_all(parent)?;
         }
+        let _lock = self.lock()?;
 
         let current = match fs::read_to_string(&self.path) {
             Ok(value) => value.trim().parse::<u64>().map_err(|error| {
@@ -51,9 +78,11 @@ impl SessionStore for FileSessionStore {
             io::Error::new(io::ErrorKind::InvalidData, "proxy firewall session counter overflow")
         })?;
 
-        let temporary = self
-            .path
-            .with_extension(format!("tmp-{}", std::process::id()));
+        let temporary = self.path.with_extension(format!(
+            "tmp-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -121,30 +150,57 @@ impl ProxySession {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
 
-    #[test]
-    fn file_store_persists_strictly_increasing_session_ids() {
+    fn temporary_store(name: &str) -> (PathBuf, FileSessionStore) {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock after Unix epoch")
             .as_nanos();
         let directory = std::env::temp_dir().join(format!(
-            "vpnhotspotd-proxy-session-{}-{unique}",
+            "vpnhotspotd-proxy-session-{name}-{}-{unique}",
             std::process::id(),
         ));
-        let path = directory.join("counter");
+        let store = FileSessionStore::new(directory.join("counter"));
+        (directory, store)
+    }
 
-        let first = FileSessionStore::new(&path).next_session_id().unwrap();
-        let second = FileSessionStore::new(&path).next_session_id().unwrap();
-        let third = FileSessionStore::new(&path).next_session_id().unwrap();
+    #[test]
+    fn file_store_persists_strictly_increasing_session_ids() {
+        let (directory, store) = temporary_store("serial");
+
+        let first = store.next_session_id().unwrap();
+        let second = FileSessionStore::new(store.path()).next_session_id().unwrap();
+        let third = FileSessionStore::new(store.path()).next_session_id().unwrap();
 
         assert_eq!(first, 1);
         assert_eq!(second, 2);
         assert_eq!(third, 3);
-        assert_eq!(fs::read_to_string(&path).unwrap().trim(), "3");
+        assert_eq!(fs::read_to_string(store.path()).unwrap().trim(), "3");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn file_store_serializes_concurrent_boots() {
+        let (directory, store) = temporary_store("concurrent");
+        let store = Arc::new(store);
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            threads.push(std::thread::spawn(move || store.next_session_id().unwrap()));
+        }
+        let mut values = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+
+        assert_eq!(values, (1..=8).collect::<Vec<_>>());
+        assert_eq!(fs::read_to_string(store.path()).unwrap().trim(), "8");
 
         fs::remove_dir_all(directory).unwrap();
     }
