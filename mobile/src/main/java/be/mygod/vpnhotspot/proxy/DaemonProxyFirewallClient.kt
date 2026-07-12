@@ -41,16 +41,35 @@ class StaleProxyFirewallTokenException(
  * Track B client mapping. Session IDs, epochs and runtime IDs are populated
  * only from daemon acknowledgements; no local `.copy()` or inferred token is
  * permitted. Every handle mutation sends the exact daemon-issued token.
+ *
+ * [containmentConfig] is evaluated immediately before sanitation. Its result
+ * must describe the current downstream/listener ports with both deny flags set
+ * and no allowed clients. This provider is the integration seam for the future
+ * service-owned controller composition (Track C); the controller's reviewed
+ * no-argument [ProxyFirewallClient.cleanOrDenyBeforeRestart] contract remains
+ * unchanged.
  */
 class DaemonProxyFirewallClient(
     private val rpc: ProxyFirewallRpc,
+    private val containmentConfig: suspend () -> ProxyFirewallConfig,
 ) : ProxyFirewallClient {
     override suspend fun cleanOrDenyBeforeRestart(): SanitationResult? {
+        // A failed or cancelled sanitation must never leave a previous token
+        // available for a subsequent start call.
+        latestSanitation = null
+        val config = containmentConfig()
+        require(config.denyAllIpv4 && config.denyAllIpv6) {
+            "sanitation requires explicit IPv4 and IPv6 deny containment"
+        }
+        require(config.allowedClients.isEmpty()) {
+            "sanitation containment must not include allowed clients"
+        }
         val ack = rpc.execute(
             ProxyFirewallProto.ProxyFirewallCommand.newBuilder()
                 .setSanitize(
                     ProxyFirewallProto.SanitizeRequest.newBuilder()
                         .setReason("controller sanitation gate")
+                        .setContainmentConfig(config.toProto())
                         .build(),
                 )
                 .build(),
@@ -135,11 +154,7 @@ class DaemonProxyFirewallClient(
         ),
     )
 
-    /**
-     * The controller always sanitizes before start and validates the returned
-     * handle afterwards. The transport retains the most recent successful
-     * sanitation acknowledgement solely to populate Start's expected token.
-     */
+    /** Most recent successful daemon sanitation token, used only by Start. */
     private var latestSanitation: SanitationResult? = null
 
     private fun requireSanitationToken(): SanitationResult = latestSanitation
