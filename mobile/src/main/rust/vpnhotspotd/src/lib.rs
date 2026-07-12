@@ -2,4 +2,5 @@
 //!
 //! Android/root/socket runtime code stays under `src/`; shared modules live under `src/shared/`.
 
+pub mod proxy_firewall;
 pub mod shared;
