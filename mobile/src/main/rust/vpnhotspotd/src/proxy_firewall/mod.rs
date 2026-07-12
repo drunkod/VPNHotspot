@@ -677,7 +677,7 @@ mod tests {
         };
         let first = firewall
             .handle(ProxyFirewallCommand {
-                kind: Some(proxy_firewall_command::Kind::Stop(request.clone())),
+                kind: Some(proxy_firewall_command::Kind::Stop(request)),
             })
             .await;
         let second = firewall
