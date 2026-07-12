@@ -162,7 +162,7 @@ class CleanupGenerationMatrixTest {
     fun cleanupDebtRetry_successfulSanitation_reestablishesMarkersAndClearsDebt() = runBlocking {
         ControllerHarness().use { harness ->
             val controller = harness.controller
-            harness.firewall.sanitationResults += SanitationResult(sessionId = 9, epoch = 7)
+            harness.firewall.sanitationResults += SanitationResult(sessionId = 9, epoch = 7, daemonGeneration = 11)
             controller.seedForTrackATest(
                 latest = desiredStateForTest(11),
                 sanitizedDaemonGeneration = 10,
@@ -180,6 +180,61 @@ class CleanupGenerationMatrixTest {
             assertEquals(9L, controller.sanitizedSessionIdForTrackATest())
             assertEquals(7L, controller.sanitizedEpochForTrackATest())
             assertEquals(7L, controller.firewallGenerationForTrackATest())
+        }
+    }
+
+    @Test
+    fun primarySanitation_ackGenerationMismatchRetainsDaemonCleanDebt() = runBlocking {
+        ControllerHarness().use { harness ->
+            harness.firewall.sanitationResults += SanitationResult(
+                sessionId = 9,
+                epoch = 7,
+                daemonGeneration = 10,
+            )
+            val desired = desiredStateForTest(daemonGeneration = 11)
+            harness.controller.seedForTrackATest(
+                latest = desired,
+                sanitizedDaemonGeneration = 10,
+                sanitizedSessionId = 5,
+                sanitizedEpoch = 2,
+                serviceActivated = true,
+            )
+
+            harness.controller.reconcileForTrackATest(desired)
+
+            val debt = harness.controller.cleanupDebtForTrackATest()
+            assertTrue(debt?.daemonCleanPending == true)
+            assertEquals(10L, harness.controller.sanitizedDaemonGenerationForTrackATest())
+            assertNull(harness.controller.sanitizedSessionIdForTrackATest())
+            assertNull(harness.controller.sanitizedEpochForTrackATest())
+            assertFalse(harness.firewall.calls.any { it == "start" })
+        }
+    }
+
+    @Test
+    fun cleanupDebtRetry_ackGenerationMismatchDoesNotCommitSanitation() = runBlocking {
+        ControllerHarness().use { harness ->
+            harness.firewall.sanitationResults += SanitationResult(
+                sessionId = 9,
+                epoch = 7,
+                daemonGeneration = 10,
+            )
+            harness.controller.seedForTrackATest(
+                latest = desiredStateForTest(11),
+                sanitizedDaemonGeneration = 10,
+                sanitizedSessionId = 5,
+                sanitizedEpoch = 2,
+                debt = firewallDebt(ProxyFirewallHandle(sessionId = 5, epoch = 2, id = 8)),
+            )
+
+            harness.controller.retryCleanupDebtForTrackATest()
+
+            val debt = harness.controller.cleanupDebtForTrackATest()
+            assertTrue(debt?.daemonCleanPending == true)
+            assertEquals(10L, harness.controller.sanitizedDaemonGenerationForTrackATest())
+            assertEquals(5L, harness.controller.sanitizedSessionIdForTrackATest())
+            assertEquals(2L, harness.controller.sanitizedEpochForTrackATest())
+            assertTrue(debt!!.failures.any { it.step == "daemon_clean_race" })
         }
     }
 

@@ -379,11 +379,13 @@ async fn handle_command(
             let mut proxy = state.proxy_firewall.lock().await;
             let mut handle = netlink::RequestConnection::new()
                 .with_report_context("control.clean_routing.netlink")?;
-            routing::clean(&mut handle, &command)
-                .await
-                .with_report_context("control.clean_routing")?;
             proxy
-                .record_external_clean()
+                .record_external_clean(|| async {
+                    routing::clean(&mut handle, &command)
+                        .await
+                        .with_report_context("control.clean_routing")
+                })
+                .await
                 .with_report_context("control.clean_routing.proxy_epoch")?;
             Ok(CallOutput::Reply(ack_reply_frame(id)))
         }

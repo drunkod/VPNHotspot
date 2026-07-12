@@ -295,8 +295,36 @@ class ProxyOnlyController(
                 return
             }
 
+            if (result.daemonGeneration != capturedDaemonGeneration) {
+                val mismatch = "sanitation acknowledgement generation ${result.daemonGeneration} " +
+                    "does not match observed daemon generation $capturedDaemonGeneration"
+                withContext(NonCancellable) {
+                    cleanupApplied("sanitation identity mismatch", daemonAvailable = false)
+                }
+                mergeDebt(
+                    CleanupDebt(
+                        listenerClosePending = false, serviceHandlePending = null,
+                        firewallHandlePending = null, firewallDenyPending = false,
+                        firewallStopPending = false, daemonCleanPending = true,
+                        featureStopPending = false, serviceWasActivated = serviceActivated,
+                        failures = listOf(
+                            CleanupFailure("startup_sanitation_generation", RuntimeException(mismatch))
+                        ),
+                        generation = nextDebtGeneration++, attempt = 0,
+                    )
+                )
+                val state = cleanupDebt?.let(::debtState)
+                    ?: ProxyOnlyState.FailClosed(
+                        FailClosedReason.StartupSanitationFailed(mismatch)
+                    )
+                enterWaitingIfActive(state)
+                publishSafely(state)
+                cleanupDebt?.let(::scheduleDebtRetry)
+                return
+            }
+
             firewallGeneration = AtomicLong(result.epoch)
-            sanitizedDaemonGeneration = capturedDaemonGeneration
+            sanitizedDaemonGeneration = result.daemonGeneration
             sanitizedSessionId = result.sessionId
             sanitizedEpoch = result.epoch
         }
@@ -771,23 +799,23 @@ class ProxyOnlyController(
             if (result != null) {
                 // R8 blocker #3: validate generation hasn't changed during the call.
                 val currentGeneration = latestSnapshot.get()?.daemonGeneration
-                if (currentGeneration == capturedDaemonGeneration) {
+                if (currentGeneration == capturedDaemonGeneration &&
+                    result.daemonGeneration == capturedDaemonGeneration) {
                     daemonCleanPending = false
                     newFirewallGenerationEpoch = result.epoch
                     newSanitizedEpoch = result.epoch
                     newSanitizedSessionId = result.sessionId
-                    newSanitizedDaemonGen = capturedDaemonGeneration
+                    newSanitizedDaemonGen = result.daemonGeneration
                 } else {
-                    // Generation changed while IPC was in flight. The acknowledgement
-                    // belongs to the old generation and must not be stored as sanitation
-                    // for the new one. Retain daemonCleanPending; reconcile will
-                    // re-sanitize the new daemon via the sanitation gate.
+                    // Both the observed generation and the acknowledgement-issued
+                    // generation must identify the same daemon. Retain sanitation debt
+                    // whenever either clock changed or disagrees.
                     failures += CleanupFailure(
                         "daemon_clean_race",
                         RuntimeException(
-                            "daemon generation changed from $capturedDaemonGeneration to " +
-                                "$currentGeneration during cleanOrDenyBeforeRestart; " +
-                                "acknowledgement discarded"
+                            "daemon generation mismatch during cleanOrDenyBeforeRestart: " +
+                                "captured=$capturedDaemonGeneration current=$currentGeneration " +
+                                "ack=${result.daemonGeneration}; acknowledgement discarded"
                         )
                     )
                 }

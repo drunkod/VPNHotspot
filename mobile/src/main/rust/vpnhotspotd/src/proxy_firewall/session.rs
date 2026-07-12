@@ -31,6 +31,43 @@ impl FileSessionStore {
         &self.path
     }
 
+    fn temporary_path(&self) -> io::Result<PathBuf> {
+        let file_name = self.path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "session counter path has no file name")
+        })?;
+        let name = file_name.to_string_lossy();
+        Ok(self.path.with_file_name(format!(
+            "{name}.tmp-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        )))
+    }
+
+    fn cleanup_stale_temporaries(&self) -> io::Result<()> {
+        let Some(parent) = self.path.parent().filter(|path| !path.as_os_str().is_empty()) else {
+            return Ok(());
+        };
+        let Some(file_name) = self.path.file_name() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session counter path has no file name",
+            ));
+        };
+        let prefix = format!("{}.tmp-", file_name.to_string_lossy());
+        for entry in fs::read_dir(parent)? {
+            let entry = entry?;
+            if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+                continue;
+            }
+            match fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
     fn lock(&self) -> io::Result<FileLock> {
         let lock_path = self.path.with_extension("lock");
         let file = OpenOptions::new()
@@ -64,6 +101,7 @@ impl SessionStore for FileSessionStore {
             fs::create_dir_all(parent)?;
         }
         let _lock = self.lock()?;
+        self.cleanup_stale_temporaries()?;
 
         let current = match fs::read_to_string(&self.path) {
             Ok(value) => value.trim().parse::<u64>().map_err(|error| {
@@ -79,11 +117,7 @@ impl SessionStore for FileSessionStore {
             io::Error::new(io::ErrorKind::InvalidData, "proxy firewall session counter overflow")
         })?;
 
-        let temporary = self.path.with_extension(format!(
-            "tmp-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id(),
-        ));
+        let temporary = self.temporary_path()?;
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -151,6 +185,7 @@ impl ProxySession {
 
 #[cfg(test)]
 mod tests {
+    use std::process::{Command, Stdio};
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -181,6 +216,66 @@ mod tests {
         assert_eq!(second, 2);
         assert_eq!(third, 3);
         assert_eq!(fs::read_to_string(store.path()).unwrap().trim(), "3");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn file_store_removes_stale_temporary_files_under_lock() {
+        let (directory, store) = temporary_store("stale-temp");
+        fs::create_dir_all(&directory).unwrap();
+        let stale = store.path().with_file_name("counter.tmp-stale");
+        fs::write(&stale, "partial").unwrap();
+
+        assert_eq!(store.next_session_id().unwrap(), 1);
+        assert!(!stale.exists());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn file_store_process_helper() {
+        let Some(path) = std::env::var_os("VPNHOTSPOTD_SESSION_STORE_HELPER") else {
+            return;
+        };
+        let value = FileSessionStore::new(path).next_session_id().unwrap();
+        println!("SESSION_ID={value}");
+    }
+
+    #[test]
+    fn file_store_serializes_concurrent_processes() {
+        let (directory, store) = temporary_store("processes");
+        let executable = std::env::current_exe().unwrap();
+        let test_name = "proxy_firewall::session::tests::file_store_process_helper";
+        let mut children = Vec::new();
+        for _ in 0..8 {
+            children.push(
+                Command::new(&executable)
+                    .args(["--exact", test_name, "--nocapture"])
+                    .env("VPNHOTSPOTD_SESSION_STORE_HELPER", store.path())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        let mut values = children
+            .into_iter()
+            .map(|child| {
+                let output = child.wait_with_output().unwrap();
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .find_map(|line| line.strip_prefix("SESSION_ID="))
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+
+        assert_eq!(values, (1..=8).collect::<Vec<_>>());
+        assert_eq!(fs::read_to_string(store.path()).unwrap().trim(), "8");
 
         fs::remove_dir_all(directory).unwrap();
     }
