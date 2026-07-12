@@ -21,8 +21,10 @@ data class ProxyDaemonState(
     val generation: Long?,
 ) {
     init {
-        require(healthy == (sessionId != null && generation != null)) {
-            "healthy daemon state requires a complete acknowledgement identity"
+        val completeIdentity = sessionId != null && generation != null
+        val absentIdentity = sessionId == null && generation == null
+        require((healthy && completeIdentity) || (!healthy && absentIdentity)) {
+            "daemon state must be either healthy with a complete identity or unavailable"
         }
         require(sessionId == null || sessionId != 0L) { "daemon session ID must be non-zero" }
         require(generation == null || generation != 0L) { "daemon generation must be non-zero" }
@@ -88,11 +90,32 @@ class TrackingProxyFirewallRpc(
 }
 
 /**
+ * Concrete production composition for proxy firewall RPC and daemon health identity.
+ *
+ * The same private tracker feeds both [firewallClient] and [desiredStates]. This prevents callers
+ * from accidentally wiring the controller to one generation source while firewall acknowledgements
+ * are validated against another.
+ */
+class ProxyDaemonComposition(
+    rpc: ProxyFirewallRpc,
+    containmentConfig: suspend () -> ProxyFirewallConfig,
+) {
+    private val tracker = ProxyDaemonStateTracker()
+    val daemonState: StateFlow<ProxyDaemonState> get() = tracker.state
+    val firewallClient: DaemonProxyFirewallClient = DaemonProxyFirewallClient(
+        rpc = TrackingProxyFirewallRpc(rpc, tracker),
+        containmentConfig = containmentConfig,
+    )
+
+    fun desiredStates(source: Flow<DesiredProxyState>): Flow<DesiredProxyState> =
+        source.withAcknowledgedDaemonState(tracker.state)
+}
+
+/**
  * Replace any independently supplied daemon health clock with acknowledgement-backed state.
  *
- * This adapter is the required production entry point before a desired-state flow is handed to
- * [ProxyOnlyController]. It prevents a service/health observer from claiming generation G1 while
- * the RPC channel is returning acknowledgements from generation G2.
+ * Production code should normally use [ProxyDaemonComposition.desiredStates], which guarantees
+ * that this flow and the firewall client share the same tracker.
  */
 fun Flow<DesiredProxyState>.withAcknowledgedDaemonState(
     daemonState: Flow<ProxyDaemonState>,
