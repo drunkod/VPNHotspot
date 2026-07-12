@@ -118,3 +118,34 @@ impl ProxySession {
         Validation::Current
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    #[test]
+    fn file_store_persists_strictly_increasing_session_ids() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "vpnhotspotd-proxy-session-{}-{unique}",
+            std::process::id(),
+        ));
+        let path = directory.join("counter");
+
+        let first = FileSessionStore::new(&path).next_session_id().unwrap();
+        let second = FileSessionStore::new(&path).next_session_id().unwrap();
+        let third = FileSessionStore::new(&path).next_session_id().unwrap();
+
+        assert_eq!(first, 1);
+        assert_eq!(second, 2);
+        assert_eq!(third, 3);
+        assert_eq!(fs::read_to_string(&path).unwrap().trim(), "3");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
