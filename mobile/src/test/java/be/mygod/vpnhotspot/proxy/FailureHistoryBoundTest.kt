@@ -44,7 +44,7 @@ class FailureHistoryBoundTest {
             .mergeUnresolved(debtWith(serviceHandle = ProxyServiceHandle(2)))
 
         repeat(100) {
-            debt = debt.mergeUnresolved(debtWith(serviceHandle = ProxyServiceHandle(3 + it)))
+            debt = debt.mergeUnresolved(debtWith(serviceHandle = ProxyServiceHandle(3L + it)))
         }
 
         assertEquals(1, debt.failures.count { it.step == "service_handle_conflict" })
