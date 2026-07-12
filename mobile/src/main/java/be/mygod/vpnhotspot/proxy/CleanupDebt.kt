@@ -10,26 +10,36 @@ package be.mygod.vpnhotspot.proxy
 //   • Successful firewall stop   → resolves FIREWALL_RUNTIME + FIREWALL_DENY
 //   • Deny success alone         → does NOT resolve FIREWALL_RUNTIME
 //   • Debt merge                 → fresh generation, union of unresolved resources
-//   • New-epoch sanitation       → dominates all firewall handles whose epoch
-//     is strictly less than the new sanitation epoch, regardless of daemon generation.
+//   • New-epoch sanitation       → dominates all firewall handles whose session
+//     and epoch are strictly dominated by the new (sessionId, epoch) pair.
 //
 // R5: serviceWasActivated — records whether the service foreground activation
 //     was issued, so cleanup-scope retries know whether service IPC is valid
 //     even after the controller worker has exited.
 //
-// R6: epoch-qualified firewall handle provenance.
-//     ProxyFirewallHandle now carries (epoch, id). The epoch is set by the
-//     controller to the sanitizedEpoch returned by cleanOrDenyBeforeRestart().
-//     A handle is stale iff its epoch is strictly less than the current
-//     sanitizedEpoch. firewallHandleGeneration (daemon-generation proxy) is
-//     removed; epoch comparison covers same-generation pre-sanitation handles.
+// R6/R7/R9: epoch-qualified, session-qualified firewall handle provenance.
+//     ProxyFirewallHandle carries (sessionId, epoch, id), all returned by the
+//     daemon in the start acknowledgement. The controller MUST NOT manufacture
+//     sessionId or epoch locally. A handle is current iff its (sessionId, epoch)
+//     exactly matches the controller's (sanitizedSessionId, sanitizedEpoch).
+//     A same-session lower epoch is dominated (sanitation covered it); a
+//     different session or future epoch is a conflict requiring re-sanitation.
+//     firewallHandleGeneration (daemon-generation proxy) was removed in R6;
+//     the authoritative (sessionId, epoch) pair replaces it.
+//
+// R9: service-handle conflict resolution: both handles are discarded, listener
+//     ownership is marked unknown, and featureStopPending forces authoritative
+//     full service teardown. stopFeature() uses the service's own internal
+//     backend handle, so it does not require the controller to hold a specific
+//     service handle. Conflict failures are deduplicated per step name to bound
+//     history growth under repeated merges.
 // ---------------------------------------------------------------------------
 
 /**
  * Tracks one active proxy runtime.
  *
- * [firewall] carries epoch provenance via [ProxyFirewallHandle.epoch]; the
- * separate [firewallDaemonGeneration] field from R5 is removed.
+ * [firewall] carries full provenance via [ProxyFirewallHandle.sessionId] and
+ * [ProxyFirewallHandle.epoch], both issued by the daemon.
  */
 data class AppliedProxyState(
     val key: RuntimeKey,
@@ -49,15 +59,21 @@ enum class CleanupResource {
 
 data class CleanupDebt(
     val listenerClosePending: Boolean,
+    /**
+     * Non-null only when the controller holds a specific service handle that
+     * needs to be stopped. Null when service identity is unknown/conflicted
+     * (in which case [featureStopPending] forces a full authoritative teardown).
+     */
     val serviceHandlePending: ProxyServiceHandle?,
     /**
-     * Non-null only when the handle belongs to the current sanitation epoch and
-     * the firewall runtime has not been stopped. The epoch is embedded in the
-     * handle ([ProxyFirewallHandle.epoch]); callers compare it against
+     * Non-null only when the handle belongs to the current sanitation session/epoch
+     * and the firewall runtime has not been stopped. The session and epoch are
+     * embedded in the handle ([ProxyFirewallHandle.sessionId] / [.epoch]); callers
+     * compare them against [ProxyOnlyController.sanitizedSessionId] /
      * [ProxyOnlyController.sanitizedEpoch] to detect stale handles.
      *
-     * Handles from prior epochs are NOT carried here; they are resolved by
-     * sanitation dominance in [ProxyOnlyController.cleanupApplied] and
+     * Handles from prior sessions/epochs are NOT carried here; they are resolved
+     * by sanitation dominance in [ProxyOnlyController.cleanupApplied] and
      * [ProxyOnlyController.retryCleanupDebtSafely].
      */
     val firewallHandlePending: ProxyFirewallHandle?,
@@ -87,18 +103,25 @@ data class CleanupDebt(
     /**
      * Merge [other] into this debt, preserving concrete surviving handles.
      *
-     * R8 blocker #2: non-throwing typed conflict resolution.
+     * R8/R9: non-throwing typed conflict resolution.
      *
      * Firewall handle conflict (both non-null, different): drop both handles and
      * set [daemonCleanPending]. The daemon must re-sanitize before any new IPC
      * against either handle. Conflict details are recorded as [CleanupFailure]s.
      *
-     * Service handle conflict (both non-null, different): keep the existing
-     * handle and set [featureStopPending] so the full service is torn down. The
-     * stale handle will produce a no-op or stale-handle failure on the next retry,
-     * which is safe and observable.
+     * Service handle conflict (both non-null, different): discard BOTH handles
+     * (neither is authoritative), mark [listenerClosePending] true (ownership
+     * unknown), and set [featureStopPending] for authoritative full teardown.
+     * [ProxyService.stopFeature] uses the service's own internal backend handle
+     * and does not require the controller to hold a specific [serviceHandlePending].
+     * This breaks the R8 deadlock where retaining a stale handle permanently
+     * blocked [featureStopPending].
      *
-     * No throws: the invariant violation is recorded in [failures] rather than
+     * Conflict failures are deduplicated by step name: a given conflict type is
+     * appended at most once, preventing unbounded history growth under repeated
+     * merges of the same unresolved conflict (R9 amendment #6).
+     *
+     * No throws: invariant violations are recorded in [failures] rather than
      * propagated. This ensures that [applied] can always be cleared atomically
      * after the global debt merge (see [ProxyOnlyController.cleanupApplied]).
      */
@@ -110,8 +133,10 @@ data class CleanupDebt(
             other.serviceHandlePending != null &&
             serviceHandlePending != other.serviceHandlePending
 
+        // Deduplicate: append a conflict failure only if not already present.
+        val existingSteps = (failures + other.failures).map { it.step }.toHashSet()
         val conflictFailures = buildList {
-            if (firewallConflict) add(
+            if (firewallConflict && "firewall_handle_conflict" !in existingSteps) add(
                 CleanupFailure(
                     "firewall_handle_conflict",
                     IllegalStateException(
@@ -120,21 +145,25 @@ data class CleanupDebt(
                     )
                 )
             )
-            if (serviceConflict) add(
+            if (serviceConflict && "service_handle_conflict" !in existingSteps) add(
                 CleanupFailure(
                     "service_handle_conflict",
                     IllegalStateException(
                         "conflicting service handles: $serviceHandlePending " +
-                            "vs ${other.serviceHandlePending} — featureStopPending set"
+                            "vs ${other.serviceHandlePending} — dropped both, " +
+                            "listenerClosePending + featureStopPending set"
                     )
                 )
             )
         }
 
         return copy(
-            listenerClosePending = listenerClosePending || other.listenerClosePending,
-            // Service conflict: keep existing handle; featureStopPending forces teardown.
-            serviceHandlePending = serviceHandlePending ?: other.serviceHandlePending,
+            // Service conflict: mark listener unknown (two backends = unknown listener).
+            listenerClosePending = listenerClosePending || other.listenerClosePending ||
+                serviceConflict,
+            // Service conflict: discard both handles; featureStopPending forces teardown.
+            serviceHandlePending = if (serviceConflict) null
+                                   else serviceHandlePending ?: other.serviceHandlePending,
             // Firewall conflict: drop both; no IPC, re-sanitation required.
             firewallHandlePending = if (firewallConflict) null
                                     else firewallHandlePending ?: other.firewallHandlePending,
@@ -143,7 +172,8 @@ data class CleanupDebt(
             firewallStopPending = if (firewallConflict) false
                                   else firewallStopPending || other.firewallStopPending,
             daemonCleanPending = daemonCleanPending || other.daemonCleanPending || firewallConflict,
-            featureStopPending = featureStopPending || other.featureStopPending || serviceConflict,
+            featureStopPending = featureStopPending || other.featureStopPending ||
+                serviceConflict,
             serviceWasActivated = serviceWasActivated || other.serviceWasActivated,
             failures = failures + other.failures + conflictFailures,
             attempt = 0,
