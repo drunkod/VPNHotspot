@@ -24,12 +24,18 @@ class DaemonProxyFirewallClientTest {
                 handle = 99,
             ),
         )
-        val client = DaemonProxyFirewallClient(rpc)
+        val client = client(rpc)
 
         assertEquals(SanitationResult(11, 4), client.cleanOrDenyBeforeRestart())
         val handle = client.start(config(generation = 5, deny = true))
 
         assertEquals(ProxyFirewallHandle(11, 4, 99), handle)
+        val sanitize = rpc.commands.single { it.hasSanitize() }.sanitize
+        assertTrue(sanitize.hasContainmentConfig())
+        assertTrue(sanitize.containmentConfig.denyAllIpv4)
+        assertTrue(sanitize.containmentConfig.denyAllIpv6)
+        assertEquals(0, sanitize.containmentConfig.allowedClientsCount)
+
         val start = rpc.commands.single { it.hasStart() }.start
         assertEquals(11, start.expectedSessionId)
         assertEquals(4, start.expectedEpoch)
@@ -48,7 +54,7 @@ class DaemonProxyFirewallClientTest {
                 detail = "old session",
             ),
         )
-        val client = DaemonProxyFirewallClient(rpc)
+        val client = client(rpc)
         val handle = ProxyFirewallHandle(sessionId = 11, epoch = 4, id = 99)
 
         val report = client.denyAll(handle)
@@ -74,12 +80,27 @@ class DaemonProxyFirewallClientTest {
                 detail = "iptables failed",
             ),
         )
-        val client = DaemonProxyFirewallClient(rpc)
+        val client = client(rpc)
 
         assertNull(client.cleanOrDenyBeforeRestart())
         val failure = runCatching { client.start(config(generation = 1, deny = true)) }.exceptionOrNull()
         assertTrue(failure is IllegalStateException)
         assertEquals(1, rpc.commands.size)
+    }
+
+    @Test
+    fun secondFailedSanitation_clearsPreviouslySuccessfulToken() = runBlocking {
+        val rpc = FakeRpc(
+            ack(ProxyFirewallProto.ProxyFirewallAck.Status.OK, session = 7, epoch = 1),
+            ack(ProxyFirewallProto.ProxyFirewallAck.Status.IO_ERROR, session = 7, epoch = 1),
+        )
+        val client = client(rpc)
+
+        assertEquals(SanitationResult(7, 1), client.cleanOrDenyBeforeRestart())
+        assertNull(client.cleanOrDenyBeforeRestart())
+        val failure = runCatching { client.start(config(generation = 2, deny = true)) }.exceptionOrNull()
+        assertTrue(failure is IllegalStateException)
+        assertEquals(2, rpc.commands.size)
     }
 
     @Test
@@ -92,7 +113,7 @@ class DaemonProxyFirewallClientTest {
                 handle = 4,
             ),
         )
-        val client = DaemonProxyFirewallClient(rpc)
+        val client = client(rpc)
         val handle = ProxyFirewallHandle(2, 3, 4)
 
         client.replace(handle, config(generation = 8, deny = false))
@@ -102,6 +123,10 @@ class DaemonProxyFirewallClientTest {
             replace.config.downstreamsList.single().ipv4AddressesList.single().toByteArray().toList())
         assertEquals(listOf<Byte>(0x02, 0, 0, 0, 0, 1),
             replace.config.allowedClientsList.single().mac.toByteArray().toList())
+    }
+
+    private fun client(rpc: FakeRpc) = DaemonProxyFirewallClient(rpc) {
+        config(generation = 1, deny = true)
     }
 
     private class FakeRpc(vararg acks: ProxyFirewallProto.ProxyFirewallAck) : ProxyFirewallRpc {
