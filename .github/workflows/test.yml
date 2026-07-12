@@ -26,7 +26,12 @@ jobs:
       - name: Apply Track C implementation
         if: github.event_name == 'pull_request' && github.actor != 'github-actions[bot]'
         run: |
-          python3 .github/scripts/apply_track_c.py
+          mkdir -p mobile/build/reports
+          if ! python3 .github/scripts/apply_track_c.py > mobile/build/reports/track-c-patch.log 2>&1; then
+            cat mobile/build/reports/track-c-patch.log
+            exit 1
+          fi
+          cat mobile/build/reports/track-c-patch.log
           git diff --check
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
