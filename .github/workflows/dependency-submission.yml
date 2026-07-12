@@ -2,6 +2,9 @@ name: Dependency Submission
 
 on:
   push:
+    branches:
+      - master
+      - agent/proxy-only-design
   workflow_dispatch:
 
 # Dependency snapshots are repository metadata. Keep write permission isolated
