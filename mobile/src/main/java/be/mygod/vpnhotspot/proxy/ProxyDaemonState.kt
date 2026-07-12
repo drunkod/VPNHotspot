@@ -95,6 +95,11 @@ class TrackingProxyFirewallRpc(
  * The same private tracker feeds both [firewallClient] and [desiredStates]. This prevents callers
  * from accidentally wiring the controller to one generation source while firewall acknowledgements
  * are validated against another.
+ *
+ * Call [bootstrap] before starting the controller and again after the root transport reconnects.
+ * Bootstrap uses the existing deny-first sanitation command, so identity becomes visible only after
+ * the daemon has proved containment. The controller deliberately performs its own sanitation gate
+ * afterward; the duplicate pre-runtime sanitation is idempotent and advances no active handle.
  */
 class ProxyDaemonComposition(
     rpc: ProxyFirewallRpc,
@@ -106,6 +111,16 @@ class ProxyDaemonComposition(
         rpc = TrackingProxyFirewallRpc(rpc, tracker),
         containmentConfig = containmentConfig,
     )
+
+    suspend fun bootstrap(): ProxyDaemonState {
+        val sanitation = firewallClient.cleanOrDenyBeforeRestart()
+        if (sanitation == null) tracker.disconnected()
+        return tracker.state.value
+    }
+
+    fun transportDisconnected() {
+        tracker.disconnected()
+    }
 
     fun desiredStates(source: Flow<DesiredProxyState>): Flow<DesiredProxyState> =
         source.withAcknowledgedDaemonState(tracker.state)
