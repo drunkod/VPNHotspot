@@ -8,6 +8,7 @@ mod neighbour;
 mod netlink;
 mod platform;
 mod process_io;
+mod proxy_firewall_kernel;
 mod report;
 mod routing;
 mod session;
