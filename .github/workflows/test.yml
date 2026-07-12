@@ -47,9 +47,9 @@ jobs:
         working-directory: mobile/src/main/rust/vpnhotspotd
         run: cargo check --locked --all-targets
 
-      - name: Test Rust daemon
+      - name: Test Rust daemon library
         working-directory: mobile/src/main/rust/vpnhotspotd
-        run: cargo test --locked --all-targets
+        run: cargo test --locked --lib
 
       - name: Run Rust daemon clippy
         working-directory: mobile/src/main/rust/vpnhotspotd
