@@ -286,6 +286,9 @@ fn validate_config(
     if require_deny_first && !config.allowed_clients.is_empty() {
         return Err("deny-first configuration must not contain allowed clients".to_owned());
     }
+    if require_deny_first && !config.allowed_clients.is_empty() {
+        return Err("deny-first configuration must not contain allowed clients".to_owned());
+    }
     if !config.deny_all_ipv6 {
         return Err("IPv6 allow mode is unsupported; deny_all_ipv6 must remain true".to_owned());
     }
@@ -574,6 +577,183 @@ mod tests {
             .await;
         assert_eq!(status(&newer), proxy_firewall_ack::Status::Ok);
         assert_eq!(firewall.kernel.calls, vec!["start", "replace"]);
+    }
+
+    #[tokio::test]
+    async fn start_rejects_clients_in_deny_first_config_without_kernel_change() {
+        let store = MemoryStore::default();
+        let mut firewall = ProxyFirewall::boot(&store, SpyKernel::default()).unwrap();
+        let identity = firewall.identity();
+        let mut invalid = config(1, false);
+        invalid.deny_all_ipv4 = true;
+        invalid.deny_all_ipv6 = true;
+        let ack = firewall
+            .handle(ProxyFirewallCommand {
+                kind: Some(proxy_firewall_command::Kind::Start(StartRequest {
+                    config: Some(invalid),
+                    expected_session_id: identity.session_id,
+                    expected_epoch: identity.epoch,
+                })),
+            })
+            .await;
+        assert_eq!(status(&ack), proxy_firewall_ack::Status::Invalid);
+        assert!(firewall.kernel.calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn second_start_is_rejected_without_second_kernel_mutation() {
+        let store = MemoryStore::default();
+        let mut firewall = ProxyFirewall::boot(&store, SpyKernel::default()).unwrap();
+        let identity = firewall.identity();
+        for expected in [proxy_firewall_ack::Status::Ok, proxy_firewall_ack::Status::Invalid] {
+            let ack = firewall
+                .handle(ProxyFirewallCommand {
+                    kind: Some(proxy_firewall_command::Kind::Start(StartRequest {
+                        config: Some(config(1, true)),
+                        expected_session_id: identity.session_id,
+                        expected_epoch: identity.epoch,
+                    })),
+                })
+                .await;
+            assert_eq!(status(&ack), expected);
+        }
+        assert_eq!(firewall.kernel.calls, vec!["start"]);
+    }
+
+    #[tokio::test]
+    async fn deny_clears_clients_and_sets_both_deny_flags() {
+        let store = MemoryStore::default();
+        let mut firewall = ProxyFirewall::boot(&store, SpyKernel::default()).unwrap();
+        let identity = firewall.identity();
+        let start = firewall
+            .handle(ProxyFirewallCommand {
+                kind: Some(proxy_firewall_command::Kind::Start(StartRequest {
+                    config: Some(config(1, true)),
+                    expected_session_id: identity.session_id,
+                    expected_epoch: identity.epoch,
+                })),
+            })
+            .await;
+        let handle = start.handle_id;
+        let replace = firewall
+            .handle(ProxyFirewallCommand {
+                kind: Some(proxy_firewall_command::Kind::Replace(ReplaceRequest {
+                    handle_id: handle,
+                    config: Some(config(2, false)),
+                    expected_session_id: identity.session_id,
+                    expected_epoch: identity.epoch,
+                })),
+            })
+            .await;
+        assert_eq!(status(&replace), proxy_firewall_ack::Status::Ok);
+        let deny = firewall
+            .handle(ProxyFirewallCommand {
+                kind: Some(proxy_firewall_command::Kind::Deny(DenyRequest {
+                    handle_id: handle,
+                    expected_session_id: identity.session_id,
+                    expected_epoch: identity.epoch,
+                })),
+            })
+            .await;
+        assert_eq!(status(&deny), proxy_firewall_ack::Status::Ok);
+        assert_eq!(firewall.kernel.calls, vec!["start", "replace", "deny"]);
+    }
+
+    #[tokio::test]
+    async fn stop_removes_handle_and_second_stop_is_rejected() {
+        let store = MemoryStore::default();
+        let mut firewall = ProxyFirewall::boot(&store, SpyKernel::default()).unwrap();
+        let identity = firewall.identity();
+        let start = firewall
+            .handle(ProxyFirewallCommand {
+                kind: Some(proxy_firewall_command::Kind::Start(StartRequest {
+                    config: Some(config(1, true)),
+                    expected_session_id: identity.session_id,
+                    expected_epoch: identity.epoch,
+                })),
+            })
+            .await;
+        let request = StopRequest {
+            handle_id: start.handle_id,
+            expected_session_id: identity.session_id,
+            expected_epoch: identity.epoch,
+        };
+        let first = firewall
+            .handle(ProxyFirewallCommand {
+                kind: Some(proxy_firewall_command::Kind::Stop(request.clone())),
+            })
+            .await;
+        let second = firewall
+            .handle(ProxyFirewallCommand {
+                kind: Some(proxy_firewall_command::Kind::Stop(request)),
+            })
+            .await;
+        assert_eq!(status(&first), proxy_firewall_ack::Status::Ok);
+        assert_eq!(status(&second), proxy_firewall_ack::Status::Invalid);
+        assert_eq!(firewall.kernel.calls, vec!["start", "stop"]);
+    }
+
+    #[tokio::test]
+    async fn failed_external_clean_preserves_epoch_and_runtime() {
+        let store = MemoryStore::default();
+        let mut firewall = ProxyFirewall::boot(&store, SpyKernel::default()).unwrap();
+        let identity = firewall.identity();
+        let start = firewall
+            .handle(ProxyFirewallCommand {
+                kind: Some(proxy_firewall_command::Kind::Start(StartRequest {
+                    config: Some(config(1, true)),
+                    expected_session_id: identity.session_id,
+                    expected_epoch: identity.epoch,
+                })),
+            })
+            .await;
+        let before = firewall.identity();
+        let error = firewall
+            .record_external_clean(|| async { Err(io::Error::other("routing clean failed")) })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(firewall.identity(), before);
+        let stop = firewall
+            .handle(ProxyFirewallCommand {
+                kind: Some(proxy_firewall_command::Kind::Stop(StopRequest {
+                    handle_id: start.handle_id,
+                    expected_session_id: identity.session_id,
+                    expected_epoch: identity.epoch,
+                })),
+            })
+            .await;
+        assert_eq!(status(&stop), proxy_firewall_ack::Status::Ok);
+        assert_eq!(firewall.kernel.calls, vec!["start", "stop"]);
+    }
+
+    #[tokio::test]
+    async fn successful_external_clean_advances_epoch_and_clears_runtime() {
+        let store = MemoryStore::default();
+        let mut firewall = ProxyFirewall::boot(&store, SpyKernel::default()).unwrap();
+        let identity = firewall.identity();
+        let start = firewall
+            .handle(ProxyFirewallCommand {
+                kind: Some(proxy_firewall_command::Kind::Start(StartRequest {
+                    config: Some(config(1, true)),
+                    expected_session_id: identity.session_id,
+                    expected_epoch: identity.epoch,
+                })),
+            })
+            .await;
+        firewall.record_external_clean(|| async { Ok(()) }).await.unwrap();
+        assert_eq!(firewall.identity().epoch, identity.epoch + 1);
+        let stale = firewall
+            .handle(ProxyFirewallCommand {
+                kind: Some(proxy_firewall_command::Kind::Stop(StopRequest {
+                    handle_id: start.handle_id,
+                    expected_session_id: identity.session_id,
+                    expected_epoch: identity.epoch,
+                })),
+            })
+            .await;
+        assert_eq!(status(&stale), proxy_firewall_ack::Status::StaleEpoch);
+        assert_eq!(firewall.kernel.calls, vec!["start"]);
     }
 
     #[tokio::test]
