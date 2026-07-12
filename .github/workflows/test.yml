@@ -27,11 +27,12 @@ jobs:
         if: github.event_name == 'pull_request' && github.actor != 'github-actions[bot]'
         run: |
           python3 .github/scripts/cleanup_proxy_review_fixes.py
+          sed -i 's/request\.clone()/request/' mobile/src/main/rust/vpnhotspotd/src/proxy_firewall/mod.rs
           git diff --check
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add mobile/src
-          git commit -m "Normalize proxy review fixes"
+          git commit -m "Fix final proxy review lint"
           git push origin HEAD:agent/proxy-only-design
 
       - name: Set up Java
