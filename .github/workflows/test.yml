@@ -24,7 +24,20 @@ jobs:
           fetch-depth: 0
 
       - name: Decode reviewed implementation
-        run: base64 --decode tools/apply_proxy_tracks_de.py.gz.b64 | gzip --decompress > "${RUNNER_TEMP}/apply_proxy_tracks_de.py"
+        env:
+          OUTPUT_PATH: ${{ runner.temp }}/apply_proxy_tracks_de.py
+        run: |
+          python - <<'PY'
+          import base64
+          import gzip
+          import os
+          from pathlib import Path
+
+          encoded = Path("tools/apply_proxy_tracks_de.py.gz.b64").read_text().strip()
+          print(f"encoded payload bytes: {len(encoded)}")
+          decoded = base64.b64decode(encoded, validate=True)
+          Path(os.environ["OUTPUT_PATH"]).write_bytes(gzip.decompress(decoded))
+          PY
 
       - name: Apply Tracks D and E plus Track C review fixes
         run: python "${RUNNER_TEMP}/apply_proxy_tracks_de.py"
