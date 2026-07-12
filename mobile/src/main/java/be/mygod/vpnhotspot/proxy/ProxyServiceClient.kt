@@ -58,14 +58,22 @@ data class ProxyFirewallHandle(val sessionId: Long, val epoch: Long, val id: Lon
  * Result of [ProxyFirewallClient.cleanOrDenyBeforeRestart].
  *
  * [sessionId] is an opaque daemon-session identity that must change on every
- * daemon process restart and never repeat within a lifetime. Using daemon
- * generation as the session ID is acceptable for Phase 0 scaffolding.
+ * daemon process restart and never repeat within a lifetime.
  *
  * [epoch] is the ledger epoch reset by this sanitation. Handles created by
  * [ProxyFirewallClient.start] after a successful sanitation carry the same
  * (sessionId, epoch) pair.
+ *
+ * [daemonGeneration] is the daemon's authoritative transport/boot generation
+ * from the same acknowledgement. The controller must compare it with the
+ * observed desired-state generation before committing sanitation; it must never
+ * substitute a locally inferred generation for this value.
  */
-data class SanitationResult(val sessionId: Long, val epoch: Long)
+data class SanitationResult(
+    val sessionId: Long,
+    val epoch: Long,
+    val daemonGeneration: Long,
+)
 
 // ---------------------------------------------------------------------------
 // Report types
@@ -175,7 +183,7 @@ interface ProxyBackend {
 
 // ---------------------------------------------------------------------------
 // ProxyFirewallClient interface
-// R3 fix #3: cleanOrDenyBeforeRestart returns Long? (daemon-issued epoch).
+// R3 fix #3: cleanOrDenyBeforeRestart returns daemon-issued sanitation identity.
 // ---------------------------------------------------------------------------
 
 data class ProxyFirewallConfig(
@@ -204,17 +212,19 @@ interface ProxyFirewallClient {
      * R3/R4/R7: perform idempotent proxy-chain sanitation and atomically reset
      * the daemon's generation ledger.
      *
-     * @return [SanitationResult] carrying the daemon-acknowledged session ID and
-     *   epoch. Returns `null` on failure; the controller treats null as a fatal
-     *   startup gate that prevents any new runtime from being started.
+     * @return [SanitationResult] carrying the daemon-acknowledged session ID,
+     *   epoch and authoritative daemon generation. Returns `null` on failure;
+     *   the controller treats null as a fatal startup gate that prevents any new
+     *   runtime from being started.
      *
      * The daemon atomically: (1) installs deny-all, (2) resets its ledger to
      * reject any command from prior sessions or epochs, and (3) returns the new
-     * (sessionId, epoch). Only a successful non-null return proves containment.
+     * identity. Only a successful non-null return proves containment.
      *
-     * The [SanitationResult.sessionId] must change on every daemon process restart
-     * and must never repeat, ensuring that handles from a prior daemon process
-     * cannot match a new session even if the epoch counter is reused.
+     * The [SanitationResult.sessionId] and [SanitationResult.daemonGeneration]
+     * must come from the same acknowledgement. The controller must reject a
+     * result whose daemon generation differs from the currently observed daemon
+     * generation instead of committing two independent clocks.
      */
     suspend fun cleanOrDenyBeforeRestart(): SanitationResult?
 }
