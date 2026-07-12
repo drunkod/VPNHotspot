@@ -37,9 +37,9 @@ class DaemonProxyFirewallClientTest {
         assertEquals(0, sanitize.containmentConfig.allowedClientsCount)
 
         val start = rpc.commands.single { it.hasStart() }.start
-        assertEquals(11, start.expectedSessionId)
-        assertEquals(4, start.expectedEpoch)
-        assertEquals(5, start.config.generation)
+        assertEquals(11L, start.expectedSessionId)
+        assertEquals(4L, start.expectedEpoch)
+        assertEquals(5L, start.config.generation)
         assertTrue(start.config.denyAllIpv4)
         assertTrue(start.config.denyAllIpv6)
     }
@@ -63,11 +63,11 @@ class DaemonProxyFirewallClientTest {
         assertEquals("deny_stale", report.failures.single().step)
         val failure = report.failures.single().cause as? StaleProxyFirewallTokenException
         assertNotNull(failure)
-        assertEquals(12, failure!!.identity?.sessionId)
+        assertEquals(12L, failure!!.identity?.sessionId)
         val deny = rpc.commands.single().deny
-        assertEquals(99, deny.handleId)
-        assertEquals(11, deny.expectedSessionId)
-        assertEquals(4, deny.expectedEpoch)
+        assertEquals(99L, deny.handleId)
+        assertEquals(11L, deny.expectedSessionId)
+        assertEquals(4L, deny.expectedEpoch)
     }
 
     @Test
