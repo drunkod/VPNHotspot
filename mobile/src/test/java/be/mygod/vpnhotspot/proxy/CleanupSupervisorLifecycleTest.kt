@@ -1,7 +1,8 @@
 package be.mygod.vpnhotspot.proxy
 
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
@@ -14,7 +15,7 @@ import org.junit.Test
 class CleanupSupervisorLifecycleTest {
     @Test
     fun retryRunsAfterControllerWorkerScopeCancelled() = runBlocking {
-        ControllerHarness(cleanupDelayMillis = { 250L }).use { harness ->
+        ControllerHarness(cleanupDelayMillis = { 1_000L }).use { harness ->
             harness.service.stopBackendResult = CleanupReport.failure(
                 "backend_stop",
                 RuntimeException("terminal stop failed once"),
@@ -32,20 +33,27 @@ class CleanupSupervisorLifecycleTest {
                 serviceActivated = true,
             )
 
-            val worker = harness.controller.start(emptyFlow())
+            val worker = harness.controller.start(flow<DesiredProxyState> { awaitCancellation() })
             harness.cancelWorker()
             worker.join()
 
+            val featureStopsAtWorkerExit = harness.service.calls.count { it == "stopFeature" }
             assertEquals(1, harness.service.calls.count { it == "stopBackend(41)" })
+            assertEquals(0, featureStopsAtWorkerExit)
             assertNotNull(harness.controller.cleanupDebtForTrackATest())
 
-            harness.service.stopBackendResult = CleanupReport.empty()
-            withTimeout(2_000L) {
-                while (harness.controller.cleanupDebtForTrackATest() != null) delay(10L)
+            withTimeout(3_000L) {
+                while (
+                    harness.service.calls.count { it == "stopFeature" } == featureStopsAtWorkerExit ||
+                    harness.controller.cleanupDebtForTrackATest() != null
+                ) delay(10L)
             }
 
-            assertEquals(2, harness.service.calls.count { it == "stopBackend(41)" })
-            assertTrue(harness.service.calls.contains("stopFeature"))
+            assertEquals(
+                featureStopsAtWorkerExit + 1,
+                harness.service.calls.count { it == "stopFeature" },
+            )
+            assertNull(harness.controller.cleanupDebtForTrackATest())
             assertTrue(harness.cleanupOwner.cleanupSupervisor.isActive)
         }
     }
