@@ -4,11 +4,12 @@ Single source of truth for what is **done**, **in progress**, and **not started*
 in the proxy-only Phase 0 spike. Supersedes the scattered status notes across the
 13 implementation-review rounds.
 
-- Latest reviewed controller source: `e2492a5e3838013b089600f7b9631f9f6be01cee`
+- Latest verified controller source: `6f80321f1a0134f67e8982a611126aa2bb793db8`
 - Latest review document commit: `8189193a0b640d6ab3ee5649be605c8bb22870ce` (round 13)
 - Track B verified clean implementation head: `e2492a5e3838013b089600f7b9631f9f6be01cee`
+- Track C verified clean implementation head: `6f80321f1a0134f67e8982a611126aa2bb793db8`
 - Branch: `agent/proxy-only-design`
-- PR state: **draft** (correctly held; Tracks C–E and production service/backend integration remain)
+- PR state: **draft** (correctly held; Tracks D–E and production service/backend integration remain)
 
 ## Legend
 
@@ -21,8 +22,9 @@ in the proxy-only Phase 0 spike. Supersedes the scattered status notes across th
 
 | Area | File(s) | State |
 | --- | --- | --- |
-| Controller reconciliation + cleanup-debt loop | `proxy/ProxyOnlyController.kt` | 🟡 through R13; concrete supervisor remains Track C |
-| Itemized cleanup debt model | `proxy/CleanupDebt.kt` | 🟡 logic complete, history unbounded (Track D) |
+| Controller reconciliation + cleanup-debt loop | `proxy/ProxyOnlyController.kt` | ✅ service-owned retries and authoritative debt activation through Track C |
+| Cleanup retry supervisor + Phase-0 owner | `proxy/ProxyCleanupSupervisor.kt`, `proxy/ProxyService.kt` | ✅ named owner, worker-independent scope, explicit shutdown |
+| Itemized cleanup debt model | `proxy/CleanupDebt.kt` | 🟡 logic complete, ordinary failure history unbounded (Track D) |
 | Domain models + normalization | `proxy/ProxyModels.kt` | 🟡 works; silent drops, no diagnostics (Track E) |
 | Service/firewall client interfaces | `proxy/ProxyServiceClient.kt` | ✅ interfaces defined; authoritative sanitation generation carried |
 | VPN selector | `proxy/ProxyVpnSelector.kt` | 🟡 selection logic present |
@@ -30,9 +32,9 @@ in the proxy-only Phase 0 spike. Supersedes the scattered status notes across th
 | Proxy firewall wire protocol | `mobile/src/main/proto/proxy_firewall.proto`, `daemon.proto` | ✅ command envelope, authoritative identity and typed acks |
 | Rust daemon proxy firewall | `rust/vpnhotspotd/src/proxy_firewall/`, `proxy_firewall_kernel.rs` | ✅ enforced token boundary, ledger, persistent session store and iptables backend |
 | Kotlin daemon firewall adapter | `proxy/DaemonProxyFirewallClient.kt` | ✅ Wire mapping, transport-failure null gate and generation cross-check |
-| Proxy controller/protocol tests | `mobile/src/test/java/be/mygod/vpnhotspot/proxy/` | ✅ Tracks A/B plus R13 mismatch/transport regressions |
+| Proxy controller/protocol tests | `mobile/src/test/java/be/mygod/vpnhotspot/proxy/` | ✅ Tracks A–C plus R13 mismatch/transport regressions |
 | Dependency graph submission/review | `.github/workflows/` | ✅ submission and moderate-severity review green |
-| **ProxyService (foreground service)** | — | ⬜ not implemented |
+| **Production ProxyService foreground service** | — | ⬜ not implemented; Phase-0 cleanup owner is not the Android FGS |
 | **Hev backend / native hook integration** | — | ⬜ no pinned backend/JNI production integration |
 
 ## Track A result — complete
@@ -68,8 +70,27 @@ closed the remaining reviewed seams:
 
 The concrete foreground-service implementation that supplies the RPC transport,
 containment configuration and health observation remains production integration. The
-controller now rejects a health-generation value that disagrees with the same daemon's
+controller rejects a health-generation value that disagrees with the same daemon's
 acknowledgement instead of silently accepting two clocks.
+
+## Track C result — complete
+
+Track C replaces the raw cleanup-scope lifetime promise with an owned lifecycle object:
+
+- `ProxyCleanupSupervisor` owns a `SupervisorJob` retry scope and exposes idempotent final shutdown;
+- `ProxyServiceCleanupOwner` is the named Phase-0 service/application owner and the only shutdown site;
+- `ProxyOnlyController` no longer accepts `cleanupScope: CoroutineScope`;
+- cleanup retries run in the service-owned scope and survive controller-worker cancellation;
+- retries are deduplicated by debt generation and stop after supervisor shutdown;
+- inactive-supervisor scheduling retains and reports debt instead of silently losing it;
+- service retry eligibility comes from immutable `CleanupDebt.serviceWasActivated`;
+- non-activated service/listener debt resolves as void without IPC rather than stranding;
+- activated debt performs backend/listener/feature teardown despite controller-local state drift;
+- lifecycle tests cover worker cancellation, owner shutdown and both activation-state cases;
+- Rust check/tests/clippy/audit, Android `assembleDebug check`, release R8 verification and Dependency Review passed on `6f80321f` under the restored normal workflow.
+
+The Phase-0 owner proves lifecycle and retry semantics but is not the production Android
+foreground service. Concrete RPC/health composition remains production integration.
 
 ## Track F result — complete
 
@@ -86,7 +107,7 @@ suppression was added.
 | Real Android binding through selected VPN | ⬜ | Phase 1/backend |
 | Zero/one/multiple VPN behavior | 🟡 selector + focused controller coverage | integration tests |
 | Per-app VPN include/exclude behavior | 🟡 | integration tests |
-| Activation-grant + process-restart behavior | 🟡 controller path | C / integration tests |
+| Activation-grant + process-restart behavior | 🟡 controller and cleanup-owner paths | production integration tests |
 | Typed, config-aware TCP/UDP/DNS/readiness probes | 🟡 | backend integration tests |
 | UDP topology + safe firewall return-policy evidence | ⬜ | Phase 0.5 |
 | Bounded VPN-aware DNS under blackhole | ⬜ | Phase 0.6 |
@@ -95,35 +116,34 @@ suppression was added.
 | Authoritative sanitation generation agreement | ✅ controller fail-closed cross-checks | A, B |
 | Crash-persistent unique daemon session identity | ✅ serial + thread + process tests | B |
 | Itemized cleanup debt + partial resolution | ✅ focused Track A tests | A, D |
-| Self-triggered backoff retry, quiescent external state | 🟡 concrete supervisor remains | C |
+| Service-owned self-triggered cleanup retry | ✅ lifecycle tests across worker cancellation/shutdown | C |
 | No restart over unresolved firewall debt | ✅ focused generation/race tests | A, B |
 | Repeated start/stop without FD/thread leaks | ⬜ | backend/service integration |
 
-## Open blockers after Tracks A, B and F
+## Open blockers after Tracks A, B, C and F
 
 | # | Blocker | Track | Priority |
 | --- | --- | --- | --- |
-| 1 | `cleanupScope` is an abstract lifetime contract, not a real service-owned supervisor | **C** | P1 |
-| 2 | `mergeUnresolved()` ordinary failure history can grow without bound | **D** | P1 |
-| 3 | Normalization silently drops records and downstream IPv4 selection is order-dependent | **E** | P2 |
-| 4 | Foreground service, real RPC/health composition, Hev backend/JNI and device verification are absent | production phases | P0 before release |
+| 1 | `mergeUnresolved()` ordinary failure history can grow without bound | **D** | P1 |
+| 2 | Normalization silently drops records and downstream IPv4 selection is order-dependent | **E** | P2 |
+| 3 | Production foreground service, concrete RPC/health composition, Hev backend/JNI and device verification are absent | production phases | P0 before release |
 
 ## Recommended sequencing
 
-1. Implement **Track C** so cleanup ownership survives controller worker cancellation and the concrete service supplies RPC plus authoritative daemon health identity.
-2. Implement **Track D** and **Track E** in parallel under Track A regression coverage.
-3. Build the real foreground service/backend integration, then run physical-device verification.
+1. Implement **Track D** and **Track E** under the existing Tracks A–C regression coverage.
+2. Build the production foreground service, RPC/health composition and backend integration.
+3. Run UDP/DNS evidence and physical-device start/stop/restart/leak verification.
 
 ## Track index
 
 - ✅ [Track A — generation/session/epoch matrix tests](TRACK-A-generation-matrix-tests.md)
 - ✅ [Track B — daemon protocol enforcement](TRACK-B-daemon-protocol-enforcement.md)
-- ⬜ [Track C — service-owned cleanup supervisor](TRACK-C-cleanup-supervisor.md)
+- ✅ [Track C — service-owned cleanup supervisor](TRACK-C-cleanup-supervisor.md)
 - ⬜ [Track D — bounded failure history](TRACK-D-bounded-failure-history.md)
 - ⬜ [Track E — normalization diagnostics + deterministic selection](TRACK-E-normalization-diagnostics.md)
 - ✅ [Track F — Dependency Review CI fix](TRACK-F-dependency-review-ci.md)
 
 ## Definition of done for Phase 0 sign-off
 
-Tracks C, D and E must complete with tests green, followed by concrete service/backend
+Tracks D and E must complete with tests green, followed by concrete service/backend
 composition and the remaining Phase 0 evidence rows. Only then should the PR leave draft.
