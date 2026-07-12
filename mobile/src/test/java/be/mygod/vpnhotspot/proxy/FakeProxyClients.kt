@@ -6,6 +6,7 @@ import java.lang.reflect.InvocationTargetException
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.Continuation
+import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED
 import kotlin.coroutines.intrinsics.suspendCoroutineUninterceptedOrReturn
 import kotlinx.coroutines.CoroutineScope
@@ -138,11 +139,14 @@ internal class RecordingErrorReporter : ProxyErrorReporter {
 internal class ControllerHarness(
     val firewall: FakeFirewallClient = FakeFirewallClient(),
     val service: FakeServiceClient = FakeServiceClient(),
+    cleanupDelayMillis: (Int) -> Long = ::cleanupBackoff,
 ) : Closeable {
     private val workerJob = SupervisorJob()
-    private val cleanupJob = SupervisorJob()
     private val workerScope = CoroutineScope(workerJob + Dispatchers.Unconfined)
-    private val cleanupScope = CoroutineScope(cleanupJob + Dispatchers.Unconfined)
+    val cleanupOwner = ProxyServiceCleanupOwner(
+        parent = EmptyCoroutineContext,
+        dispatcher = Dispatchers.Unconfined,
+    )
 
     val stateSink = RecordingStateSink()
     val reporter = RecordingErrorReporter()
@@ -159,12 +163,17 @@ internal class ControllerHarness(
         stateSink = stateSink,
         reporter = reporter,
         scope = workerScope,
-        cleanupScope = cleanupScope,
+        cleanupSupervisor = cleanupOwner.cleanupSupervisor,
+        cleanupDelayMillis = cleanupDelayMillis,
     )
+
+    fun cancelWorker() {
+        workerScope.cancel()
+    }
 
     override fun close() {
         workerScope.cancel()
-        cleanupScope.cancel()
+        cleanupOwner.close()
     }
 }
 
@@ -258,6 +267,18 @@ internal suspend fun ProxyOnlyController.retryCleanupDebtForTrackATest() {
 
 internal suspend fun ProxyOnlyController.reconcileForTrackATest(state: DesiredProxyState) {
     invokePrivateSuspend<Unit>("reconcile", state)
+}
+
+internal fun ProxyOnlyController.scheduleDebtRetryForTrackCTest(debt: CleanupDebt) {
+    val method = javaClass.declaredMethods.singleOrNull { candidate ->
+        candidate.name == "scheduleDebtRetry" && candidate.parameterCount == 1
+    } ?: error("No method 'scheduleDebtRetry' with one argument on ${javaClass.name}")
+    method.isAccessible = true
+    try {
+        method.invoke(this, debt)
+    } catch (failure: InvocationTargetException) {
+        throw failure.targetException
+    }
 }
 
 private fun Any.findPrivateField(name: String): Field {

@@ -5,6 +5,7 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.Continuation
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -15,8 +16,9 @@ import org.junit.Test
  * latestSnapshot, sanitizedDaemonGeneration, sanitizedSessionId, sanitizedEpoch,
  * firewallGeneration, applied, cleanupDebt, serviceActivated, nextDebtGeneration.
  *
- * It also invokes these private suspend methods:
- * cleanupApplied(reason, daemonAvailable), retryCleanupDebtSafely(), reconcile(state).
+ * It also invokes these private methods:
+ * cleanupApplied(reason, daemonAvailable), retryCleanupDebtSafely(), reconcile(state),
+ * and scheduleDebtRetry(debt).
  *
  * fakeVpnUpstream() allocates ProxyVpnUpstream without an Android Network constructor
  * and writes the private handle and interfaces fields. Tracks C–E must update this
@@ -34,15 +36,30 @@ class ControllerHarnessContractTest {
             "applied",
             "cleanupDebt",
             "serviceActivated",
+            "scheduledRetryGeneration",
             "nextDebtGeneration",
         )
         fields.forEach { name ->
             assertNotNull("missing ProxyOnlyController field '$name'", ProxyOnlyController::class.java.findField(name))
         }
+        assertNotNull(
+            "missing concrete cleanup supervisor field",
+            ProxyOnlyController::class.java.findField("cleanupSupervisor"),
+        )
+        assertNull(
+            "raw cleanupScope contract must be removed",
+            ProxyOnlyController::class.java.findField("cleanupScope"),
+        )
 
         assertSuspendMethod("cleanupApplied", argumentCount = 2)
         assertSuspendMethod("retryCleanupDebtSafely", argumentCount = 0)
         assertSuspendMethod("reconcile", argumentCount = 1)
+        assertTrue(
+            "missing private scheduleDebtRetry(debt)",
+            ProxyOnlyController::class.java.declaredMethods.any { method ->
+                method.name == "scheduleDebtRetry" && method.parameterCount == 1
+            },
+        )
     }
 
     @Test

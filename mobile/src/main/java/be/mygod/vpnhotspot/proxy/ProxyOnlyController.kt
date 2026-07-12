@@ -74,15 +74,8 @@ class ProxyOnlyController(
     private val stateSink: ProxyStateSink,
     private val reporter: ProxyErrorReporter,
     private val scope: CoroutineScope,
-    /**
-     * Cleanup retry jobs execute directly in this scope under [stateMutex].
-     *
-     * Contract: this scope MUST outlive [scope] (the worker coroutine scope).
-     * Typically provided by the foreground service or application lifecycle so
-     * that terminal cleanup debt can be retried after the controller worker exits.
-     * The owner is responsible for cancelling this scope during final teardown.
-     */
-    private val cleanupScope: CoroutineScope,
+    private val cleanupSupervisor: ProxyCleanupSupervisor,
+    private val cleanupDelayMillis: (Int) -> Long = ::cleanupBackoff,
 ) {
     // -----------------------------------------------------------------------
     // Mutable state — all accessed only under stateMutex.
@@ -125,6 +118,7 @@ class ProxyOnlyController(
     private var applied: AppliedProxyState? = null
     private var cleanupDebt: CleanupDebt? = null
     private var retryJob: Job? = null
+    private var scheduledRetryGeneration: Long? = null
     private var nextDebtGeneration = 1L
 
     // -----------------------------------------------------------------------
@@ -146,6 +140,8 @@ class ProxyOnlyController(
         } finally {
             collector.cancel()
             retryJob?.cancel()
+            retryJob = null
+            scheduledRetryGeneration = null
             withContext(NonCancellable) {
                 stateMutex.withLock {
                     terminalStopSafely("controller worker terminated")
@@ -724,10 +720,18 @@ class ProxyOnlyController(
             }
         }
 
+        // Track C: retry eligibility belongs to the immutable debt snapshot, not
+        // mutable controller-local activation state that may drift after worker exit.
+        val serviceIpcValid = debt.serviceWasActivated
         var serviceHandle = debt.serviceHandlePending
         var listenerPending = debt.listenerClosePending
 
-        if (serviceHandle != null && newServiceActivated) {
+        if (!serviceIpcValid) {
+            // No foreground-service activation existed for this debt. Service-side
+            // resources are therefore void rather than retriable forever.
+            serviceHandle = null
+            listenerPending = false
+        } else if (serviceHandle != null) {
             if (attempt("backend_stop") { service.stopBackend(serviceHandle!!) }) {
                 serviceHandle = null
                 listenerPending = false
@@ -735,8 +739,12 @@ class ProxyOnlyController(
         }
 
         var emergencyOutcomeDebt: CleanupDebt? = null
-        if (listenerPending && newServiceActivated) {
-            val outcome = safeEmergencyClose("cleanup debt retry")
+        if (listenerPending && serviceIpcValid) {
+            val outcome = safeEmergencyClose(
+                reason = "cleanup debt retry",
+                serviceWasActivated = serviceIpcValid,
+                serviceHandle = serviceHandle,
+            )
             if (!outcome.report.hasCriticalFailure) listenerPending = false
             emergencyOutcomeDebt = outcome.debt
         }
@@ -826,14 +834,15 @@ class ProxyOnlyController(
         }
 
         var featureStopPending = debt.featureStopPending
-        // R9 blocker #1 / R10 blocker #1:
+        if (!serviceIpcValid) featureStopPending = false
+        // R9 blocker #1 / R10 blocker #1 / Track C:
         // feature_stop is allowed whenever serviceHandlePending is null; ProxyService
         // .stopFeature() uses its own internal backend handle authoritatively.
         // R10: on successful feature_stop, authoritative teardown dominates all earlier
         // emergency service/listener debt from this transaction — emergencyOutcomeDebt is
         // discarded so stale handles and listener flags are not reintroduced by the later
         // merge. A failed feature_stop retains emergencyOutcomeDebt for further retry.
-        if (featureStopPending && newServiceActivated && serviceHandle == null) {
+        if (featureStopPending && serviceIpcValid && serviceHandle == null) {
             if (attempt("feature_stop") { service.stopFeature("cleanup debt retry") }) {
                 featureStopPending = false
                 listenerPending = false
@@ -880,12 +889,30 @@ class ProxyOnlyController(
     // -----------------------------------------------------------------------
 
     private fun scheduleDebtRetry(debt: CleanupDebt) {
+        if (!cleanupSupervisor.isActive) {
+            retryJob?.cancel()
+            retryJob = null
+            scheduledRetryGeneration = null
+            safeReport(
+                "proxy.cleanup_supervisor.inactive",
+                IllegalStateException(
+                    "cleanup supervisor inactive; debt generation ${debt.generation} retained"
+                ),
+                debt.failures,
+            )
+            return
+        }
+        if (retryJob?.isActive == true && scheduledRetryGeneration == debt.generation) return
+
         retryJob?.cancel()
-        retryJob = cleanupScope.launch {
-            delay(cleanupBackoff(debt.attempt))
+        scheduledRetryGeneration = debt.generation
+        retryJob = cleanupSupervisor.retryScope.launch {
             try {
+                delay(cleanupDelayMillis(debt.attempt))
                 stateMutex.withLock {
+                    if (scheduledRetryGeneration != debt.generation) return@withLock
                     retryJob = null
+                    scheduledRetryGeneration = null
                     try {
                         retryCleanupDebtSafely()
                         val unresolved = cleanupDebt
@@ -923,6 +950,7 @@ class ProxyOnlyController(
         cleanupDebt = merged.copy(generation = nextDebtGeneration++, attempt = 0)
         retryJob?.cancel()
         retryJob = null
+        scheduledRetryGeneration = null
     }
 
     // -----------------------------------------------------------------------
@@ -1021,7 +1049,11 @@ class ProxyOnlyController(
     // Helpers
     // -----------------------------------------------------------------------
 
-    private suspend fun safeEmergencyClose(reason: String): CleanupOutcome {
+    private suspend fun safeEmergencyClose(
+        reason: String,
+        serviceWasActivated: Boolean = serviceActivated,
+        serviceHandle: ProxyServiceHandle? = applied?.service,
+    ): CleanupOutcome {
         return try {
             withTimeoutOrNull(CLEANUP_STEP_TIMEOUT_MS) {
                 service.emergencyCloseListener(reason)
@@ -1032,10 +1064,10 @@ class ProxyOnlyController(
                     CleanupReport(listOf(f)),
                     CleanupDebt(
                         listenerClosePending = true,
-                        serviceHandlePending = applied?.service,
+                        serviceHandlePending = serviceHandle,
                         firewallHandlePending = null, firewallDenyPending = false,
                         firewallStopPending = false, daemonCleanPending = false,
-                        featureStopPending = false, serviceWasActivated = serviceActivated,
+                        featureStopPending = false, serviceWasActivated = serviceWasActivated,
                         failures = listOf(f), generation = nextDebtGeneration++, attempt = 0,
                     )
                 )
@@ -1048,10 +1080,10 @@ class ProxyOnlyController(
                 CleanupReport(listOf(f)),
                 CleanupDebt(
                     listenerClosePending = true,
-                    serviceHandlePending = applied?.service,
+                    serviceHandlePending = serviceHandle,
                     firewallHandlePending = null, firewallDenyPending = false,
                     firewallStopPending = false, daemonCleanPending = false,
-                    featureStopPending = false, serviceWasActivated = serviceActivated,
+                    featureStopPending = false, serviceWasActivated = serviceWasActivated,
                     failures = listOf(f), generation = nextDebtGeneration++, attempt = 0,
                 )
             )
