@@ -1,232 +1,112 @@
 # Track C — service-owned cleanup supervisor + authoritative service state
 
-**Goal:** replace the abstract `cleanupScope` lifetime *contract* with a concrete,
-service-owned supervisor that provably outlives the controller worker, survives the
-recovery window, and is cancelled at final teardown. Make `serviceWasActivated`
-authoritative retry state instead of relying on the mutable controller-local
-`serviceActivated`.
+Status: **complete and verified**
 
-Today `ProxyOnlyController` takes `cleanupScope: CoroutineScope` as a constructor arg
-with only a kdoc promise ("MUST outlive [scope]"). Nothing proves an owner exists, and
-`CleanupDebt.serviceWasActivated` is carried but not used as the source of truth for
-retry eligibility — process/service state drift can strand service debt.
+Verified clean source head: `6f80321f1a0134f67e8982a611126aa2bb793db8`
 
-**Blocker refs:** R10 §5 (persistent cleanup ownership), R11 audit row "Persistent
-cleanup ownership — Not fixed", R12 audit row "Persistent cleanup owner — Not fixed".
+## Goal
 
-**Files touched:**
+Replace the abstract `cleanupScope: CoroutineScope` lifetime promise with a named,
+owned cleanup supervisor that outlives controller workers and has one explicit final
+shutdown path. Make `CleanupDebt.serviceWasActivated` the authoritative source for
+service-IPC retry eligibility so mutable controller-local state drift cannot strand debt
+or authorize an old debt incorrectly.
 
-```text
-mobile/src/main/java/be/mygod/vpnhotspot/proxy/ProxyCleanupSupervisor.kt   (new)
-mobile/src/main/java/be/mygod/vpnhotspot/proxy/ProxyService.kt             (owner; may be stubbed for Phase 0)
-mobile/src/main/java/be/mygod/vpnhotspot/proxy/ProxyOnlyController.kt      (consume supervisor + authoritative state)
-mobile/src/test/java/be/mygod/vpnhotspot/proxy/CleanupSupervisorLifecycleTest.kt (new)
-```
+## Delivered implementation
 
-> For Phase 0 (fakes, no real FGS yet) the "owner" can be a test/application-scoped
-> holder. The point is that the supervisor is a *named, owned object with an explicit
-> lifecycle*, not an opaque scope handed in from nowhere.
+### Concrete cleanup supervisor
 
----
+`ProxyCleanupSupervisor` owns a `SupervisorJob` and retry `CoroutineScope`. Controllers
+can launch retry work through `retryScope`, but only the lifecycle owner can call the
+idempotent `shutdown(reason)` method. `isActive` checks both the explicit lifecycle bit
+and the job state.
 
-## Step C1 — the supervisor abstraction
+A failed retry cannot cancel sibling work because the scope is backed by
+`SupervisorJob`.
 
-```kotlin
-package be.mygod.vpnhotspot.proxy
+### Named Phase-0 owner
 
-import kotlinx.coroutines.*
+`ProxyServiceCleanupOwner` is the Phase-0 service/application lifecycle holder. It owns
+one `ProxyCleanupSupervisor` and exposes one authoritative teardown site through
+`close()`. The production Android foreground service will own this holder for its full
+lifecycle; Track C does not claim that the real foreground service or RPC transport is
+implemented.
 
-/**
- * Owns the coroutine scope in which terminal cleanup-debt retries execute.
- *
- * Lifecycle contract, now enforced by construction rather than by kdoc:
- *   - created by and tied to the foreground-service (or application) lifecycle;
- *   - guaranteed to outlive any controller worker scope it hands out;
- *   - cancelled exactly once, at authoritative final teardown, via [shutdown].
- *
- * The controller NEVER constructs this; it receives one and may only launch
- * retry work through [retryScope].
- */
-class ProxyCleanupSupervisor private constructor(
-    private val supervisorJob: CompletableJob,
-    val retryScope: CoroutineScope,
-) {
-    private val active = java.util.concurrent.atomic.AtomicBoolean(true)
+### Controller ownership contract
 
-    val isActive: Boolean get() = active.get()
+`ProxyOnlyController` no longer accepts a raw `cleanupScope`. It receives a
+`ProxyCleanupSupervisor` and routes every cleanup-debt retry through the supervisor's
+scope.
 
-    /** Cancel all in-flight retries; idempotent. Only the owner may call this. */
-    fun shutdown(reason: String) {
-        if (active.compareAndSet(true, false)) {
-            supervisorJob.cancel(CancellationException("cleanup supervisor shutdown: $reason"))
-        }
-    }
+The retry scheduler now:
 
-    companion object {
-        fun create(
-            parent: CoroutineContext,
-            dispatcher: CoroutineDispatcher = Dispatchers.Default,
-            name: String = "proxy-cleanup",
-        ): ProxyCleanupSupervisor {
-            val job = SupervisorJob(parent[Job])
-            val scope = CoroutineScope(parent + job + dispatcher + CoroutineName(name))
-            return ProxyCleanupSupervisor(job, scope)
-        }
-    }
-}
-```
+- refuses to schedule after supervisor shutdown while retaining and reporting debt;
+- deduplicates an already-active retry for the same debt generation;
+- cancels superseded retry generations;
+- clears its scheduled-generation marker atomically under the controller mutex;
+- continues retrying terminal debt after the controller worker scope is cancelled.
 
-`SupervisorJob` ensures a single failed retry does not cancel sibling retries; the
-owner's `shutdown()` is the only path that tears it down.
+The worker's final block cancels only its currently scheduled retry before performing
+terminal cleanup. Any debt produced by that terminal cleanup is rescheduled into the
+service-owned supervisor, not the dying worker scope.
 
----
+### Authoritative service retry state
 
-## Step C2 — the owner (ProxyService, or Phase-0 application holder)
+`retryCleanupDebtSafely()` now derives service-IPC eligibility from the immutable
+`debt.serviceWasActivated` value captured when the debt was created.
 
-```kotlin
-// ProxyService.kt (real owner once the FGS exists)
-class ProxyService : Service() {
-    // Tied to the service lifecycle; outlives every controller worker.
-    private val cleanupSupervisor =
-        ProxyCleanupSupervisor.create(parent = lifecycleScope.coroutineContext)
+- When `serviceWasActivated == true`, pending backend/listener/feature teardown IPC is
+  attempted even if mutable controller-local `serviceActivated` has drifted to false.
+- When `serviceWasActivated == false`, service/listener/feature items are treated as
+  void and cleared without IPC instead of becoming permanently retriable debt.
+- A newer controller-local activation is not overwritten merely because an older,
+  non-activated debt resolves as void.
+- Emergency-close debt records the activation and service-handle values from the debt
+  retry transaction rather than re-reading unrelated mutable controller state.
 
-    fun newController(): ProxyOnlyController = ProxyOnlyController(
-        // ... existing deps ...
-        cleanupSupervisor = cleanupSupervisor,
-    )
+## Regression coverage
 
-    override fun onDestroy() {
-        // Authoritative final teardown: the ONE place the supervisor is cancelled.
-        cleanupSupervisor.shutdown("service destroyed")
-        super.onDestroy()
-    }
-}
-```
+`CleanupSupervisorLifecycleTest` verifies:
 
-For Phase 0 tests, an `ApplicationCleanupOwner` (or the test itself) plays this role —
-what matters is that a distinct object owns creation and `shutdown()`.
+1. a cleanup retry executes after the controller worker scope is cancelled;
+2. owner shutdown cancels an in-flight delayed retry;
+3. service debt captured with `serviceWasActivated=false` clears without service IPC;
+4. service debt captured with `serviceWasActivated=true` performs backend and feature
+   teardown despite controller-local activation drift.
 
----
+`ControllerHarnessContractTest` additionally asserts that the raw `cleanupScope` field
+is absent and the concrete supervisor/scheduler contract remains present. The shared
+controller harness now owns a `ProxyServiceCleanupOwner` and closes it explicitly.
 
-## Step C3 — controller consumes the supervisor, not a raw scope
+## Verification
 
-Replace the `cleanupScope: CoroutineScope` constructor param with the supervisor and
-route retry launches through it:
+The restored normal CI workflow passed on the exact clean source head:
 
-```kotlin
-class ProxyOnlyController(
-    // ...
-    private val cleanupSupervisor: ProxyCleanupSupervisor,
-) {
-    private fun scheduleDebtRetry(debt: CleanupDebt) {
-        if (!cleanupSupervisor.isActive) {
-            reporter.report("cleanup supervisor inactive; debt retained but not scheduled", debt)
-            return
-        }
-        if (retryJob?.isActive == true && scheduledRetryGeneration == debt.generation) return
-        retryJob?.cancel()
-        scheduledRetryGeneration = debt.generation
-        retryJob = cleanupSupervisor.retryScope.launch {
-            delay(cleanupBackoff(debt.attempt))
-            events.send(ControllerEvent.RetryCleanupDebt(debt.generation))
-        }
-    }
-}
-```
+- `cargo check --locked --all-targets`;
+- `cargo test --locked --lib`;
+- `cargo clippy --locked --all-targets -- -D warnings`;
+- `cargo audit`;
+- `./gradlew assembleDebug check --no-daemon`;
+- `./gradlew :mobile:verifyReleaseCoroutineDebugR8 --no-daemon`;
+- Dependency Review with `fail-on-severity: moderate`.
 
-Because `retryScope` is owned by the service, terminal debt keeps retrying after the
-controller worker's own `scope` is cancelled — which is the whole reason the two scopes
-were separated.
+Temporary patch machinery and elevated workflow permissions were removed before this
+verification.
 
----
+## Acceptance criteria audit
 
-## Step C4 — make `serviceWasActivated` authoritative
+- ✅ `cleanupScope: CoroutineScope` constructor parameter removed.
+- ✅ Concrete `ProxyCleanupSupervisor` and named lifecycle owner added.
+- ✅ Terminal retries survive worker cancellation.
+- ✅ Owner shutdown cancels pending retries and prevents rescheduling.
+- ✅ Service IPC eligibility is driven by `CleanupDebt.serviceWasActivated`.
+- ✅ False-activation service/listener debt resolves as void instead of stranding.
+- ✅ New lifecycle tests and the existing suite pass.
 
-`CleanupDebt.serviceWasActivated` already exists (`CleanupDebt.kt` line 85) but retry
-eligibility currently reads the mutable `serviceActivated` field. Decide service-IPC
-eligibility from the **debt's own captured flag**, so a retry running after worker exit
-(or across process/service drift) still knows service IPC is valid.
+## Remaining integration boundary
 
-```kotlin
-private suspend fun retryCleanupDebtSafely() {
-    val debt = cleanupDebt ?: return
-    // Authoritative: was the service ever activated for THIS debt? (captured at creation)
-    val serviceIpcValid = debt.serviceWasActivated
-    // ...
-    if (debt.serviceHandlePending != null && serviceIpcValid) {
-        val report = service.stopBackend(debt.serviceHandlePending)
-        // ...
-    }
-    if (debt.featureStopPending && serviceIpcValid && noConcreteControllerHandleRemains()) {
-        val report = service.stopFeature("terminal teardown")
-        // ...
-    }
-    // If !serviceIpcValid, service items are treated as already-void (no live service),
-    // never as retriable-forever debt that can strand.
-}
-```
-
-Whenever debt is created, capture the flag from real activation state:
-
-```kotlin
-val debt = CleanupDebt(
-    // ...
-    serviceWasActivated = serviceActivated,  // captured at creation time, immutable thereafter
-)
-```
-
----
-
-## Step C5 — lifecycle tests
-
-```kotlin
-class CleanupSupervisorLifecycleTest {
-    @Test fun retryRunsAfterControllerWorkerScopeCancelled() = runTest {
-        val supervisor = ProxyCleanupSupervisor.create(parent = coroutineContext)
-        val workerScope = CoroutineScope(coroutineContext + Job())
-        val controller = newController(scope = workerScope, cleanupSupervisor = supervisor)
-        controller.seedUnresolvedDebt()
-
-        workerScope.cancel("worker done")     // controller worker exits
-        advanceUntilRetryFires()
-
-        assertTrue("retry still executed via service-owned scope",
-            controller.retryAttemptedForTest())
-    }
-
-    @Test fun shutdownCancelsInFlightRetries() = runTest {
-        val supervisor = ProxyCleanupSupervisor.create(parent = coroutineContext)
-        val controller = newController(cleanupSupervisor = supervisor)
-        controller.seedUnresolvedDebt()
-
-        supervisor.shutdown("teardown")
-        advanceTimeBy(LONG)
-
-        assertFalse(controller.retryAttemptedForTest())
-    }
-
-    @Test fun serviceDebtWithServiceWasActivatedFalse_doesNotStrand() = runTest {
-        // debt.serviceWasActivated=false → service items resolve as void, debt clears
-    }
-
-    @Test fun serviceDebtWithServiceWasActivatedTrue_retriesServiceIpc() = runTest {
-        // debt.serviceWasActivated=true → stopBackend/stopFeature attempted on retry
-    }
-}
-```
-
-## Acceptance criteria
-
-- `cleanupScope: CoroutineScope` constructor param is gone; replaced by
-  `ProxyCleanupSupervisor` with an explicit owner and single `shutdown()` site.
-- Terminal debt retries survive controller-worker cancellation and stop after
-  `shutdown()`.
-- Retry service-IPC eligibility is driven by `debt.serviceWasActivated`, not the
-  mutable `serviceActivated`.
-- No service/listener debt can become permanently unreachable due to state drift.
-- New lifecycle tests + existing suite green.
-
-## Dependencies
-
-- Independent of Track B; can land in parallel.
-- Coordinates with Track A's teardown-dominance tests (shared fakes).
+Track C closes persistent cleanup ownership and authoritative cleanup-debt service state.
+It does **not** implement the production Android foreground service, concrete
+`ProxyFirewallRpc`/health composition, Hev/JNI backend, VPN-bound socket integration or
+physical-device verification. Those remain production integration work, while Tracks D
+and E remain the outstanding Phase-0 controller/model tracks.
