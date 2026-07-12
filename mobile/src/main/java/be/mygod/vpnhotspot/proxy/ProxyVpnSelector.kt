@@ -28,9 +28,10 @@ class ProxyVpnSelector(
     private val connectivity: ConnectivityManager,
 ) {
     fun select(candidates: Collection<Upstream>): VpnSelection {
-        // R1 fix #13 / R2 fix #10: deduplicate by stable network handle, then merge
-        // interface names from all observations of the same network rather than
-        // arbitrarily keeping only the first.
+        // Deduplicate by stable network handle, then merge the public interfaceName
+        // value from every observation of the same network. LinkProperties exposes
+        // one nullable interface name through its public Android API; duplicate
+        // observations may still carry different/stale values, so merge them here.
         val usable = candidates
             .mapNotNull { candidate ->
                 val caps = connectivity.getNetworkCapabilities(candidate.network)
@@ -41,7 +42,7 @@ class ProxyVpnSelector(
                 ProxyVpnUpstream(
                     network = candidate.network,
                     handle = candidate.network.networkHandle,
-                    interfaces = candidate.properties.allInterfaceNames.toSortedSet(),
+                    interfaces = listOfNotNull(candidate.properties.interfaceName).toSortedSet(),
                 )
             }
             .groupBy { it.handle }
@@ -63,7 +64,7 @@ class ProxyVpnSelector(
 
 /**
  * Minimal upstream descriptor; the real type is provided by the existing
- * routing/tethering layer.  This stub keeps the proxy package self-contained
+ * routing/tethering layer. This stub keeps the proxy package self-contained
  * until integration wires the real [android.net.Network] and
  * [android.net.LinkProperties] objects.
  */
