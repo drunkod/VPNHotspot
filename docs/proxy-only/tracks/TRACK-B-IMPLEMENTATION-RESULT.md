@@ -1,8 +1,10 @@
 # Track B implementation result
 
-Status: **complete and verified**
+Status: **complete and verified, including round-13 remediation**
 
-Verified source head: `229a7459f3d0ce1587e0cdf2a39225d8437cb782`
+Verified clean source head: `e2492a5e3838013b089600f7b9631f9f6be01cee`
+
+Resolution audit: [implementation review round 13](../REVIEW_IMPLEMENTATION_ROUND13.md)
 
 ## Delivered boundary
 
@@ -14,21 +16,29 @@ Verified source head: `229a7459f3d0ce1587e0cdf2a39225d8437cb782`
 - Sanitation accepts an explicit deny-only containment configuration, installs the
   containment rules, clears the runtime ledger and only then advances the epoch.
 - The daemon session ID is stored in a crash-persistent fsync'd counter protected by
-  an inter-process file lock; serial and concurrent boot tests verify uniqueness.
-- The applied-runtime ledger issues non-zero handles and rejects non-increasing
-  replacement generations.
+  an inter-process file lock; serial, threaded and independent-process tests verify
+  uniqueness.
+- Stale session-counter temporary files are removed while the store lock is held.
+- The applied-runtime ledger issues non-zero handles, rejects a second active runtime,
+  rejects non-increasing replacement generations and never recycles removed handles.
+- Deny-first start rejects any configuration containing allowed clients.
 - The Android daemon backend installs dedicated IPv4/IPv6 chains without a
   delete-before-deny window. IPv4 allow rules require interface, client IPv4 and MAC;
   IPv4 terminates in reject and IPv6 listener/relay ports remain rejected.
-- Daemon-wide routing cleanup removes proxy chains while holding the same proxy state
-  lock and advances the sanitation epoch only after successful cleanup.
+- Daemon-wide routing cleanup executes under the proxy state lock and cannot clear the
+  ledger or advance the epoch unless kernel cleanup succeeds.
 - `DaemonProxyFirewallClient` uses the project Wire models, trusts acknowledgement
   identity/handles, sends exact handle tokens and maps stale cleanup acknowledgements
   to non-resolving failures.
+- Sanitation transport `IOException` follows the controller's `null`/cleanup-debt gate
+  and clears any previously cached sanitation token.
+- `SanitationResult` carries the acknowledgement-issued daemon generation. Primary
+  reconciliation and cleanup-debt retry require it to match the observed desired-state
+  generation; mismatches retain sanitation debt and prevent start.
 
 ## Verification
 
-At the verified source head:
+At the verified clean source head:
 
 - `cargo check --locked --all-targets` — passed
 - `cargo test --locked --lib` — passed
@@ -38,9 +48,15 @@ At the verified source head:
 - `./gradlew :mobile:verifyReleaseCoroutineDebugR8 --no-daemon` — passed
 - Dependency Review with `fail-on-severity: moderate` — passed
 
+The normal least-privilege Test workflow was restored and all temporary remediation
+workflows/scripts were removed before the final verification.
+
 ## Remaining integration boundary
 
 Track B implements and verifies the daemon protocol boundary and Kotlin adapter. The
-actual foreground service and concrete `ProxyFirewallRpc` composition remain part of
-production service integration/Track C work; this result does not claim that the
-user-facing Proxy-only feature is complete.
+actual foreground service and concrete `ProxyFirewallRpc`/health composition remain part
+of production service integration/Track C work. That composition must source the
+observed daemon generation from the same acknowledgement identity; the controller now
+rejects any disagreement rather than accepting divergent clocks.
+
+This result does not claim that the user-facing Proxy-only feature is complete.
