@@ -21,7 +21,11 @@ class ProxyDaemonStateIntegrationTest {
             desiredStateForTest(daemonGeneration = 999).copy(daemonHealthy = true),
         )
         val rpc = FakeRpc(
-            ack(session = 11, epoch = 4, generation = 17),
+            // Pre-controller deny-first bootstrap.
+            ack(session = 11, epoch = 1, generation = 17),
+            // Controller's own sanitation gate after it observes generation 17.
+            ack(session = 11, epoch = 2, generation = 17),
+            // Root daemon restart and reconnect bootstrap.
             ack(session = 12, epoch = 1, generation = 18),
         )
         val composition = composition(rpc)
@@ -32,8 +36,8 @@ class ProxyDaemonStateIntegrationTest {
         assertNull(unavailable.daemonGeneration)
 
         assertEquals(
-            SanitationResult(11, 4, 17),
-            composition.firewallClient.cleanOrDenyBeforeRestart(),
+            ProxyDaemonState(healthy = true, sessionId = 11, generation = 17),
+            composition.bootstrap(),
         )
         val firstBoot = withTimeout(1_000L) {
             composed.first { it.daemonGeneration == 17L }
@@ -43,8 +47,13 @@ class ProxyDaemonStateIntegrationTest {
         assertEquals(11L, composition.daemonState.value.sessionId)
 
         assertEquals(
-            SanitationResult(12, 1, 18),
+            SanitationResult(11, 2, 17),
             composition.firewallClient.cleanOrDenyBeforeRestart(),
+        )
+
+        assertEquals(
+            ProxyDaemonState(healthy = true, sessionId = 12, generation = 18),
+            composition.bootstrap(),
         )
         val restarted = withTimeout(1_000L) {
             composed.first { it.daemonGeneration == 18L }
@@ -57,28 +66,40 @@ class ProxyDaemonStateIntegrationTest {
             999L,
             rawDesired.value.daemonGeneration,
         )
+        assertEquals(3, rpc.commands.count { it.sanitize != null })
     }
 
     @Test
     fun transportDisconnectClearsAcknowledgedHealthAndGeneration() = runBlocking {
         val rawDesired = MutableStateFlow(desiredStateForTest(daemonGeneration = 999))
-        val rpc = FakeRpc(ack(session = 7, epoch = 2, generation = 9))
+        val rpc = FakeRpc(ack(session = 7, epoch = 1, generation = 9))
         val composition = composition(rpc)
         val composed = composition.desiredStates(rawDesired)
 
         assertEquals(
-            SanitationResult(7, 2, 9),
-            composition.firewallClient.cleanOrDenyBeforeRestart(),
+            ProxyDaemonState(healthy = true, sessionId = 7, generation = 9),
+            composition.bootstrap(),
         )
         assertEquals(9L, composed.first { it.daemonHealthy }.daemonGeneration)
 
         rpc.failure = IOException("root daemon channel closed")
-        assertNull(composition.firewallClient.cleanOrDenyBeforeRestart())
+        assertEquals(ProxyDaemonState.Unavailable, composition.bootstrap())
 
         val unavailable = withTimeout(1_000L) {
             composed.first { !it.daemonHealthy }
         }
         assertNull(unavailable.daemonGeneration)
+        assertEquals(ProxyDaemonState.Unavailable, composition.daemonState.value)
+    }
+
+    @Test
+    fun explicitTransportDisconnectClearsStateWithoutAnotherRpc() = runBlocking {
+        val rpc = FakeRpc(ack(session = 5, epoch = 1, generation = 6))
+        val composition = composition(rpc)
+
+        composition.bootstrap()
+        composition.transportDisconnected()
+
         assertEquals(ProxyDaemonState.Unavailable, composition.daemonState.value)
     }
 
@@ -101,10 +122,12 @@ class ProxyDaemonStateIntegrationTest {
     )
 
     private class FakeRpc(vararg acknowledgements: ProxyFirewallAck) : ProxyFirewallRpc {
+        val commands = mutableListOf<ProxyFirewallCommand>()
         private val responses = ArrayDeque(acknowledgements.toList())
         var failure: IOException? = null
 
         override suspend fun execute(command: ProxyFirewallCommand): ProxyFirewallAck {
+            commands += command
             failure?.let { throw it }
             return responses.removeFirst()
         }
