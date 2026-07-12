@@ -21,6 +21,7 @@ use vpnhotspotd::shared::protocol::{
 };
 
 mod calls;
+mod proxy_firewall;
 mod session_control;
 mod wire;
 
@@ -34,12 +35,15 @@ pub(crate) async fn run(socket_name: String) -> io::Result<()> {
     let (mut controller_read, controller_write) = controller.into_split();
     let (sender, writer) = spawn_writer(controller_write);
     report::init(sender.clone())?;
+    let proxy_firewall = proxy_firewall::boot()
+        .with_report_context("control.proxy_firewall.boot")?;
     let state = Arc::new(State {
         ipsec: Mutex::new(UpstreamTracker::default()),
         icmp: nat66::IcmpDispatcher::new(),
         sessions: Mutex::new(HashMap::new()),
         ipv6_nat_firewall_base: Mutex::new(false),
         neighbour_monitor: Mutex::new(None),
+        proxy_firewall: Mutex::new(proxy_firewall),
     });
     let active_calls: Arc<Mutex<HashMap<u64, Arc<CallState>>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -152,6 +156,7 @@ struct State {
     sessions: Mutex<HashMap<u64, Arc<SessionState>>>,
     ipv6_nat_firewall_base: Mutex<bool>,
     neighbour_monitor: Mutex<Option<MonitorState>>,
+    proxy_firewall: Mutex<proxy_firewall::State>,
 }
 
 struct SessionState {
@@ -350,6 +355,10 @@ async fn handle_command(
                 )?;
             Ok(CallOutput::Reply(ack_reply_frame(id)))
         }
+        daemon::client_envelope::Command::ProxyFirewall(command) => {
+            let ack = proxy_firewall::handle(&state.proxy_firewall, command).await;
+            Ok(CallOutput::Reply(proxy_firewall::reply_frame(id, ack)))
+        }
         daemon::client_envelope::Command::CleanRouting(command) => {
             let sessions = state.drain_sessions().await;
             let mut complete_ids = Vec::new();
@@ -367,11 +376,15 @@ async fn handle_command(
             for id in complete_ids {
                 send_complete(id, sender);
             }
+            let mut proxy = state.proxy_firewall.lock().await;
             let mut handle = netlink::RequestConnection::new()
                 .with_report_context("control.clean_routing.netlink")?;
             routing::clean(&mut handle, &command)
                 .await
                 .with_report_context("control.clean_routing")?;
+            proxy
+                .record_external_clean()
+                .with_report_context("control.clean_routing.proxy_epoch")?;
             Ok(CallOutput::Reply(ack_reply_frame(id)))
         }
     }
