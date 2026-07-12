@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package vpnhotspot.daemon;
 
+import "proxy_firewall.proto";
+
 option java_package = "be.mygod.vpnhotspot.root.daemon";
 option java_outer_classname = "DaemonProto";
 option optimize_for = LITE_RUNTIME;
@@ -16,6 +18,7 @@ message ClientEnvelope {
     StartNeighbourMonitorCommand start_neighbour_monitor = 6;
     CleanRoutingCommand clean_routing = 7;
     ReplaceStaticAddressesCommand replace_static_addresses = 8;
+    vpnhotspot.proxy.ProxyFirewallCommand proxy_firewall = 9;
   }
 }
 
@@ -98,6 +101,7 @@ message ReplyFrame {
   oneof payload {
     Ack ack = 2;
     TrafficCounters traffic_counters = 3;
+    vpnhotspot.proxy.ProxyFirewallAck proxy_firewall = 4;
   }
 }
 
