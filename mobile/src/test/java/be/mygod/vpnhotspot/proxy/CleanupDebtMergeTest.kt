@@ -20,6 +20,32 @@ class CleanupDebtMergeTest {
     }
 
     @Test
+    fun repeatedServiceConflict_doesNotReadoptConcreteHandle() {
+        val first = debt(serviceHandle = ProxyServiceHandle(1)).mergeUnresolved(
+            debt(serviceHandle = ProxyServiceHandle(2)),
+        )
+        val repeated = first.mergeUnresolved(
+            debt(serviceHandle = ProxyServiceHandle(3)),
+        )
+
+        assertNull(repeated.serviceHandlePending)
+        assertTrue(repeated.listenerClosePending)
+        assertTrue(repeated.featureStopPending)
+        assertEquals(1, repeated.failures.count { it.step == "service_handle_conflict" })
+    }
+
+    @Test
+    fun authoritativeFeatureStop_dropsConcreteHandleRegardlessOfMergeSide() {
+        val authoritative = debt(featureStopPending = true)
+        val concrete = debt(serviceHandle = ProxyServiceHandle(3))
+
+        assertNull(authoritative.mergeUnresolved(concrete).serviceHandlePending)
+        assertNull(concrete.mergeUnresolved(authoritative).serviceHandlePending)
+        assertTrue(authoritative.mergeUnresolved(concrete).featureStopPending)
+        assertTrue(concrete.mergeUnresolved(authoritative).featureStopPending)
+    }
+
+    @Test
     fun conflictingFirewallHandles_dropConcreteIpcAndRequireSanitation() {
         val merged = debt(
             firewallHandle = ProxyFirewallHandle(1, 1, 1),
@@ -45,6 +71,7 @@ class CleanupDebtMergeTest {
         firewallHandle: ProxyFirewallHandle? = null,
         firewallDenyPending: Boolean = false,
         firewallStopPending: Boolean = false,
+        featureStopPending: Boolean = false,
     ) = CleanupDebt(
         listenerClosePending = false,
         serviceHandlePending = serviceHandle,
@@ -52,8 +79,8 @@ class CleanupDebtMergeTest {
         firewallDenyPending = firewallDenyPending,
         firewallStopPending = firewallStopPending,
         daemonCleanPending = false,
-        featureStopPending = false,
-        serviceWasActivated = serviceHandle != null,
+        featureStopPending = featureStopPending,
+        serviceWasActivated = serviceHandle != null || featureStopPending,
         failures = emptyList(),
         generation = 1,
         attempt = 0,
