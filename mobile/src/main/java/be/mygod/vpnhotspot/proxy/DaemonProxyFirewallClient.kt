@@ -1,8 +1,8 @@
 package be.mygod.vpnhotspot.proxy
 
+import be.mygod.vpnhotspot.proxy.proto.ProxyFirewallProto
 import com.google.protobuf.ByteString
 import java.io.IOException
-import be.mygod.vpnhotspot.proxy.proto.ProxyFirewallProto
 
 /**
  * Transport seam for the existing root-daemon request/reply channel.
@@ -58,9 +58,11 @@ class DaemonProxyFirewallClient(
         if (ack.status != ProxyFirewallProto.ProxyFirewallAck.Status.OK || !ack.hasIdentity()) {
             return null
         }
-        return SanitationResult(
-            sessionId = ack.identity.sessionId,
-            epoch = ack.identity.epoch,
+        return recordSanitation(
+            SanitationResult(
+                sessionId = ack.identity.sessionId,
+                epoch = ack.identity.epoch,
+            ),
         )
     }
 
