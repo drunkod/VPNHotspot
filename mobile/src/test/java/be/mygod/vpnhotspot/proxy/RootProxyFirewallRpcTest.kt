@@ -4,6 +4,7 @@ import be.mygod.vpnhotspot.proxy.proto.DaemonIdentity
 import be.mygod.vpnhotspot.proxy.proto.ProxyFirewallAck
 import be.mygod.vpnhotspot.proxy.proto.ProxyFirewallCommand
 import java.io.IOException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertSame
@@ -42,6 +43,16 @@ class RootProxyFirewallRpcTest {
     @Test
     fun ioTransportFailurePreservesIdentity() = runBlocking {
         val expected = IOException("socket closed")
+        val rpc = RootProxyFirewallRpc { throw expected }
+
+        val failure = runCatching { rpc.execute(ProxyFirewallCommand()) }.exceptionOrNull()
+
+        assertSame(expected, failure)
+    }
+
+    @Test
+    fun cancellationPropagatesWithoutTransportWrapping() = runBlocking {
+        val expected = CancellationException("controller transaction cancelled")
         val rpc = RootProxyFirewallRpc { throw expected }
 
         val failure = runCatching { rpc.execute(ProxyFirewallCommand()) }.exceptionOrNull()
