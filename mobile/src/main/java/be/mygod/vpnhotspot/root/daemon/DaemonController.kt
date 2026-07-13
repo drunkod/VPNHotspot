@@ -14,6 +14,8 @@ import be.mygod.librootkotlinx.net.ALocalSocket
 import be.mygod.vpnhotspot.App.Companion.app
 import be.mygod.vpnhotspot.io.drainLines
 import be.mygod.vpnhotspot.io.isEBADF
+import be.mygod.vpnhotspot.proxy.proto.ProxyFirewallAck
+import be.mygod.vpnhotspot.proxy.proto.ProxyFirewallCommand
 import be.mygod.vpnhotspot.root.RootManager
 import be.mygod.vpnhotspot.util.Services
 import be.mygod.vpnhotspot.widget.SmartSnackbar
@@ -123,6 +125,11 @@ object DaemonController {
 
     suspend fun cleanRouting(ipv6NatPrefixSeed: String) {
         request(ClientEnvelope(clean_routing = CleanRoutingCommand(ipv6NatPrefixSeed))).requireAck()
+    }
+
+    suspend fun proxyFirewall(command: ProxyFirewallCommand): ProxyFirewallAck {
+        val reply = request(ClientEnvelope(proxy_firewall = command))
+        return reply.proxy_firewall ?: throw IOException("Unexpected daemon proxy firewall reply $reply")
     }
 
     private sealed class Call {
