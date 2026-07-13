@@ -49,6 +49,8 @@ fun ProxyScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val invalidPortsMessage = stringResource(R.string.proxy_invalid_ports)
+    val settingsSavedMessage = stringResource(R.string.proxy_settings_saved)
     val fallbackSettings by remember { proxySettingsFlow() }
         .collectAsStateWithLifecycle(initialValue = ProxyOnlyPreferences.current())
     val settings = binder?.settings?.collectAsStateWithLifecycle()?.value ?: fallbackSettings
@@ -149,13 +151,13 @@ fun ProxyScreen(
                         val udpValid = !settings.udpEnabled ||
                             (start != null && end != null && start in 1..65_535 && end in start..65_535)
                         if (!tcpValid || !udpValid) {
-                            scope.launch { snackbarHostState.showSnackbar(context.getString(R.string.proxy_invalid_ports)) }
+                            scope.launch { snackbarHostState.showSnackbar(invalidPortsMessage) }
                         } else {
                             ProxyOnlyPreferences.setTcpPort(checkNotNull(port))
                             if (settings.udpEnabled) {
                                 ProxyOnlyPreferences.setUdpRange(checkNotNull(start)..checkNotNull(end))
                             }
-                            scope.launch { snackbarHostState.showSnackbar(context.getString(R.string.proxy_settings_saved)) }
+                            scope.launch { snackbarHostState.showSnackbar(settingsSavedMessage) }
                         }
                     }) {
                         Text(stringResource(R.string.wifi_save))
