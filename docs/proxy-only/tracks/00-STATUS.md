@@ -3,10 +3,11 @@
 Single source of truth for the proxy-only work on `agent/proxy-only-design`.
 
 - PR: #1, intentionally **draft**
-- Current executable application source: `cc09b299e7ea67d25d05eaa21449cdb3d28b8916`
-- Last fully green executable source before the Track G review: `db27ed52a539e825f4980fa94098751232377dae`
-- Track G disconnect/protocol review fixes: **implemented; current PR checks are authoritative**
+- Executable source verified: `a18473547e4818e3d37053b884d44042be3c0ab0`
+- Normal `Test` workflow on that source: **passed**
+- Dependency Review: **rerunning on the final documentation head**
 - App-visible authenticated SOCKS5 MVP: **implemented**
+- Track G composition review: **complete; three findings remediated and regression-tested**
 - Track L Mermaid architecture, failure matrix and evidence map: **documented**
 - Rooted-device validation runbook and UDP probe: **documented; execution pending**
 - Rooted physical-device/security evidence: **still required before release**
@@ -29,7 +30,8 @@ Single source of truth for the proxy-only work on `agent/proxy-only-design`.
 | Production foreground service and binder | ✅ | `proxy/ProxyOnlyService.kt`, manifest registration |
 | Controller and cleanup-debt supervisor | ✅ | Tracks A, C, D |
 | Acknowledgement-backed daemon identity | ✅ | Tracks B, G |
-| Transport-epoch acknowledgement fencing | ✅ code | `ProxyDaemonState.kt`, Track G review |
+| Transport-epoch acknowledgement fencing | ✅ | `ProxyDaemonState.kt`, Track G review |
+| Root RPC cancellation transparency | ✅ | `RootProxyFirewallRpc.kt` |
 | Root request/reply transport and lease | ✅ | `RootProxyFirewallRpc.kt`, `DaemonController.kt` |
 | Root firewall ACL and global containment | ✅ | Rust `proxy_firewall` + `proxy_firewall_kernel.rs` |
 | Authenticated TCP SOCKS5 CONNECT | ✅ | `KotlinSocks5Backend.kt` |
@@ -37,6 +39,7 @@ Single source of truth for the proxy-only work on `agent/proxy-only-design`.
 | VPN-bound sockets and bounded VPN-aware DNS | ✅ code, 🟡 device evidence | `KotlinSocks5Backend.kt` |
 | Track L architecture and packet-evidence map | ✅ | [`architecture/TRACK-L-kotlin-socks5-architecture.md`](../architecture/TRACK-L-kotlin-socks5-architecture.md) |
 | Rooted-device validation procedure | ✅ documented, 🟡 execution pending | [`DEVICE_VALIDATION.md`](../DEVICE_VALIDATION.md) |
+| Authenticated UDP validation probe | ✅ tooling | `tools/proxy_device_validation/socks5_udp_probe.py` |
 | Physical-device packet/leak matrix | ⬜ evidence | required before release |
 
 ## User flow
@@ -68,12 +71,29 @@ starts until the user taps **Resume** and a new one-time grant is issued.
 | D — bounded cleanup failure history | ✅ |
 | E — normalization diagnostics | ✅ |
 | F — dependency graph/review workflow | ✅ |
-| G — acknowledgement-backed daemon composition | ✅ reviewed; late-ack and malformed-identity gaps remediated; device restart evidence pending |
+| G — acknowledgement-backed daemon composition | ✅ reviewed; late-ack, malformed-identity, and cancellation gaps remediated; device restart evidence pending |
 | H — settings, credentials and desired-state source | ✅ |
 | I — production foreground service | ✅ |
 | J — Compose UI | ✅ |
 | K — root RPC transport and daemon lease | ✅ |
 | L — Kotlin SOCKS5 MVP data plane | 🟡 code complete; architecture documented; device evidence pending |
+
+## Track G review result
+
+The focused review found and fixed three composition-boundary defects:
+
+1. An acknowledgement already in flight could previously restore daemon health after an explicit
+   transport disconnect. Requests are now fenced to a transport epoch, and old-epoch replies fail
+   closed.
+2. `OK`/stale acknowledgements with a missing or zero daemon identity could retain an older healthy
+   state. Malformed authoritative identities now invalidate the matching epoch and return protocol
+   failure.
+3. `RootProxyFirewallRpc` could wrap `CancellationException` as `IOException`, misclassifying
+   structured cancellation as daemon loss. Cancellation now propagates unchanged.
+
+Deterministic JVM regressions cover all three findings. The remaining Track G boundary is physical:
+DV-09 in the device runbook must kill the real daemon, prove the old runtime becomes unreachable, and
+show deny-first recovery under a new acknowledgement identity.
 
 ## Security and lifecycle properties implemented
 
@@ -99,6 +119,7 @@ starts until the user taps **Resume** and a new one-time grant is issued.
   restore daemon health.
 - Authoritative acknowledgements with missing or zero identity fail closed and clear the matching
   transport epoch instead of retaining older health.
+- Coroutine cancellation is not rewritten as transport failure.
 - Idle root-daemon lifetime is explicit through a reference-counted lease.
 - Disable closes the backend and releases root-backed monitoring/transport even while UI remains
   bound.
@@ -106,35 +127,50 @@ starts until the user taps **Resume** and a new one-time grant is issued.
 - Foreground stop operations run on the main thread; OS-driven service destruction performs ordered
   fallback cleanup without blocking the main thread.
 
-## Verification scope
+## Verification on executable head
 
-The normal workflows run:
+The normal `Test` workflow passed on `a18473547e4818e3d37053b884d44042be3c0ab0`:
 
-- Rust daemon check and unit tests;
-- Rust clippy with `-D warnings`;
-- Rust dependency audit;
-- Android debug assembly and lint;
-- JVM tests, including Track G disconnect/malformed-identity regressions;
-- release R8 coroutine-debug verification;
-- Dependency Review with moderate-severity failure policy; and
-- APK/report artifact upload.
+- Rust daemon check: passed
+- Rust daemon unit tests, including global non-downstream rejects: passed
+- Rust clippy with `-D warnings`: passed
+- Rust dependency audit: passed
+- Android debug assembly: passed
+- Android lint: passed
+- JVM tests, including the Track G disconnect/malformed-identity/cancellation regressions: passed
+- release R8 coroutine-debug verification: passed
+- APK and report artifacts: uploaded
 
-The PR checks on the current head are the authoritative result. A runner setup failure before checkout
-is infrastructure and must be rerun; it is not counted as source verification.
+A GitHub-hosted runner setup failure occurred on an intermediate head before checkout. It did not run
+repository code. The final documentation head reruns Dependency Review and the complete Test workflow.
+
+## Rooted-device evidence plan
+
+[`DEVICE_VALIDATION.md`](../DEVICE_VALIDATION.md) defines the first repeatable hardware pass and its
+sensitive evidence bundle. It covers:
+
+- foreground activation and deny-first startup;
+- authenticated TCP CONNECT and auth rejection;
+- real UDP ASSOCIATE using the included Python probe;
+- exact client/interface/MAC containment and IPv6 denial;
+- tether/VPN/uplink packet capture with explicit leak interpretation;
+- VPN loss and DNS-blackhole fail-closed behavior;
+- real daemon restart and Track G identity recovery;
+- process death and explicit Resume;
+- 20-cycle FD/task/RSS/listener baselines; and
+- UI, notification, clipboard, and configuration QA.
+
+These tests have **not** been executed by this documentation/code-review pass.
 
 ## Remaining release blockers
 
-These are evidence tasks, not missing app wiring. Execute and retain the artifacts defined in
-[`DEVICE_VALIDATION.md`](../DEVICE_VALIDATION.md):
-
-1. Rooted physical-device installation and foreground-service behavior across supported Android
-   versions.
-2. VPN include/exclude and permission-denial matrix.
-3. TCP CONNECT and UDP ASSOCIATE interoperability from real tethered clients.
-4. DNS blackhole, VPN loss and packet-capture proof of no physical fallback.
-5. Real daemon restart while a runtime is active, including Track G acknowledgement recovery.
-6. Repeated enable/disable and process-death FD/thread/coroutine leak measurements.
-7. UI screenshots and large-screen/notification-permission QA.
+1. Execute the rooted-device runbook and retain its evidence package.
+2. Validate VPN include/exclude and permission-denial behavior.
+3. Prove TCP CONNECT and UDP ASSOCIATE interoperability from real tethered clients.
+4. Prove DNS blackhole, VPN loss, and absence of physical-network fallback by packet capture.
+5. Restart the real daemon while active and complete the Track G/K recovery evidence.
+6. Complete repeated enable/disable and process-death FD/thread/coroutine leak measurements.
+7. Complete phone/large-screen screenshots and notification-permission QA.
 
 The former Hev/JNI pin is no longer required for this Kotlin MVP. Hev may still be evaluated as a
 later performance backend behind the same `ProxyBackend` interface, but it must not replace the
