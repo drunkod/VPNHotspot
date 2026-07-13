@@ -30,6 +30,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -88,8 +90,9 @@ class ProxyOnlyService : Service() {
     val state: StateFlow<ProxyOnlyState> = mutableState.asStateFlow()
     private val mutableCredentials = MutableStateFlow<ProxyCredentials?>(null)
     val credentials: StateFlow<ProxyCredentials?> = mutableCredentials.asStateFlow()
-    private val binder = Binder(this)
     private val foreground = AtomicBoolean(false)
+    private val activated = MutableStateFlow(false)
+    private val binder = Binder(this)
 
     lateinit var settings: StateFlow<ProxyOnlySettings>
         private set
@@ -115,7 +118,9 @@ class ProxyOnlyService : Service() {
             SharingStarted.Eagerly,
             emptyList(),
         )
-        clients = proxyAllowedClientsFlow().stateIn(
+        clients = activated.flatMapLatest { active ->
+            if (active) proxyAllowedClientsFlow() else flowOf(emptyList())
+        }.stateIn(
             serviceScope,
             SharingStarted.Eagerly,
             emptyList(),
@@ -225,6 +230,7 @@ class ProxyOnlyService : Service() {
                 daemonLease = null
             }
         }
+        activated.value = false
         serviceScope.cancel()
         foreground.set(false)
         super.onDestroy()
@@ -246,10 +252,12 @@ class ProxyOnlyService : Service() {
                 )
             } else startForeground(NOTIFICATION_ID, notification)
             foreground.set(true)
+            activated.value = true
             true
         } catch (failure: RuntimeException) {
             if (Build.VERSION.SDK_INT >= 31 && failure.javaClass.name == FGS_NOT_ALLOWED_CLASS) {
                 mutableState.value = ProxyOnlyState.ActivationRequired
+                activated.value = false
                 foreground.set(false)
                 false
             } else throw failure
@@ -262,6 +270,7 @@ class ProxyOnlyService : Service() {
     }
 
     internal fun stopForegroundAndSelf() {
+        activated.value = false
         if (foreground.getAndSet(false)) stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
