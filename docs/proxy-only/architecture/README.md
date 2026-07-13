@@ -12,7 +12,8 @@ rooted-device and packet evidence required for release.
   - TCP CONNECT request and relay sequence;
   - UDP ASSOCIATE request, endpoint validation and teardown sequence;
   - runtime and cleanup state model;
-  - bounded DNS cancellation boundary; and
+  - bounded DNS cancellation boundary;
+  - failure-containment matrix; and
   - rooted-device packet and lifecycle evidence map.
 
 The implementation status and track index remain in
