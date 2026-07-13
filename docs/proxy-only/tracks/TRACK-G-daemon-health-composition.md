@@ -1,11 +1,10 @@
 # Track G — acknowledgement-backed daemon health composition
 
-Status: **reviewed and remediated; rooted-device restart evidence pending**
+Status: **reviewed, remediated, and source-CI verified; rooted-device restart evidence pending**
 
-Reviewed executable source head: `cc09b299e7ea67d25d05eaa21449cdb3d28b8916`
+Verified executable source head: `a18473547e4818e3d37053b884d44042be3c0ab0`
 
-The Android/JVM workflow for that source head is tracked by the PR checks. Documentation and device
-runbook commits may follow without changing the application source.
+Documentation and device-runbook commits may follow without changing the application source.
 
 ## Goal
 
@@ -38,6 +37,10 @@ Partial and zero identities are rejected.
 
 An explicit disconnect advances the transport epoch immediately. A reply that was already in flight
 on the old epoch is rejected rather than restoring `healthy=true` after disconnect.
+
+`RootProxyFirewallRpc` also preserves coroutine cancellation. A controller timeout or parent
+cancellation is rethrown as `CancellationException`; it is never rewritten as an `IOException` or
+misclassified as daemon transport loss.
 
 ### Deny-first bootstrap
 
@@ -109,13 +112,28 @@ Remediation:
 - a malformed authoritative acknowledgement is a protocol `IOException`; and
 - the matching transport epoch is invalidated before the failure reaches the caller.
 
+### Finding G-3 — cancellation was rewritten as transport loss
+
+Previous behavior:
+
+- `RootProxyFirewallRpc` caught generic `Exception`;
+- Kotlin `CancellationException` was wrapped in `IOException`; and
+- controller cancellation could therefore clear daemon health and enter transport-failure recovery
+  rather than preserving structured cancellation.
+
+Remediation:
+
+- `CancellationException` is caught first and rethrown unchanged;
+- actual `IOException` retains its identity; and
+- only non-I/O, non-cancellation transport failures are wrapped as `IOException`.
+
 No additional Track G code defect was found in serialized bootstrap/controller operation ordering,
-stale-token identity handling, or desired-state replacement.
+stale-token identity handling, desired-state replacement, or root-daemon epoch mutation ordering.
 
 ## Regression coverage
 
-`ProxyDaemonStateIntegrationTest` drives the real Kotlin firewall client stack over fake transports
-and verifies:
+`ProxyDaemonStateIntegrationTest` and `RootProxyFirewallRpcTest` drive the real Kotlin composition
+stack over fake transports and verify:
 
 1. an independently supplied generation is suppressed before bootstrap;
 2. deny-first bootstrap publishes its acknowledged session and generation;
@@ -125,8 +143,9 @@ and verifies:
 6. transport failure clears health and generation;
 7. explicit disconnect clears state without another RPC;
 8. an acknowledgement released after explicit disconnect cannot restore health;
-9. missing and zero authoritative identities invalidate previously healthy state; and
-10. partial or zero `ProxyDaemonState` identities are rejected.
+9. missing and zero authoritative identities invalidate previously healthy state;
+10. partial or zero `ProxyDaemonState` identities are rejected; and
+11. coroutine cancellation propagates without transport wrapping.
 
 ## MVP composition boundary
 
@@ -140,21 +159,26 @@ The first rooted-device run therefore records daemon process/session state, list
 firewall snapshots, and recovery ordering. See [`../DEVICE_VALIDATION.md`](../DEVICE_VALIDATION.md),
 especially DV-09.
 
-## Verification commands
+## Verification
 
-The normal least-privilege workflows execute:
+The normal `Test` workflow passed on executable source head
+`a18473547e4818e3d37053b884d44042be3c0ab0`:
 
 - `cargo check --locked --all-targets`;
 - `cargo test --locked --lib`;
 - `cargo clippy --locked --all-targets -- -D warnings`;
 - `cargo audit`;
-- `./gradlew assembleDebug check --no-daemon`;
+- `./gradlew assembleDebug check --no-daemon`, including the new Track G regressions;
 - `./gradlew :mobile:verifyReleaseCoroutineDebugR8 --no-daemon`; and
-- Dependency Review with `fail-on-severity: moderate`.
+- APK/report artifact upload.
+
+Dependency Review is unchanged by these source edits and is rerun on the final documentation head
+with `fail-on-severity: moderate`.
 
 ## Remaining evidence boundary
 
-Track G's code-level acknowledgement and disconnect races are covered by deterministic JVM tests.
-Release still requires a real rooted-phone test that kills the active `vpnhotspotd`, proves the old
-listener/runtime becomes unreachable, observes a new daemon identity and deny-first sanitation, and
-shows that TCP/UDP resume only after the new acknowledgement-backed runtime reaches `Running`.
+Track G's code-level acknowledgement, protocol, and cancellation races are covered by deterministic
+JVM tests. Release still requires a real rooted-phone test that kills the active `vpnhotspotd`, proves
+the old listener/runtime becomes unreachable, observes a new daemon identity and deny-first
+sanitation, and shows that TCP/UDP resume only after the new acknowledgement-backed runtime reaches
+`Running`.
