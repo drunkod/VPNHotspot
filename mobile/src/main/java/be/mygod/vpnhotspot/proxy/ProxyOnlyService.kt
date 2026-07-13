@@ -1,6 +1,5 @@
 package be.mygod.vpnhotspot.proxy
 
-import android.app.ForegroundServiceStartNotAllowedException
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -50,6 +49,7 @@ class ProxyOnlyService : Service() {
 
         private const val CHANNEL_ID = "proxy-only"
         private const val NOTIFICATION_ID = 2
+        private const val FGS_NOT_ALLOWED_CLASS = "android.app.ForegroundServiceStartNotAllowedException"
 
         fun startIfEnabled(context: Context) {
             if (ProxyOnlyPreferences.enabled) request(context, ACTION_START)
@@ -219,10 +219,11 @@ class ProxyOnlyService : Service() {
         check(ProxyActivationGrants.isLive(grant.id)) { "activation grant is not live" }
     }
 
-    internal fun ensureForeground(state: ProxyOnlyState) {
+    /** Returns false only when Android rejected foreground activation. */
+    internal fun ensureForeground(state: ProxyOnlyState): Boolean {
         val notification = buildNotification(state)
-        try {
-            if (Build.VERSION.SDK_INT >= 33) {
+        return try {
+            if (Build.VERSION.SDK_INT >= 34) {
                 startForeground(
                     NOTIFICATION_ID,
                     notification,
@@ -230,9 +231,13 @@ class ProxyOnlyService : Service() {
                 )
             } else startForeground(NOTIFICATION_ID, notification)
             foreground.set(true)
-        } catch (e: ForegroundServiceStartNotAllowedException) {
-            mutableState.value = ProxyOnlyState.ActivationRequired
-            throw e
+            true
+        } catch (failure: RuntimeException) {
+            if (Build.VERSION.SDK_INT >= 31 && failure.javaClass.name == FGS_NOT_ALLOWED_CLASS) {
+                mutableState.value = ProxyOnlyState.ActivationRequired
+                foreground.set(false)
+                false
+            } else throw failure
         }
     }
 
@@ -296,7 +301,7 @@ class ProxyOnlyService : Service() {
             if (state == ProxyOnlyState.ActivationRequired) {
                 addAction(
                     Notification.Action.Builder(
-                        null,
+                        R.drawable.ic_proxy,
                         getText(R.string.proxy_resume),
                         PendingIntent.getService(
                             this@ProxyOnlyService,
@@ -341,11 +346,8 @@ private class AndroidProxyServiceClient(
     ): ServiceActivation = lock.withLock {
         if (featureActive) return@withLock ServiceActivation.Active
         owner.validateGrant(grant)
-        try {
-            withContext(Dispatchers.Main.immediate) { owner.ensureForeground(initialState) }
-        } catch (_: ForegroundServiceStartNotAllowedException) {
-            return@withLock ServiceActivation.ForegroundStartNotAllowed
-        }
+        val started = withContext(Dispatchers.Main.immediate) { owner.ensureForeground(initialState) }
+        if (!started) return@withLock ServiceActivation.ForegroundStartNotAllowed
         featureActive = true
         ServiceActivation.Active
     }
