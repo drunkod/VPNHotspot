@@ -4,6 +4,8 @@ Status: **complete and verified**
 
 Verified clean source head: `81d902c60ec05b068c86cb4a51e8f341ed01007a`
 
+Documentation commits may follow that source head without changing executable code.
+
 ## Goal
 
 Carry the Track B generation contract into production composition: the desired-state
