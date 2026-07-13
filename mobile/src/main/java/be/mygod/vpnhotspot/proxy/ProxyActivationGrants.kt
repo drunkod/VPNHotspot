@@ -28,8 +28,7 @@ object ProxyActivationGrants : ActivationGrantConsumer {
 
     fun isLive(id: UUID): Boolean = id in live
 
-    @Synchronized
-    override suspend fun consume(grantId: UUID) {
+    override suspend fun consume(grantId: UUID) = synchronized(this) {
         live.remove(grantId)
         if (mutablePending.value?.id == grantId) mutablePending.value = null
     }
