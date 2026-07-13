@@ -8,6 +8,29 @@ The MVP uses an app-owned Kotlin backend behind the existing `ProxyBackend` inte
 of claiming the unpinned Hev/JNI integration is complete. This is the fallback explicitly
 allowed by the implementation plan when the native feasibility spike is not yet proven.
 
+## Architecture
+
+The full visual architecture, request sequences, lifecycle model, trust boundaries and device
+capture plan are documented in
+[Track L Kotlin SOCKS5 architecture](../architecture/TRACK-L-kotlin-socks5-architecture.md).
+
+```mermaid
+flowchart LR
+    Client["Tethered client"]
+    Firewall["Root exact-client firewall"]
+    Backend["KotlinSocks5Backend"]
+    Vpn["Selected Android VPN Network"]
+    Remote["Remote IPv4 endpoint"]
+
+    Client --> Firewall --> Backend
+    Backend -. "DNS and bindSocket" .-> Vpn
+    Vpn --> Remote
+```
+
+The root firewall is the client-admission boundary. `KotlinSocks5Backend` is the authenticated
+protocol and relay boundary. The selected Android VPN `Network` is the only implemented egress
+boundary.
+
 ## Protocol support
 
 `KotlinSocks5Backend` implements:
@@ -35,9 +58,12 @@ Every Internet-facing socket is bound with `Network.bindSocket` before connect/s
 requests use `Network.getAllByName`, so they use the selected VPN's resolver path rather than
 the process-default network. There is no physical-network fallback branch.
 
-DNS work is limited to two concurrent resolver calls and each caller has a five-second deadline.
-A VPN DNS blackhole can therefore fail requests closed without creating unbounded resolver
-concurrency or indefinitely wedging proxy sessions.
+DNS work is limited to two concurrent resolver calls and each requesting coroutine has a
+five-second deadline. This prevents unbounded resolver concurrency and makes callers fail closed.
+The underlying `Network.getAllByName` call is blocking and cannot be interrupted by coroutine
+cancellation, so a resolver worker that already entered the platform call may remain occupied
+until Android's resolver returns. The architecture document records this boundary and the future
+`DnsResolver` plus `CancellationSignal` hardening option.
 
 ## Probes
 
@@ -88,6 +114,7 @@ IO scope. Foreground stop calls are dispatched to the main thread.
 - `proxy/ProxyOnlyService.kt`
 - `proxy/KotlinSocks5BackendHelpersTest.kt`
 - `rust/vpnhotspotd/src/proxy_firewall_kernel.rs`
+- `docs/proxy-only/architecture/TRACK-L-kotlin-socks5-architecture.md`
 
 ## Verification
 
