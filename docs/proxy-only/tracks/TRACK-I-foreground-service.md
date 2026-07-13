@@ -1,211 +1,82 @@
-# Track I — real foreground `ProxyService` (Android Service) + manifest
+# Track I — production Android foreground service
 
-**Why this exists:** there is no `android.app.Service` for proxy-only and no `<service>`
-entry in `AndroidManifest.xml`, so the OS has nothing to start and the UI has nothing to
-bind. `proxy/ProxyService.kt` today is the Phase-0 `ProxyServiceCleanupOwner` — **not** an
-Android Service. This track adds the real foreground service that owns the controller,
-the Track G daemon composition, and the cleanup owner, and exposes `ProxyOnlyState` to the
-UI through a `Binder` (the exact pattern `TetheringService`/`RepeaterService` use).
+Status: **implemented and verified**
 
-**Scope:** service lifecycle + manifest + binder. Consumes Track H (desired state) and
-Track K (`ProxyFirewallRpc`). The `ProxyServiceClient` **backend** (Hev) remains a
-separate later track; this service can run with a typed stub backend so the state machine
-progresses to `StartingBackend`/`FailClosed` and the UI shows real state.
+## Result
 
-**Files:**
+`ProxyOnlyService` is now the Android lifecycle owner for proxy-only mode. It is registered
+as a non-exported `specialUse` foreground service and follows the app's existing bound-service
+pattern.
 
-```text
-mobile/src/main/java/be/mygod/vpnhotspot/proxy/ProxyOnlyService.kt   (new — the Android Service)
-mobile/src/main/AndroidManifest.xml                                  (add <service> + FGS type)
-mobile/src/main/res/values/strings.xml                               (notification + subtype strings)
-```
+## Ownership
 
-> Name it `ProxyOnlyService` to avoid colliding with the existing Phase-0
-> `proxy/ProxyService.kt` (the cleanup owner). Rename the Phase-0 file to
-> `ProxyServiceCleanupOwner.kt` in the same change if you want the names to read cleanly.
+The service owns, for one service lifetime:
 
----
+- `ProxyOnlyController`;
+- `ProxyServiceCleanupOwner` and its supervisor-owned retry scope;
+- `ProxyDaemonComposition` and concrete root RPC adapter;
+- the Kotlin SOCKS5 backend;
+- live settings, VPN, downstream and allowed-client sources;
+- the root-daemon transport lease;
+- the foreground notification and UI binder.
 
-## Step I1 — the foreground service
+The binder exposes live `StateFlow`s for controller state, settings and credentials, and
+provides explicit enable, resume, disable and credential-rotation commands.
 
-Follow the app conventions seen in `TetheringService`/`RepeaterService`: `directBootAware`,
-a foreground notification, an inner `Binder : android.os.Binder()` exposing `StateFlow`s,
-and a service-scoped `CoroutineScope`. The service owns the cleanup supervisor for its
-whole lifetime and cancels/joins the worker **before** closing the owner (the ordering
-Track C documented).
+## Activation contract
 
-```kotlin
-package be.mygod.vpnhotspot.proxy
+The service is deliberately `START_NOT_STICKY`.
 
-import android.app.Service
-import android.content.Intent
-import android.os.Binder
-import be.mygod.vpnhotspot.App.Companion.app
-import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.*
+- A persisted `enabled=true` bit never starts a foreground service or root process.
+- Binding the screen after process restart exposes `ActivationRequired`.
+- Only foreground enable/resume commands issue a process-local one-time grant.
+- Android 12+ foreground-start rejection maps back to `ActivationRequired`.
+- Root-backed client monitoring and daemon bootstrap begin only after foreground activation
+  succeeds.
 
-class ProxyOnlyService : Service() {
-    companion object {
-        const val ACTION_RESUME = "be.mygod.vpnhotspot.proxy.RESUME"
-    }
+This preserves the Track A/C requirement that persistence is not authority to reactivate a
+network listener.
 
-    // Published state for the UI.
-    private val _state = MutableStateFlow<ProxyOnlyState>(ProxyOnlyState.Disabled)
-    inner class ProxyBinder : Binder() {
-        val state: StateFlow<ProxyOnlyState> get() = _state.asStateFlow()
-        /** Foreground user action → one-time grant that unblocks ActivationRequired. */
-        fun resume() { pendingGrant.value = ProxyActivationGrants.issue(ActivationSource.UserResume) }
-    }
-    private val binder = ProxyBinder()
+## Foreground and waiting behavior
 
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private val cleanupOwner = ProxyServiceCleanupOwner(parent = serviceScope.coroutineContext)
-    private val pendingGrant = MutableStateFlow<ActivationGrant?>(null)
+After activation, the service stays foreground through waiting and fail-closed states while
+the backend listener is closed. Notifications show the typed controller state and include a
+Resume action when user activation is required. The three-argument `startForeground` call and
+`FOREGROUND_SERVICE_TYPE_SPECIAL_USE` are used only on Android 14+, with the compatible call
+used on earlier supported versions.
 
-    private var composition: ProxyDaemonComposition? = null
-    private var workerJob: Job? = null
+## Root-daemon lifecycle
 
-    override fun onBind(intent: Intent?) = binder
+The service acquires an explicit reference-counted `DaemonController.Lease` before bootstrap.
+The lease keeps one daemon identity alive between individual request/reply calls and is released
+immediately after authoritative feature stop, even if the UI remains bound. Re-enable creates a
+fresh bootstrap job and lease.
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_RESUME) {
-            pendingGrant.value = ProxyActivationGrants.issue(ActivationSource.UserResume)
-        }
-        startForegroundWithState()
-        ensureRunning()
-        return START_STICKY
-    }
+## Teardown ordering
 
-    private fun ensureRunning() {
-        if (workerJob != null) return
+The implemented ordering is:
 
-        // Track G composition owns the RPC tracker + DaemonProxyFirewallClient and
-        // overwrites daemonHealthy/daemonGeneration with acknowledgement-backed values.
-        val rpc: ProxyFirewallRpc = RootProxyFirewallRpc()          // Track K
-        val comp = ProxyDaemonComposition(rpc) { containmentConfig() }
-        composition = comp
+1. controller closes backend/firewall resources and releases daemon resources on feature stop;
+2. service destruction cancels and joins the controller worker;
+3. the cleanup owner is closed only after the worker exits;
+4. any remaining bootstrap job and daemon lease are closed;
+5. the service scope is cancelled.
 
-        val stateSink = object : ProxyStateSink {
-            override suspend fun publish(state: ProxyOnlyState) {
-                _state.value = state
-                updateNotification(state)
-            }
-        }
+Failed cleanup retains handles/debt and does not falsely report a completed stop.
 
-        val controller = ProxyOnlyController(
-            service = ProxyBackendServiceClient(/* Hev backend seam — later track */),
-            firewall = comp.firewallClient,
-            activationGrants = ProxyActivationGrants,
-            credentialProvider = ProxyCredentialProviderImpl,   // Track H credentials
-            stateSink = stateSink,
-            reporter = ProxyErrorReporterImpl,
-            scope = serviceScope,
-            cleanupSupervisor = cleanupOwner.cleanupSupervisor,
-        )
+## Files
 
-        val desired = comp.composeDesiredStates(
-            ProxyDesiredStateSource(
-                settings = proxySettingsFlow(),
-                pendingGrant = pendingGrant,
-                vpnSelection = ProxyVpnSelector.selectionFlow(),   // reuse existing selector
-                downstreams = tetheringDownstreamsFlow(),          // reuse tethering iface data
-                allowedClients = allowedClientsFlow(),
-            ).states()
-        )
+- `proxy/ProxyOnlyService.kt`
+- `AndroidManifest.xml`
+- `values/proxy_strings.xml`
+- `drawable/ic_proxy.xml`
 
-        workerJob = controller.start(desired)
-    }
+## Verification
 
-    override fun onDestroy() {
-        // Track C ordering: cancel + join the worker BEFORE closing the cleanup owner.
-        runBlocking {
-            workerJob?.cancelAndJoin()
-            cleanupOwner.close()
-            composition?.close()
-            serviceScope.cancel()
-        }
-        super.onDestroy()
-    }
+Manifest merge, Android assembly, lint, JVM tests and release R8 all passed on executable head
+`a5fe4dd574faba2a6b29d5e55e72af5526798631`.
 
-    private fun startForegroundWithState() {
-        // Build a persistent notification; reuse the app's notification channel helper.
-        // startForeground(NOTIFICATION_ID, buildNotification(_state.value))
-    }
-    private fun updateNotification(state: ProxyOnlyState) { /* notify with typed reason */ }
-    private suspend fun containmentConfig(): ProxyFirewallConfig = /* deny-first config from settings */ TODO()
-}
-```
+## Remaining device evidence
 
-Key points, each grounded in an existing decision:
-
-- **Grant on `ACTION_RESUME` only** — honors the "no background activation from persisted
-  `enabled=true`" rule. `BootReceiver` must **not** start this service directly into an
-  active state; it may start it into `ActivationRequired`.
-- **`composeDesiredStates`** is the Track G seam that replaces `daemonHealthy`/
-  `daemonGeneration` with acknowledgement-backed identity. Confirm the exact method name
-  in `ProxyDaemonComposition`; if it differs, adapt.
-- **Teardown order** (`cancelAndJoin` worker → `close` owner) is the exact contract Track C
-  documented; violating it strands terminal cleanup debt.
-
----
-
-## Step I2 — manifest registration
-
-Add alongside the existing services. Match `TetheringService`'s `specialUse` FGS type and
-subtype property.
-
-```xml
-<service
-    android:name=".proxy.ProxyOnlyService"
-    android:directBootAware="true"
-    android:foregroundServiceType="specialUse">
-    <property
-        android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-        android:value="Keep an authenticated SOCKS5 proxy bound to the phone VPN active" />
-</service>
-```
-
-> If a later backend needs a different FGS type (e.g. `connectedDevice`), revisit the
-> subtype. Google Play's special-use FGS declaration form must be updated to match.
-
-No new runtime permission is required for the service itself; the proxy binds sockets to a
-VPN `Network` (Phase 1 backend) and issues root firewall commands via the existing daemon
-channel (Track K) — neither needs a new manifest permission beyond what tethering already
-declares.
-
----
-
-## Step I3 — start-into-`ActivationRequired` on boot/open
-
-- `MainActivity`/`BootReceiver`: when `ProxyOnlyPreferences.enabled == true`, start
-  `ProxyOnlyService` **without** a grant so it publishes `ActivationRequired` (persistent
-  notification + a Resume action). The UI's Resume button (Track J) sends `ACTION_RESUME`.
-- Mirror `BootReceiver.startIfEnabled()`'s existing pattern; add a proxy branch behind
-  `ProxyOnlyPreferences.enabled`.
-
----
-
-## Step I4 — tests
-
-Service classes are awkward under pure JVM tests; keep logic testable by delegating to the
-already-tested controller/composition and cover the thin service seams with Robolectric or
-an instrumented test:
-
-- binder publishes the controller's `ProxyOnlyState` transitions;
-- `ACTION_RESUME` issues exactly one grant and clears `ActivationRequired`;
-- `onDestroy` cancels+joins the worker before `cleanupOwner.close()` (assert ordering via a
-  test double owner that records call order).
-
-## Acceptance criteria
-
-- `ProxyOnlyService` is registered in the manifest with a valid FGS type and starts foreground.
-- Binder exposes `StateFlow<ProxyOnlyState>`; the UI can observe live state.
-- No background auto-activation: persisted `enabled` starts into `ActivationRequired`, not `Running`.
-- Teardown cancels/joins the worker before closing the cleanup owner.
-- `./gradlew assembleDebug` builds with the new service; lint passes the manifest.
-
-## Dependencies
-
-- Requires Track H (desired-state source) and Track K (`RootProxyFirewallRpc`).
-- The `ProxyServiceClient` backend (Hev) is stubbed here; real traffic needs the backend track.
-- Blocks Track J (UI binds this service).
+Instrumentation/device runs are still required for Android foreground-service policy variants,
+process death while enabled, rapid disable/re-enable, and long-running cleanup retry behavior.
