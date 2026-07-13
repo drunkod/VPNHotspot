@@ -51,12 +51,12 @@ flowchart LR
     Controller --> ServiceClient --> Backend
     Composition --> Rpc --> Transport --> Daemon --> Firewall --> Rules
 
-    Client == "TCP CONNECT / UDP ASSOCIATE" ==> Backend
-    Backend -. "DNS + bindSocket" .-> VpnNetwork
-    VpnNetwork == "VPN-only egress" ==> Internet
+    Client ==>|"TCP CONNECT / UDP ASSOCIATE"| Backend
+    Backend -.->|"DNS + bindSocket"| VpnNetwork
+    VpnNetwork ==>|"VPN-only egress"| Internet
 
-    Rules -. "admits exact downstream + IPv4 + MAC" .-> Client
-    Rules -. "rejects every other interface and IPv6" .-> Backend
+    Rules -.->|"admits exact downstream + IPv4 + MAC"| Client
+    Rules -.->|"rejects every other interface and IPv6"| Backend
 ```
 
 ### Boundary ownership
