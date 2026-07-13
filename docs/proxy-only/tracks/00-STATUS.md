@@ -6,6 +6,7 @@ Single source of truth for the proxy-only work on `agent/proxy-only-design`.
 - Executable source verified: `db27ed52a539e825f4980fa94098751232377dae`
 - Normal `Test` and `Dependency Review` workflows: **passed**
 - App-visible authenticated SOCKS5 MVP: **implemented**
+- Track L Mermaid architecture and evidence map: **documented**
 - Rooted physical-device/security evidence: **still required before release**
 
 ## Legend
@@ -31,6 +32,7 @@ Single source of truth for the proxy-only work on `agent/proxy-only-design`.
 | Authenticated TCP SOCKS5 CONNECT | ✅ | `KotlinSocks5Backend.kt` |
 | SOCKS5 UDP ASSOCIATE | ✅ | `KotlinSocks5Backend.kt` |
 | VPN-bound sockets and bounded VPN-aware DNS | ✅ code, 🟡 device evidence | `KotlinSocks5Backend.kt` |
+| Track L architecture and packet-evidence map | ✅ | [`architecture/TRACK-L-kotlin-socks5-architecture.md`](../architecture/TRACK-L-kotlin-socks5-architecture.md) |
 | Physical-device packet/leak matrix | ⬜ | required before release |
 
 ## User flow
@@ -67,7 +69,7 @@ listener starts until the user taps **Resume** and a new one-time grant is issue
 | I — production foreground service | ✅ |
 | J — Compose UI | ✅ |
 | K — root RPC transport and daemon lease | ✅ |
-| L — Kotlin SOCKS5 MVP data plane | 🟡 code complete; device evidence pending |
+| L — Kotlin SOCKS5 MVP data plane | 🟡 code complete; architecture documented; device evidence pending |
 
 ## Security and lifecycle properties implemented
 
@@ -76,7 +78,9 @@ listener starts until the user taps **Resume** and a new one-time grant is issue
 - Exactly one VPN transport is required.
 - Every outbound TCP/UDP socket is bound to that VPN before use.
 - Domain resolution uses the selected VPN `Network`, with two-way concurrency limiting and a
-  five-second request deadline.
+  five-second caller deadline.
+- The blocking platform resolver may outlive a timed-out caller; this bounded cancellation boundary
+  and the future async `DnsResolver` option are documented in the Track L architecture companion.
 - SOCKS5 username/password authentication is mandatory.
 - TCP relay output is flushed for every copied chunk, preserving interactive and small responses.
 - UDP replies are accepted only from a bounded set of remote address/port pairs requested by the
@@ -138,3 +142,4 @@ the Kotlin path without completing its original hook, DNS, UDP and lifecycle evi
 - [Track J](TRACK-J-compose-ui.md)
 - [Track K](TRACK-K-root-rpc-transport.md)
 - [Track L](TRACK-L-kotlin-socks-backend.md)
+- [Track L architecture diagrams](../architecture/TRACK-L-kotlin-socks5-architecture.md)
