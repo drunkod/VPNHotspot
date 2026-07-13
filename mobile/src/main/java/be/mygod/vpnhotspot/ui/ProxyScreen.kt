@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.weight
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -35,11 +36,9 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import be.mygod.vpnhotspot.R
 import be.mygod.vpnhotspot.proxy.FailClosedReason
-import be.mygod.vpnhotspot.proxy.ProxyCredentialStore
 import be.mygod.vpnhotspot.proxy.ProxyCredentials
 import be.mygod.vpnhotspot.proxy.ProxyOnlyPreferences
 import be.mygod.vpnhotspot.proxy.ProxyOnlyService
-import be.mygod.vpnhotspot.proxy.ProxyOnlySettings
 import be.mygod.vpnhotspot.proxy.ProxyOnlyState
 import be.mygod.vpnhotspot.proxy.proxySettingsFlow
 import kotlinx.coroutines.launch
@@ -147,11 +146,16 @@ fun ProxyScreen(
                         val port = tcpPort.toIntOrNull()
                         val start = udpStart.toIntOrNull()
                         val end = udpEnd.toIntOrNull()
-                        if (port !in 1..65_535 || start !in 1..65_535 || end !in (start ?: 65_536)..65_535) {
+                        val tcpValid = port != null && port in 1..65_535
+                        val udpValid = !settings.udpEnabled ||
+                            (start != null && end != null && start in 1..65_535 && end in start..65_535)
+                        if (!tcpValid || !udpValid) {
                             scope.launch { snackbarHostState.showSnackbar(context.getString(R.string.proxy_invalid_ports)) }
                         } else {
-                            ProxyOnlyPreferences.setTcpPort(port!!)
-                            ProxyOnlyPreferences.setUdpRange(start!!..end!!)
+                            ProxyOnlyPreferences.setTcpPort(checkNotNull(port))
+                            if (settings.udpEnabled) {
+                                ProxyOnlyPreferences.setUdpRange(checkNotNull(start)..checkNotNull(end))
+                            }
                             scope.launch { snackbarHostState.showSnackbar(context.getString(R.string.proxy_settings_saved)) }
                         }
                     }) {
@@ -212,7 +216,7 @@ private fun ProxyStateRow(state: ProxyOnlyState, onResume: () -> Unit) {
     }
     ListItem(
         headlineContent = { Text(title) },
-        supportingContent = detail?.let { { Text(it) } },
+        supportingContent = if (detail == null) null else {{ Text(detail) }},
         trailingContent = if (state == ProxyOnlyState.ActivationRequired) {
             { TextButton(onClick = onResume) { Text(stringResource(R.string.proxy_resume)) } }
         } else null,
@@ -259,7 +263,7 @@ private fun CredentialsCard(
                             "${credentials.username}\n${credentials.password}",
                         ))
                     }) { Text(stringResource(R.string.proxy_copy_credentials)) }
-                    TextButton(onClick = onRotate, enabled = state !is ProxyOnlyState.StartingBackend) {
+                    TextButton(onClick = onRotate, enabled = state != ProxyOnlyState.StartingBackend) {
                         Text(stringResource(R.string.proxy_rotate_credentials))
                     }
                 }
