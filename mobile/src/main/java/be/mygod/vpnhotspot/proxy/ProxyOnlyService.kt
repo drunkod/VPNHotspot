@@ -16,6 +16,7 @@ import be.mygod.vpnhotspot.MainActivity
 import be.mygod.vpnhotspot.R
 import be.mygod.vpnhotspot.root.daemon.DaemonController
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -34,7 +35,6 @@ import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -50,7 +50,8 @@ class ProxyOnlyService : Service() {
         const val ACTION_ROTATE_CREDENTIALS = "be.mygod.vpnhotspot.proxy.ROTATE_CREDENTIALS"
 
         private const val CHANNEL_ID = "proxy-only"
-        private const val NOTIFICATION_ID = 2
+        // ServiceNotification owns ID 1. Keep this feature in a separate stable range.
+        private const val NOTIFICATION_ID = 1_002
         private const val FGS_NOT_ALLOWED_CLASS = "android.app.ForegroundServiceStartNotAllowedException"
 
         /**
@@ -84,6 +85,10 @@ class ProxyOnlyService : Service() {
     private val serviceScope = CoroutineScope(
         serviceJob + Dispatchers.Default + CoroutineName("proxy-only-service"),
     )
+    /** Independent fallback scope: Android lifecycle callbacks must never block the main thread. */
+    private val destroyScope = CoroutineScope(
+        SupervisorJob() + Dispatchers.IO + CoroutineName("proxy-only-destroy"),
+    )
     private val cleanupOwner = ProxyServiceCleanupOwner(serviceScope.coroutineContext)
     private val mutableState = MutableStateFlow<ProxyOnlyState>(ProxyOnlyState.Disabled)
     val state: StateFlow<ProxyOnlyState> = mutableState.asStateFlow()
@@ -92,6 +97,7 @@ class ProxyOnlyService : Service() {
     private val foreground = AtomicBoolean(false)
     private val activated = MutableStateFlow(false)
     private val binder = Binder(this)
+    private val daemonReleaseMutex = Mutex()
 
     lateinit var settings: StateFlow<ProxyOnlySettings>
         private set
@@ -150,7 +156,7 @@ class ProxyOnlyService : Service() {
                     mutableState.value = state
                     updateNotification(state)
                     if (state == ProxyOnlyState.Disabled && !ProxyOnlyPreferences.enabled) {
-                        stopForegroundAndSelf()
+                        withContext(Dispatchers.Main.immediate) { stopForegroundAndSelf() }
                     }
                 }
             },
@@ -203,16 +209,21 @@ class ProxyOnlyService : Service() {
     }
 
     override fun onDestroy() {
-        runBlocking {
-            withContext(NonCancellable) {
-                workerJob?.cancelAndJoin()
-                cleanupOwner.close()
-                releaseDaemonResources()
-            }
-        }
         activated.value = false
-        serviceScope.cancel()
         foreground.set(false)
+        workerJob?.cancel(CancellationException("ProxyOnlyService destroyed"))
+        bootstrapJob?.cancel(CancellationException("ProxyOnlyService destroyed"))
+
+        // The ordinary disable path has already performed ordered cleanup before stopSelf(). This
+        // fallback handles OS-driven destruction without runBlocking the main thread. The independent
+        // IO scope can wait for terminal cleanup while preserving Track C's worker-join-before-owner-close order.
+        destroyScope.launch {
+            workerJob?.join()
+            cleanupOwner.close()
+            releaseDaemonResources()
+            serviceScope.cancel()
+            destroyScope.cancel()
+        }
         super.onDestroy()
     }
 
@@ -256,12 +267,15 @@ class ProxyOnlyService : Service() {
         stopSelf()
     }
 
-    internal suspend fun releaseDaemonResources() {
-        bootstrapJob?.cancelAndJoin()
-        bootstrapJob = null
-        daemonLease?.close()
-        daemonLease = null
-        composition.transportDisconnected()
+    internal suspend fun releaseDaemonResources() = withContext(NonCancellable) {
+        daemonReleaseMutex.withLock {
+            bootstrapJob?.cancelAndJoin()
+            bootstrapJob = null
+            val lease = daemonLease
+            daemonLease = null
+            lease?.close()
+            composition.transportDisconnected()
+        }
     }
 
     private fun startDaemonBootstrap() {
@@ -335,7 +349,7 @@ class ProxyOnlyService : Service() {
                     Notification.Action.Builder(
                         R.drawable.ic_proxy,
                         getText(R.string.proxy_resume),
-                        PendingIntent.getService(
+                        PendingIntent.getForegroundService(
                             this@ProxyOnlyService,
                             1,
                             Intent(this@ProxyOnlyService, ProxyOnlyService::class.java)
