@@ -43,18 +43,38 @@ data class ProxyDaemonState(
 
 /** Single source of truth for daemon identity used by [DesiredProxyState]. */
 class ProxyDaemonStateTracker {
+    /** Identifies the transport epoch in which one RPC was issued. */
+    class RequestFence internal constructor(internal val transportEpoch: Long)
+
     private val mutableState = MutableStateFlow(ProxyDaemonState.Unavailable)
+    private var transportEpoch = 0L
     val state: StateFlow<ProxyDaemonState> get() = mutableState
 
-    fun acknowledge(sessionId: Long, generation: Long) {
+    @Synchronized
+    fun beginRequest(): RequestFence = RequestFence(transportEpoch)
+
+    /** Returns false when this acknowledgement belongs to an invalidated transport epoch. */
+    @Synchronized
+    fun acknowledge(fence: RequestFence, sessionId: Long, generation: Long): Boolean {
+        if (fence.transportEpoch != transportEpoch) return false
         mutableState.value = ProxyDaemonState(
             healthy = true,
             sessionId = sessionId,
             generation = generation,
         )
+        return true
     }
 
-    fun disconnected() {
+    /**
+     * Invalidates all requests issued in the current transport epoch.
+     *
+     * When [fence] is supplied, a failure from an already-invalidated epoch cannot clear a newer
+     * acknowledgement. Explicit disconnects omit the fence and always advance the epoch.
+     */
+    @Synchronized
+    fun disconnected(fence: RequestFence? = null) {
+        if (fence != null && fence.transportEpoch != transportEpoch) return
+        transportEpoch += 1L
         mutableState.value = ProxyDaemonState.Unavailable
     }
 }
@@ -63,31 +83,49 @@ class ProxyDaemonStateTracker {
  * RPC decorator that makes acknowledgement identity the authoritative health/generation source.
  *
  * Successful and stale-token acknowledgements publish identity. INVALID/IO_ERROR responses do not
- * publish a transient usable state, and transport [IOException] clears the tracker.
+ * publish a transient usable state. Transport failures, malformed authoritative identities and
+ * acknowledgements arriving after an explicit disconnect fail closed and clear the matching epoch.
  */
 class TrackingProxyFirewallRpc(
     private val delegate: ProxyFirewallRpc,
     private val tracker: ProxyDaemonStateTracker,
 ) : ProxyFirewallRpc {
-    override suspend fun execute(command: ProxyFirewallCommand): ProxyFirewallAck = try {
-        delegate.execute(command).also { acknowledgement ->
-            when (acknowledgement.status) {
-                ProxyFirewallAck.Status.OK,
-                ProxyFirewallAck.Status.STALE_SESSION,
-                ProxyFirewallAck.Status.STALE_EPOCH -> acknowledgement.identity?.let { identity ->
-                    tracker.acknowledge(
-                        sessionId = identity.session_id,
-                        generation = identity.generation,
-                    )
+    override suspend fun execute(command: ProxyFirewallCommand): ProxyFirewallAck {
+        val fence = tracker.beginRequest()
+        return try {
+            delegate.execute(command).also { acknowledgement ->
+                when (acknowledgement.status) {
+                    ProxyFirewallAck.Status.OK,
+                    ProxyFirewallAck.Status.STALE_SESSION,
+                    ProxyFirewallAck.Status.STALE_EPOCH -> {
+                        val identity = acknowledgement.identity ?: throw IOException(
+                            "proxy firewall acknowledgement missing daemon identity",
+                        )
+                        if (identity.session_id == 0L || identity.generation == 0L) {
+                            throw IOException(
+                                "proxy firewall acknowledgement contains zero daemon identity",
+                            )
+                        }
+                        if (!tracker.acknowledge(
+                                fence = fence,
+                                sessionId = identity.session_id,
+                                generation = identity.generation,
+                            )
+                        ) {
+                            throw IOException(
+                                "proxy firewall acknowledgement arrived after transport disconnect",
+                            )
+                        }
+                    }
+                    ProxyFirewallAck.Status.INVALID,
+                    ProxyFirewallAck.Status.IO_ERROR,
+                    is ProxyFirewallAck.Status.Unrecognized -> Unit
                 }
-                ProxyFirewallAck.Status.INVALID,
-                ProxyFirewallAck.Status.IO_ERROR,
-                is ProxyFirewallAck.Status.Unrecognized -> Unit
             }
+        } catch (failure: IOException) {
+            tracker.disconnected(fence)
+            throw failure
         }
-    } catch (failure: IOException) {
-        tracker.disconnected()
-        throw failure
     }
 }
 
@@ -97,7 +135,8 @@ class TrackingProxyFirewallRpc(
  * The same private tracker feeds both [firewallClient] and [desiredStates]. Call [bootstrap]
  * before starting the controller and again after the root transport reconnects. All bootstrap and
  * controller firewall operations are serialized through one mutex so the client's latest sanitation
- * token cannot be overwritten out of acknowledgement order.
+ * token cannot be overwritten out of acknowledgement order. The tracker additionally fences any
+ * in-flight acknowledgement that races an explicit transport disconnect.
  */
 class ProxyDaemonComposition(
     rpc: ProxyFirewallRpc,
