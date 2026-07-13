@@ -52,9 +52,12 @@ class ProxyOnlyService : Service() {
         private const val NOTIFICATION_ID = 2
         private const val FGS_NOT_ALLOWED_CLASS = "android.app.ForegroundServiceStartNotAllowedException"
 
-        fun startIfEnabled(context: Context) {
-            if (ProxyOnlyPreferences.enabled) request(context, ACTION_START)
-        }
+        /**
+         * Deliberately does not start anything. A persisted enable bit is not an activation grant;
+         * binding the screen exposes ActivationRequired until the user explicitly resumes.
+         */
+        @Suppress("UNUSED_PARAMETER")
+        fun startIfEnabled(context: Context) = Unit
 
         fun request(context: Context, action: String) {
             val intent = Intent(context, ProxyOnlyService::class.java).setAction(action)
@@ -160,7 +163,7 @@ class ProxyOnlyService : Service() {
         workerJob = controller.start(composition.desiredStates(desired))
         bootstrapJob = serviceScope.launch {
             while (isActive) {
-                if (settings.value.enabled) {
+                if (settings.value.enabled && ProxyActivationGrants.pending.value != null) {
                     if (daemonLease == null) {
                         daemonLease = runCatching { DaemonController.acquireLease() }
                             .onFailure { Timber.tag("ProxyOnly").w(it, "Root daemon lease failed") }
@@ -200,15 +203,14 @@ class ProxyOnlyService : Service() {
             }
             ACTION_ROTATE_CREDENTIALS -> {
                 mutableCredentials.value = ProxyCredentialStore.rotate()
-                if (ProxyOnlyPreferences.enabled) ensureForeground(mutableState.value)
             }
             ACTION_START -> {
-                if (ProxyOnlyPreferences.enabled) ensureForeground(ProxyOnlyState.ActivationRequired)
-                else stopSelfResult(startId)
+                if (!ProxyOnlyPreferences.enabled) stopSelfResult(startId)
+                else mutableState.value = ProxyOnlyState.ActivationRequired
             }
             else -> Timber.tag("ProxyOnly").w("Unknown service action %s", intent?.action)
         }
-        return if (ProxyOnlyPreferences.enabled) START_STICKY else START_NOT_STICKY
+        return START_NOT_STICKY
     }
 
     override fun onDestroy() {
