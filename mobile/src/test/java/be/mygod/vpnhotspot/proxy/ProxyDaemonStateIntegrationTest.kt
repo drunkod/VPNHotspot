@@ -6,6 +6,7 @@ import be.mygod.vpnhotspot.proxy.proto.ProxyFirewallCommand
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
@@ -165,6 +166,54 @@ class ProxyDaemonStateIntegrationTest {
         composition.transportDisconnected()
 
         assertEquals(ProxyDaemonState.Unavailable, composition.daemonState.value)
+    }
+
+    @Test
+    fun lateAcknowledgementCannotRestoreHealthAfterExplicitDisconnect() = runBlocking {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val rpc = object : ProxyFirewallRpc {
+            override suspend fun execute(command: ProxyFirewallCommand): ProxyFirewallAck {
+                entered.complete(Unit)
+                release.await()
+                return ack(session = 41, epoch = 1, generation = 51)
+            }
+        }
+        val composition = composition(rpc)
+        val bootstrap = async { composition.bootstrap() }
+
+        entered.await()
+        composition.transportDisconnected()
+        assertEquals(ProxyDaemonState.Unavailable, composition.daemonState.value)
+
+        release.complete(Unit)
+        assertEquals(ProxyDaemonState.Unavailable, bootstrap.await())
+        assertEquals(ProxyDaemonState.Unavailable, composition.daemonState.value)
+    }
+
+    @Test
+    fun malformedAuthoritativeAcknowledgementInvalidatesPreviousHealth() = runBlocking {
+        val malformed = listOf(
+            ProxyFirewallAck(
+                status = ProxyFirewallAck.Status.OK,
+                identity = null,
+            ),
+            ack(session = 0, epoch = 2, generation = 9),
+            ack(session = 7, epoch = 2, generation = 0),
+        )
+
+        for (acknowledgement in malformed) {
+            val composition = composition(
+                FakeRpc(
+                    ack(session = 7, epoch = 1, generation = 9),
+                    acknowledgement,
+                ),
+            )
+            assertTrue(composition.bootstrap().healthy)
+
+            assertEquals(ProxyDaemonState.Unavailable, composition.bootstrap())
+            assertEquals(ProxyDaemonState.Unavailable, composition.daemonState.value)
+        }
     }
 
     @Test
