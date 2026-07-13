@@ -142,4 +142,5 @@ the Kotlin path without completing its original hook, DNS, UDP and lifecycle evi
 - [Track J](TRACK-J-compose-ui.md)
 - [Track K](TRACK-K-root-rpc-transport.md)
 - [Track L](TRACK-L-kotlin-socks-backend.md)
+- [Architecture diagram index](../architecture/README.md)
 - [Track L architecture diagrams](../architecture/TRACK-L-kotlin-socks5-architecture.md)
