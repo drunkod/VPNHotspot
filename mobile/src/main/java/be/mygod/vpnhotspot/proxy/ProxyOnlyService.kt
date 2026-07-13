@@ -61,8 +61,10 @@ class ProxyOnlyService : Service() {
 
         fun request(context: Context, action: String) {
             val intent = Intent(context, ProxyOnlyService::class.java).setAction(action)
-            if (action == ACTION_DISABLE) context.startService(intent)
-            else ContextCompat.startForegroundService(context, intent)
+            when (action) {
+                ACTION_DISABLE, ACTION_ROTATE_CREDENTIALS -> context.startService(intent)
+                else -> ContextCompat.startForegroundService(context, intent)
+            }
         }
     }
 
@@ -163,7 +165,7 @@ class ProxyOnlyService : Service() {
         workerJob = controller.start(composition.desiredStates(desired))
         bootstrapJob = serviceScope.launch {
             while (isActive) {
-                if (settings.value.enabled && ProxyActivationGrants.pending.value != null) {
+                if (settings.value.enabled && foreground.get()) {
                     if (daemonLease == null) {
                         daemonLease = runCatching { DaemonController.acquireLease() }
                             .onFailure { Timber.tag("ProxyOnly").w(it, "Root daemon lease failed") }
