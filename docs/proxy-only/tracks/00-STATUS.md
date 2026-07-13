@@ -6,6 +6,7 @@ implementation-review rounds.
 
 - Implementation branch: `agent/proxy-only-design`
 - Latest verified clean source head: `81d902c60ec05b068c86cb4a51e8f341ed01007a`
+- Documentation commits may follow that source head without changing executable code
 - Verification source: the normal `Test` and `Dependency Review` workflows
 - PR state: **draft** (correctly held; Android service/root transport, native backend and
   physical-device evidence remain)
