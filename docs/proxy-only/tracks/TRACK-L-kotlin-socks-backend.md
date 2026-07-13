@@ -10,8 +10,9 @@ allowed by the implementation plan when the native feasibility spike is not yet 
 
 ## Architecture
 
-The full visual architecture, request sequences, lifecycle model, trust boundaries and device
-capture plan are documented in
+The [architecture diagram index](../architecture/README.md) links the visual companions for the
+proxy-only tracks. Track L's full system context, request sequences, lifecycle model, trust
+boundaries and device capture plan are documented in
 [Track L Kotlin SOCKS5 architecture](../architecture/TRACK-L-kotlin-socks5-architecture.md).
 
 ```mermaid
@@ -114,6 +115,7 @@ IO scope. Foreground stop calls are dispatched to the main thread.
 - `proxy/ProxyOnlyService.kt`
 - `proxy/KotlinSocks5BackendHelpersTest.kt`
 - `rust/vpnhotspotd/src/proxy_firewall_kernel.rs`
+- `docs/proxy-only/architecture/README.md`
 - `docs/proxy-only/architecture/TRACK-L-kotlin-socks5-architecture.md`
 
 ## Verification
