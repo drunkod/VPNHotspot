@@ -5,9 +5,9 @@ in the proxy-only Phase 0 spike. Supersedes the scattered status notes across th
 implementation-review rounds.
 
 - Implementation branch: `agent/proxy-only-design`
-- Verification source: the current PR head, enforced by the normal `Test` and
-  `Dependency Review` workflows
-- PR state: **draft** (correctly held; production service/backend integration and
+- Latest verified clean source head: `81d902c60ec05b068c86cb4a51e8f341ed01007a`
+- Verification source: the normal `Test` and `Dependency Review` workflows
+- PR state: **draft** (correctly held; Android service/root transport, native backend and
   physical-device evidence remain)
 
 ## Legend
@@ -26,13 +26,14 @@ implementation-review rounds.
 | Itemized cleanup debt model | `proxy/CleanupDebt.kt` | ✅ bounded and deduplicated failure history (Track D) |
 | Domain models + normalization | `proxy/ProxyModels.kt`, `proxy/ProxyNormalizationReport.kt` | ✅ typed diagnostics and deterministic downstream address selection (Track E) |
 | Service/firewall client interfaces | `proxy/ProxyServiceClient.kt` | ✅ interfaces defined; stable cleanup-failure identity added |
-| VPN selector | `proxy/ProxyVpnSelector.kt` | 🟡 selection logic present; production composition pending |
+| Daemon health/firewall composition | `proxy/ProxyDaemonState.kt`, `proxy/DaemonProxyFirewallClient.kt` | ✅ acknowledgement-backed generation, deny-first bootstrap and serialized token use (Track G) |
+| VPN selector | `proxy/ProxyVpnSelector.kt` | 🟡 selection logic present; production Android composition pending |
 | Probe and UDP topology types | `proxy/Probes.kt`, `proxy/UdpTopology.kt` | 🟡 scaffolding/integration pending |
-| Proxy firewall wire protocol | `mobile/src/main/proto/proxy_firewall.proto`, `daemon.proto` | ✅ command envelope, authoritative identity and typed acks |
+| Proxy firewall wire protocol | `mobile/src/main/proto/proxy_firewall.proto`, `daemon.proto` | ✅ command envelope, authoritative identity and typed acknowledgements |
 | Rust daemon proxy firewall | `rust/vpnhotspotd/src/proxy_firewall/`, `proxy_firewall_kernel.rs` | ✅ enforced token boundary, ledger, persistent session store and iptables backend |
-| Kotlin daemon firewall adapter | `proxy/DaemonProxyFirewallClient.kt` | ✅ wire mapping, transport-failure null gate and generation cross-check |
-| Proxy controller/protocol tests | `mobile/src/test/java/be/mygod/vpnhotspot/proxy/` | ✅ Tracks A–E plus reviewed race/transport regressions |
+| Proxy controller/protocol/composition tests | `mobile/src/test/java/be/mygod/vpnhotspot/proxy/` | ✅ Tracks A–G plus reviewed race/transport regressions |
 | Dependency graph submission/review | `.github/workflows/` | ✅ submission and moderate-severity review operational |
+| **Concrete root-process request/reply transport for proxy commands** | — | ⬜ not implemented in the proxy composition |
 | **Production ProxyService foreground service** | — | ⬜ not implemented; Phase-0 cleanup owner is not the Android FGS |
 | **Hev backend / native hook integration** | — | ⬜ no pinned backend/JNI production integration |
 
@@ -58,8 +59,8 @@ protocol seams:
 - IPv4 rules bind downstream interface + client IP + MAC and IPv6 listener/relay ports
   remain denied.
 
-The concrete foreground-service RPC transport, health composition and backend remain
-production integration.
+The concrete root-process proxy RPC transport and Android service remain production
+integration.
 
 ## Track C result — complete, review hardening applied
 
@@ -72,8 +73,8 @@ Track C replaces the raw cleanup-scope promise with an owned lifecycle object:
 - retry state is mutated under `stateMutex`, including worker-finally teardown;
 - service retry eligibility comes from immutable `CleanupDebt.serviceWasActivated`;
 - non-activated service/listener/feature debt resolves as void without IPC;
-- the lifecycle regression now enters the real worker-finally path, creates terminal
-  debt, joins the worker, and proves supervisor-owned IPC drains the debt afterward;
+- the lifecycle regression enters the real worker-finally path, creates terminal debt,
+  joins the worker, and proves supervisor-owned IPC drains the debt afterward;
 - owner documentation requires cancel/join of the worker before final cleanup-owner
   shutdown.
 
@@ -82,7 +83,7 @@ service.
 
 ## Track D result — complete
 
-Cleanup failure history is now deterministic and bounded:
+Cleanup failure history is deterministic and bounded:
 
 - `CleanupFailure.kind` and `CleanupFailure.key` provide stable identity without relying
   on `Throwable.equals`;
@@ -116,6 +117,25 @@ Dependency graph submission and read-only PR Dependency Review are operational.
 `fail-on-severity: moderate` remains enforced; no warning-only bypass or blanket
 suppression was added.
 
+## Track G result — complete
+
+Daemon health and generation composition now obey the Track B acknowledgement contract:
+
+- `ProxyDaemonState` permits only unavailable state or a complete non-zero acknowledged
+  `(sessionId, generation)` identity;
+- raw desired-state health/generation values are overwritten by the acknowledged state;
+- deny-first sanitation bootstraps identity before the controller worker starts and after
+  root transport reconnect;
+- failed sanitation cannot transiently publish healthy state;
+- transport disconnect clears health and generation immediately;
+- one composition-owned mutex serializes reconnect bootstrap with every controller firewall
+  operation, preventing latest-token overwrite races;
+- regressions cover initial bootstrap, daemon restart, failed acknowledgement, disconnect,
+  identity validation and concurrent bootstrap/controller sanitation.
+
+This closes the generation-clock composition seam. The concrete root-process transport and
+physical-device restart test remain open.
+
 ## Phase 0 exit criteria
 
 | Criterion | State | Track |
@@ -132,6 +152,7 @@ suppression was added.
 | Explicit IPv4/IPv6 denial | ✅ daemon-enforced proxy chains | B |
 | Authoritative stale-token rejection | ✅ zero-mutation Rust tests | B |
 | Authoritative sanitation generation agreement | ✅ controller fail-closed cross-checks | A, B |
+| Acknowledgement-backed desired-state generation | ✅ owned bootstrap and serialized composition | G |
 | Crash-persistent unique daemon session identity | ✅ serial + thread + process tests | B |
 | Itemized cleanup debt + partial resolution | ✅ bounded history and focused regressions | A, D |
 | Service-owned self-triggered cleanup retry | ✅ real worker-exit lifecycle regression | C |
@@ -139,18 +160,20 @@ suppression was added.
 | No restart over unresolved firewall debt | ✅ focused generation/race tests | A, B |
 | Repeated start/stop without FD/thread leaks | ⬜ | backend/service integration |
 
-## Open blockers after Tracks A–F
+## Open blockers after Tracks A–G
 
 | # | Blocker | Priority |
 | --- | --- | --- |
-| 1 | Production foreground service, concrete RPC/health composition and Hev backend/JNI integration are absent | P0 before release |
-| 2 | UDP/DNS evidence and physical-device start/stop/restart/leak verification are absent | P0 before release |
+| 1 | Production Android foreground service and concrete root-process proxy request/reply transport are absent | P0 before release |
+| 2 | Pinned Hev/native backend, JNI boundary and VPN-bound socket hooks are absent | P0 before release |
+| 3 | UDP/DNS evidence and physical-device start/stop/restart/leak verification are absent | P0 before release |
 
 ## Recommended sequencing
 
-1. Build the production foreground service, RPC/health composition and backend integration.
-2. Complete VPN-bound socket and typed probe integration.
-3. Run UDP/DNS evidence and physical-device start/stop/restart/leak verification.
+1. Build the root-process proxy transport and production foreground-service composition around
+   `ProxyDaemonComposition`.
+2. Integrate the pinned native backend and VPN-bound socket/probe paths.
+3. Run actual daemon-restart, UDP/DNS and repeated lifecycle evidence on devices.
 
 ## Track index
 
@@ -160,9 +183,10 @@ suppression was added.
 - ✅ [Track D — bounded failure history](TRACK-D-bounded-failure-history.md)
 - ✅ [Track E — normalization diagnostics + deterministic selection](TRACK-E-normalization-diagnostics.md)
 - ✅ [Track F — Dependency Review CI fix](TRACK-F-dependency-review-ci.md)
+- ✅ [Track G — acknowledgement-backed daemon health composition](TRACK-G-daemon-health-composition.md)
 
 ## Definition of done for Phase 0 sign-off
 
-Tracks A–F controller/model/protocol work is complete. The PR must remain draft until the
-production foreground service/backend composition and the remaining device evidence rows
-are complete.
+Tracks A–G controller/model/protocol/composition work is complete. The PR must remain draft
+until the production Android service/root transport, native backend integration and remaining
+device evidence rows are complete.
