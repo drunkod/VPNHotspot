@@ -1,7 +1,8 @@
 # Proxy-only architecture diagrams
 
-This directory contains rendered Mermaid architecture companions for the proxy-only implementation
-tracks.
+This directory contains GitHub-rendered Mermaid architecture companions for the proxy-only
+implementation tracks. The diagrams document the implemented boundaries; they do not replace the
+rooted-device and packet evidence required for release.
 
 ## Available diagrams
 
