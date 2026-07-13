@@ -1,6 +1,6 @@
 # Track J — Compose proxy UI
 
-Status: **implemented and verified**
+Status: **implemented and build-verified; physical UI QA pending**
 
 ## Result
 
