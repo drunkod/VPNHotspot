@@ -3,7 +3,7 @@
 Single source of truth for the proxy-only work on `agent/proxy-only-design`.
 
 - PR: #1, intentionally **draft**
-- Executable source verified: `a5fe4dd574faba2a6b29d5e55e72af5526798631`
+- Executable source verified: `db27ed52a539e825f4980fa94098751232377dae`
 - Normal `Test` and `Dependency Review` workflows: **passed**
 - App-visible authenticated SOCKS5 MVP: **implemented**
 - Rooted physical-device/security evidence: **still required before release**
@@ -30,7 +30,7 @@ Single source of truth for the proxy-only work on `agent/proxy-only-design`.
 | Root firewall ACL and global containment | ✅ | Rust `proxy_firewall` + `proxy_firewall_kernel.rs` |
 | Authenticated TCP SOCKS5 CONNECT | ✅ | `KotlinSocks5Backend.kt` |
 | SOCKS5 UDP ASSOCIATE | ✅ | `KotlinSocks5Backend.kt` |
-| VPN-bound sockets and VPN-aware DNS | ✅ code, 🟡 device evidence | `KotlinSocks5Backend.kt` |
+| VPN-bound sockets and bounded VPN-aware DNS | ✅ code, 🟡 device evidence | `KotlinSocks5Backend.kt` |
 | Physical-device packet/leak matrix | ⬜ | required before release |
 
 ## User flow
@@ -69,14 +69,18 @@ listener starts until the user taps **Resume** and a new one-time grant is issue
 | K — root RPC transport and daemon lease | ✅ |
 | L — Kotlin SOCKS5 MVP data plane | 🟡 code complete; device evidence pending |
 
-## Security properties implemented
+## Security and lifecycle properties implemented
 
 - No runtime starts over unresolved cleanup debt.
 - Persisted enable state is not an activation grant.
 - Exactly one VPN transport is required.
 - Every outbound TCP/UDP socket is bound to that VPN before use.
-- Domain resolution uses the selected VPN `Network`.
+- Domain resolution uses the selected VPN `Network`, with two-way concurrency limiting and a
+  five-second request deadline.
 - SOCKS5 username/password authentication is mandatory.
+- TCP relay output is flushed for every copied chunk, preserving interactive and small responses.
+- UDP replies are accepted only from a bounded set of remote address/port pairs requested by the
+  client, and the success reply advertises a reachable downstream relay address.
 - Firewall sanitation is deny-first and identity-checked in the root daemon.
 - IPv4 admission requires downstream interface + client IPv4 + client MAC.
 - Allowed rules are followed by per-downstream and unconditional proxy-port rejects, preventing
@@ -86,6 +90,9 @@ listener starts until the user taps **Resume** and a new one-time grant is issue
 - Idle root-daemon lifetime is explicit through a reference-counted lease.
 - Disable closes the backend and releases root-backed monitoring/transport even while UI remains
   bound.
+- Backend shutdown joins the entire runtime coroutine tree.
+- Foreground stop operations run on the main thread; OS-driven service destruction performs
+  ordered fallback cleanup without blocking the main thread.
 
 ## Verification on executable head
 
@@ -95,7 +102,7 @@ listener starts until the user taps **Resume** and a new one-time grant is issue
 - Rust dependency audit: passed
 - Android debug assembly: passed
 - Android lint: passed
-- JVM tests, including Tracks A–K integration regressions: passed
+- JVM tests, including relay flushing, bounded UDP allowlist and Tracks A–K regressions: passed
 - release R8 coroutine-debug verification: passed
 - Dependency Review with moderate-severity failure policy: passed
 - APK and report artifacts: uploaded
