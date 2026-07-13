@@ -13,6 +13,8 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.EOFException
 import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
 import java.net.BindException
 import java.net.ConnectException
 import java.net.DatagramPacket
@@ -37,8 +39,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.joinAll
@@ -46,13 +48,56 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+
+/** Copies a relay stream and flushes every chunk so small/interactive responses are delivered promptly. */
+internal fun InputStream.copyToAndFlush(
+    output: OutputStream,
+    bufferSize: Int = DEFAULT_BUFFER_SIZE,
+): Long {
+    require(bufferSize > 0) { "bufferSize must be positive" }
+    val buffer = ByteArray(bufferSize)
+    var copied = 0L
+    while (true) {
+        val read = read(buffer)
+        if (read < 0) break
+        if (read == 0) continue
+        output.write(buffer, 0, read)
+        output.flush()
+        copied += read
+    }
+    return copied
+}
+
+/** Bounded set of remote UDP endpoints that this association has actually contacted. */
+internal class UdpRemoteAllowlist(private val maxEntries: Int) {
+    init {
+        require(maxEntries > 0) { "maxEntries must be positive" }
+    }
+
+    private val entries = LinkedHashSet<InetSocketAddress>()
+
+    @Synchronized
+    fun record(endpoint: InetSocketAddress) {
+        entries.remove(endpoint)
+        entries.add(endpoint)
+        while (entries.size > maxEntries) entries.remove(entries.first())
+    }
+
+    @Synchronized
+    operator fun contains(endpoint: InetSocketAddress): Boolean = endpoint in entries
+
+    @Synchronized
+    internal fun size(): Int = entries.size
+}
 
 /**
  * App-owned SOCKS5 backend for the MVP.
  *
  * It implements authenticated TCP CONNECT and UDP ASSOCIATE. Every Internet-facing socket is
- * bound to the selected Android VPN [Network] before connect/send, and domain resolution uses
- * [Network.getAllByName] so no process-default fallback exists.
+ * bound to the selected Android VPN [Network] before connect/send. Domain resolution uses a
+ * small bounded dispatcher plus a per-request timeout around [Network.getAllByName], so VPN DNS
+ * blackholes cannot create unbounded resolver concurrency or indefinitely wedge proxy sessions.
  */
 class KotlinSocks5Backend(
     private val connectivity: ConnectivityManager = checkNotNull(app.getSystemService()),
@@ -62,9 +107,10 @@ class KotlinSocks5Backend(
         val config: ProxyBackendConfig,
         val network: Network,
         val server: ServerSocket,
+        val rootJob: Job,
         val scope: CoroutineScope,
     ) {
-        lateinit var acceptJob: Job
+        val closeMutex = Mutex()
         val closeables = ConcurrentHashMap.newKeySet<Closeable>()
         val activeTcp = AtomicInteger()
         val activeUdp = AtomicInteger()
@@ -82,11 +128,13 @@ class KotlinSocks5Backend(
     private val nextId = AtomicLong(1L)
     private val runtimes = mutableMapOf<Long, Runtime>()
     private val random = SecureRandom()
+    private val dnsDispatcher = Dispatchers.IO.limitedParallelism(DNS_WORKER_COUNT)
 
     override suspend fun start(config: ProxyBackendConfig): ProxyBackendHandle {
         require(config.tcpPort in 1..65_535)
         require(config.udpPortRange == null ||
-            (config.udpPortRange.first in 1..65_535 && config.udpPortRange.last in config.udpPortRange.first..65_535))
+            (config.udpPortRange.first in 1..65_535 &&
+                config.udpPortRange.last in config.udpPortRange.first..65_535))
         val network = withContext(Dispatchers.IO) { resolveNetwork(config.vpnNetworkHandle) }
         val server = withContext(Dispatchers.IO) {
             ServerSocket().apply {
@@ -95,11 +143,12 @@ class KotlinSocks5Backend(
             }
         }
         val id = nextId.getAndIncrement()
-        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + CoroutineName("proxy-backend-$id"))
-        val runtime = Runtime(id, config, network, server, scope)
+        val rootJob = SupervisorJob()
+        val scope = CoroutineScope(rootJob + Dispatchers.IO + CoroutineName("proxy-backend-$id"))
+        val runtime = Runtime(id, config, network, server, rootJob, scope)
         runtime.closeables += server
         lock.withLock { runtimes[id] = runtime }
-        runtime.acceptJob = scope.launch { acceptLoop(runtime) }
+        scope.launch { acceptLoop(runtime) }
         return ProxyBackendHandle(id)
     }
 
@@ -122,13 +171,10 @@ class KotlinSocks5Backend(
             Socket().use { runtime.network.bindSocket(it) }
         }
         results[ProbeKind.VPN_DNS] = probe("VPN DNS") {
-            check(runtime.network.getAllByName("example.com").any { it is Inet4Address }) {
-                "VPN DNS returned no IPv4 address"
-            }
+            resolveDomain(runtime.network, "example.com")
         }
         results[ProbeKind.OUTBOUND_TCP] = probe("outbound TCP") {
-            val address = runtime.network.getAllByName("example.com").firstOrNull { it is Inet4Address }
-                ?: throw IOException("VPN DNS returned no IPv4 address")
+            val address = resolveDomain(runtime.network, "example.com")
             Socket().use { socket ->
                 runtime.network.bindSocket(socket)
                 socket.connect(InetSocketAddress(address, 443), PROBE_TIMEOUT_MS)
@@ -160,32 +206,27 @@ class KotlinSocks5Backend(
         return closeRuntime(runtime, remove = true, reason = "stop")
     }
 
-    private suspend fun closeRuntime(runtime: Runtime, remove: Boolean, reason: String): CleanupReport {
-        val failures = mutableListOf<CleanupFailure>()
-        runtime.closeables.toList().forEach { closeable ->
-            runCatching { closeable.close() }.exceptionOrNull()?.let {
-                failures += CleanupFailure("backend_close", it)
+    private suspend fun closeRuntime(runtime: Runtime, remove: Boolean, reason: String): CleanupReport =
+        runtime.closeMutex.withLock {
+            val failures = mutableListOf<CleanupFailure>()
+            runtime.closeables.toList().forEach { closeable ->
+                runCatching { closeable.close() }.exceptionOrNull()?.let {
+                    failures += CleanupFailure("backend_close", it)
+                }
             }
-        }
-        runtime.scope.cancel(CancellationException("proxy backend $reason"))
-        if (::runtimeAcceptJobInitialized.invoke(runtime)) {
-            runCatching { runtime.acceptJob.cancelAndJoin() }.exceptionOrNull()?.let {
-                failures += CleanupFailure("backend_accept_join", it)
+            runtime.rootJob.cancel(CancellationException("proxy backend $reason"))
+            try {
+                runtime.rootJob.join()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Throwable) {
+                failures += CleanupFailure("backend_runtime_join", failure)
             }
+            if (remove && failures.isEmpty()) lock.withLock {
+                if (runtimes[runtime.id] === runtime) runtimes.remove(runtime.id)
+            }
+            CleanupReport(failures = failures)
         }
-        if (remove && failures.isEmpty()) lock.withLock {
-            if (runtimes[runtime.id] === runtime) runtimes.remove(runtime.id)
-        }
-        return CleanupReport(failures = failures)
-    }
-
-    /** Avoid accessing a lateinit property before start() has assigned it. */
-    private fun runtimeAcceptJobInitialized(runtime: Runtime): Boolean = try {
-        runtime.acceptJob
-        true
-    } catch (_: UninitializedPropertyAccessException) {
-        false
-    }
 
     private suspend fun requireRuntime(handle: ProxyBackendHandle): Runtime = lock.withLock {
         runtimes[handle.id] ?: throw IllegalStateException("unknown proxy backend handle ${handle.id}")
@@ -313,8 +354,7 @@ class KotlinSocks5Backend(
                     }
                     val remoteToClient = launch(Dispatchers.IO) {
                         try {
-                            outbound.getInputStream().copyTo(clientOutput)
-                            clientOutput.flush()
+                            outbound.getInputStream().copyToAndFlush(clientOutput)
                         } finally {
                             runCatching { client.shutdownOutput() }
                         }
@@ -362,9 +402,12 @@ class KotlinSocks5Backend(
             outbound.reuseAddress = false
             outbound.bind(InetSocketAddress(anyIpv4(), 0))
             runtime.network.bindSocket(outbound)
-            sendReply(clientOutput, REPLY_SUCCEEDED, anyIpv4(), relay.localPort)
+            // RFC 1928 clients need a reachable relay address; use the downstream address chosen
+            // by the TCP control connection rather than the ambiguous 0.0.0.0 wildcard.
+            sendReply(clientOutput, REPLY_SUCCEEDED, client.localAddress, relay.localPort)
             client.soTimeout = 0
             val clientEndpoint = AtomicReference<InetSocketAddress?>(null)
+            val remoteAllowlist = UdpRemoteAllowlist(MAX_UDP_REMOTE_ENDPOINTS)
             coroutineScope {
                 val control = launch(Dispatchers.IO) {
                     try {
@@ -375,10 +418,10 @@ class KotlinSocks5Backend(
                     }
                 }
                 val toVpn = launch(Dispatchers.IO) {
-                    udpClientToVpn(runtime, client, relay, outbound, clientEndpoint)
+                    udpClientToVpn(runtime, client, relay, outbound, clientEndpoint, remoteAllowlist)
                 }
                 val toClient = launch(Dispatchers.IO) {
-                    udpVpnToClient(relay, outbound, clientEndpoint)
+                    udpVpnToClient(relay, outbound, clientEndpoint, remoteAllowlist)
                 }
                 joinAll(control, toVpn, toClient)
             }
@@ -391,12 +434,13 @@ class KotlinSocks5Backend(
         }
     }
 
-    private fun udpClientToVpn(
+    private suspend fun udpClientToVpn(
         runtime: Runtime,
         control: Socket,
         relay: DatagramSocket,
         outbound: DatagramSocket,
         clientEndpoint: AtomicReference<InetSocketAddress?>,
+        remoteAllowlist: UdpRemoteAllowlist,
     ) {
         val buffer = ByteArray(MAX_UDP_PACKET)
         while (!relay.isClosed && runtime.scope.isActive) {
@@ -407,8 +451,16 @@ class KotlinSocks5Backend(
             val known = clientEndpoint.get()
             if (known == null) clientEndpoint.compareAndSet(null, endpoint) else if (known != endpoint) continue
             val request = parseUdpRequest(packet.data, packet.offset, packet.length) ?: continue
-            val address = runCatching { resolveTarget(runtime.network, request.target) }.getOrNull() ?: continue
-            outbound.send(DatagramPacket(request.payload, request.payload.size, address, request.port))
+            val address = try {
+                resolveTarget(runtime.network, request.target)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: IOException) {
+                continue
+            }
+            val remote = InetSocketAddress(address, request.port)
+            remoteAllowlist.record(remote)
+            outbound.send(DatagramPacket(request.payload, request.payload.size, remote))
         }
     }
 
@@ -416,6 +468,7 @@ class KotlinSocks5Backend(
         relay: DatagramSocket,
         outbound: DatagramSocket,
         clientEndpoint: AtomicReference<InetSocketAddress?>,
+        remoteAllowlist: UdpRemoteAllowlist,
     ) {
         val buffer = ByteArray(MAX_UDP_PACKET)
         while (!outbound.isClosed) {
@@ -423,6 +476,7 @@ class KotlinSocks5Backend(
             outbound.receive(packet)
             val endpoint = clientEndpoint.get() ?: continue
             val source = packet.address as? Inet4Address ?: continue
+            if (InetSocketAddress(source, packet.port) !in remoteAllowlist) continue
             val encoded = ByteArrayOutputStream(packet.length + 10).use { bytes ->
                 DataOutputStream(bytes).use { output ->
                     output.writeShort(0)
@@ -463,11 +517,21 @@ class KotlinSocks5Backend(
         throw BindException("no free UDP relay port in $range").also { last?.let(it::initCause) }
     }
 
-    private fun resolveTarget(network: Network, target: Target): Inet4Address = when (target) {
+    private suspend fun resolveTarget(network: Network, target: Target): Inet4Address = when (target) {
         is Target.Address -> target.address as? Inet4Address
             ?: throw UnsupportedAddressException()
-        is Target.Domain -> network.getAllByName(target.name).firstOrNull { it is Inet4Address } as? Inet4Address
-            ?: throw IOException("VPN DNS returned no IPv4 address for ${target.name}")
+        is Target.Domain -> resolveDomain(network, target.name)
+    }
+
+    private suspend fun resolveDomain(network: Network, domain: String): Inet4Address = try {
+        withTimeout(DNS_TIMEOUT_MS) {
+            withContext(dnsDispatcher) {
+                network.getAllByName(domain).firstOrNull { it is Inet4Address } as? Inet4Address
+                    ?: throw IOException("VPN DNS returned no IPv4 address for $domain")
+            }
+        }
+    } catch (timeout: TimeoutCancellationException) {
+        throw SocketTimeoutException("VPN DNS timed out for $domain").apply { initCause(timeout) }
     }
 
     private fun sendReply(
@@ -486,9 +550,11 @@ class KotlinSocks5Backend(
         output.flush()
     }
 
-    private fun probe(operation: String, block: () -> Unit): ProbeResult = try {
+    private suspend fun probe(operation: String, block: suspend () -> Unit): ProbeResult = try {
         block()
         ProbeResult.Success
+    } catch (cancelled: CancellationException) {
+        throw cancelled
     } catch (_: SecurityException) {
         ProbeResult.Failed(ProbeFailure.PermissionDenied)
     } catch (_: SocketTimeoutException) {
@@ -560,7 +626,10 @@ class KotlinSocks5Backend(
         const val HANDSHAKE_TIMEOUT_MS = 15_000
         const val CONNECT_TIMEOUT_MS = 15_000
         const val PROBE_TIMEOUT_MS = 5_000
+        const val DNS_TIMEOUT_MS = 5_000L
+        const val DNS_WORKER_COUNT = 2
         const val MAX_UDP_PACKET = 65_535
+        const val MAX_UDP_REMOTE_ENDPOINTS = 256
 
         fun anyIpv4(): Inet4Address = InetAddress.getByAddress(byteArrayOf(0, 0, 0, 0)) as Inet4Address
     }
