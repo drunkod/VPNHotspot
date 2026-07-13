@@ -167,6 +167,27 @@ fn render_ipv4(config: &ProxyFirewallConfig, install_jump: bool) -> io::Result<S
             )?;
         }
     }
+
+    // The listener is intentionally bound to 0.0.0.0 so multiple tethering
+    // interfaces can share one backend. Allowed downstream rules above must be
+    // the only path to these ports; reject every other interface before RETURN.
+    push_global_reject_rule(
+        &mut lines,
+        IPV4_CHAIN,
+        "tcp",
+        config.tcp_port,
+        None,
+    )?;
+    if udp_enabled(config) {
+        push_global_reject_rule(
+            &mut lines,
+            IPV4_CHAIN,
+            "udp",
+            config.udp_port_range_start,
+            Some(config.udp_port_range_end),
+        )?;
+    }
+
     lines.push(firewall::restore_line(
         "-A",
         IPV4_CHAIN,
@@ -207,6 +228,22 @@ fn render_ipv6(config: &ProxyFirewallConfig, install_jump: bool) -> io::Result<S
                 Some(config.udp_port_range_end),
             )?;
         }
+    }
+    push_global_reject_rule(
+        &mut lines,
+        IPV6_CHAIN,
+        "tcp",
+        config.tcp_port,
+        None,
+    )?;
+    if udp_enabled(config) {
+        push_global_reject_rule(
+            &mut lines,
+            IPV6_CHAIN,
+            "udp",
+            config.udp_port_range_start,
+            Some(config.udp_port_range_end),
+        )?;
     }
     lines.push(firewall::restore_line(
         "-A",
@@ -282,6 +319,28 @@ fn push_reject_rule(
     Ok(())
 }
 
+fn push_global_reject_rule(
+    lines: &mut Vec<String>,
+    chain: &str,
+    protocol: &str,
+    port_start: u32,
+    port_end: Option<u32>,
+) -> io::Result<()> {
+    lines.push(firewall::restore_line(
+        "-A",
+        chain,
+        &[
+            "-p".to_owned(),
+            protocol.to_owned(),
+            "--dport".to_owned(),
+            port_spec(port_start, port_end),
+            "-j".to_owned(),
+            "REJECT".to_owned(),
+        ],
+    )?);
+    Ok(())
+}
+
 fn udp_enabled(config: &ProxyFirewallConfig) -> bool {
     config.udp_port_range_start != 0 || config.udp_port_range_end != 0
 }
@@ -338,11 +397,13 @@ mod tests {
     }
 
     #[test]
-    fn ipv4_allow_requires_interface_ip_and_mac_and_ends_in_reject() {
+    fn ipv4_allow_requires_interface_ip_and_mac_and_rejects_every_other_interface() {
         let rendered = render_ipv4(&config(false), true).unwrap();
         assert!(rendered.contains("-i wlan0 -s 192.168.43.2 -m mac --mac-source 02:00:00:00:00:01 -p tcp --dport 1080 -j ACCEPT"));
         assert!(rendered.contains("-i wlan0 -p tcp --dport 1080 -j REJECT"));
         assert!(rendered.contains("-i wlan0 -p udp --dport 20000:20100 -j REJECT"));
+        assert!(rendered.contains("-A vpnhotspot_proxy4 -p tcp --dport 1080 -j REJECT"));
+        assert!(rendered.contains("-A vpnhotspot_proxy4 -p udp --dport 20000:20100 -j REJECT"));
     }
 
     #[test]
@@ -353,10 +414,10 @@ mod tests {
     }
 
     #[test]
-    fn ipv6_always_rejects_listener_and_udp_range() {
+    fn ipv6_always_rejects_listener_and_udp_range_globally() {
         let rendered = render_ipv6(&config(false), true).unwrap();
         assert!(!rendered.contains("-j ACCEPT"));
-        assert!(rendered.contains("-p tcp --dport 1080 -j REJECT"));
-        assert!(rendered.contains("-p udp --dport 20000:20100 -j REJECT"));
+        assert!(rendered.contains("-A vpnhotspot_proxy6 -p tcp --dport 1080 -j REJECT"));
+        assert!(rendered.contains("-A vpnhotspot_proxy6 -p udp --dport 20000:20100 -j REJECT"));
     }
 }
