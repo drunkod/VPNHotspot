@@ -161,20 +161,51 @@ physical-device restart test remain open.
 | No restart over unresolved firewall debt | ✅ focused generation/race tests | A, B |
 | Repeated start/stop without FD/thread leaks | ⬜ | backend/service integration |
 
+## Why there is no proxy option in the installed app (read this first)
+
+Tracks A–G build and unit-test the controller, daemon protocol, cleanup supervisor and
+health composition **as a self-contained `proxy/` package exercised only by JVM tests**.
+Verified against the tree: no class in `proxy/` is referenced by `MainActivity`,
+`VpnHotspotApp`, `SettingsScreen`, or any other UI/app file, and there is **no `<service>`
+for the proxy in `AndroidManifest.xml`**. `proxy/ProxyService.kt` is the Phase-0
+`ProxyServiceCleanupOwner`, not an Android `Service`.
+
+So the feature is invisible on-device by construction — the app-integration layer was never
+written (it is Phase 4 + Phase 7 in `IMPLEMENTATION_PLAN.md`, deliberately gated behind
+Phase 0). Tracks **H–K** below are that missing layer.
+
+## UI + service integration (Tracks H–K) — makes the option appear and function
+
+| Track | Delivers | Makes the option… |
+| --- | --- | --- |
+| **H** | `ProxyOnlyPreferences` (App.pref), settings flow, `DesiredProxyState` source, activation grants | …have persisted state to bind to |
+| **I** | Real foreground `ProxyOnlyService` + manifest `<service>`, binder exposing `StateFlow<ProxyOnlyState>` | …runnable and observable by the OS/UI |
+| **J** | `RootDestination.Proxy` tab, `ProxyScreen`, enable switch, Resume action, live state | **…visible and interactive in the app** |
+| **K** | `RootProxyFirewallRpc` over the `DaemonController` channel | …actually reach the root firewall daemon |
+
+Minimum to **see and interact** with the toggle: **H + I + J** (with a stubbed backend the
+state machine lands in `WaitingForVpn`/`FailClosed`, which still proves the chain is live).
+Add **K** for a real firewall control plane. Actual SOCKS5 traffic still needs the separate
+Hev/JNI backend track.
+
 ## Open blockers after Tracks A–G
 
-| # | Blocker | Priority |
-| --- | --- | --- |
-| 1 | Production Android foreground service and concrete root-process proxy request/reply transport are absent | P0 before release |
-| 2 | Pinned Hev/native backend, JNI boundary and VPN-bound socket hooks are absent | P0 before release |
-| 3 | UDP/DNS evidence and physical-device start/stop/restart/leak verification are absent | P0 before release |
+| # | Blocker | Track | Priority |
+| --- | --- | --- | --- |
+| 1 | No persisted settings / desired-state source feeding the controller | **H** | P0 for visibility |
+| 2 | No production Android foreground service + manifest registration | **I** | P0 for visibility |
+| 3 | No Compose UI tab/toggle — the literal cause of "I don't see the option" | **J** | P0 for visibility |
+| 4 | No concrete root-process proxy request/reply transport | **K** | P0 for function |
+| 5 | Pinned Hev/native backend, JNI boundary and VPN-bound socket hooks are absent | backend track | P0 before release |
+| 6 | UDP/DNS evidence and physical-device start/stop/restart/leak verification are absent | device track | P0 before release |
 
 ## Recommended sequencing
 
-1. Build the root-process proxy transport and production foreground-service composition around
-   `ProxyDaemonComposition`.
-2. Integrate the pinned native backend and VPN-bound socket/probe paths.
-3. Run actual daemon-restart, UDP/DNS and repeated lifecycle evidence on devices.
+1. **Track H → I → J** to make the proxy option visible and interactive in the app (this is
+   the fix for the missing UI). With a stubbed backend it will show real typed states.
+2. **Track K** to give the firewall side a real transport to the root daemon.
+3. Integrate the pinned native (Hev) backend and VPN-bound socket/probe paths.
+4. Run actual daemon-restart, UDP/DNS and repeated lifecycle evidence on devices.
 
 ## Track index
 
@@ -185,9 +216,14 @@ physical-device restart test remain open.
 - ✅ [Track E — normalization diagnostics + deterministic selection](TRACK-E-normalization-diagnostics.md)
 - ✅ [Track F — Dependency Review CI fix](TRACK-F-dependency-review-ci.md)
 - ✅ [Track G — acknowledgement-backed daemon health composition](TRACK-G-daemon-health-composition.md)
+- ⬜ [Track H — settings persistence + DesiredProxyState source](TRACK-H-settings-and-desired-state.md)
+- ⬜ [Track I — real foreground ProxyService + manifest](TRACK-I-foreground-service.md)
+- ⬜ [Track J — Compose UI tab + toggle + live state](TRACK-J-compose-ui.md)
+- ⬜ [Track K — concrete root-process RPC transport](TRACK-K-root-rpc-transport.md)
 
 ## Definition of done for Phase 0 sign-off
 
-Tracks A–G controller/model/protocol/composition work is complete. The PR must remain draft
-until the production Android service/root transport, native backend integration and remaining
-device evidence rows are complete.
+Tracks A–G controller/model/protocol/composition work is complete. Tracks H–K add the
+app-integration layer (settings, foreground service, UI, root transport) that surfaces the
+feature on-device. The PR must remain draft until H–K, the native backend integration and
+the remaining device-evidence rows are complete.
