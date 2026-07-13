@@ -6,7 +6,7 @@ Single source of truth for the proxy-only work on `agent/proxy-only-design`.
 - Executable source verified: `db27ed52a539e825f4980fa94098751232377dae`
 - Normal `Test` and `Dependency Review` workflows: **passed**
 - App-visible authenticated SOCKS5 MVP: **implemented**
-- Track L Mermaid architecture and evidence map: **documented**
+- Track L Mermaid architecture, failure matrix and evidence map: **documented**
 - Rooted physical-device/security evidence: **still required before release**
 
 ## Legend
