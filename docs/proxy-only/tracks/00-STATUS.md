@@ -5,7 +5,7 @@ Single source of truth for the proxy-only work on `agent/proxy-only-design`.
 - PR: #1, intentionally **draft**
 - Executable source verified: `a18473547e4818e3d37053b884d44042be3c0ab0`
 - Normal `Test` workflow on that source: **passed**
-- Dependency Review: **rerunning on the final documentation head**
+- Dependency Review on the documentation head: **passed**
 - App-visible authenticated SOCKS5 MVP: **implemented**
 - Track G composition review: **complete; three findings remediated and regression-tested**
 - Track L Mermaid architecture, failure matrix and evidence map: **documented**
@@ -141,8 +141,9 @@ The normal `Test` workflow passed on `a18473547e4818e3d37053b884d44042be3c0ab0`:
 - release R8 coroutine-debug verification: passed
 - APK and report artifacts: uploaded
 
-A GitHub-hosted runner setup failure occurred on an intermediate head before checkout. It did not run
-repository code. The final documentation head reruns Dependency Review and the complete Test workflow.
+The complete `Test` workflow and Dependency Review with moderate-severity enforcement also passed on
+the documentation head. An earlier GitHub-hosted runner setup failure occurred before checkout and did
+not execute repository code.
 
 ## Rooted-device evidence plan
 
