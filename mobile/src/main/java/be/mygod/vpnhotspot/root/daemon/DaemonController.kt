@@ -23,6 +23,10 @@ import dalvik.system.BaseDexClassLoader
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.ByteWriteChannel
 import io.ktor.utils.io.readLineTo
+import java.io.EOFException
+import java.io.IOException
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.random.Random
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -44,9 +48,6 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okio.ByteString.Companion.toByteString
 import timber.log.Timber
-import java.io.EOFException
-import java.io.IOException
-import kotlin.random.Random
 
 object DaemonController {
     private const val BINARY_NAME = "vpnhotspotd"
@@ -59,6 +60,7 @@ object DaemonController {
     private var readerJob: Job? = null
     private var nextCallId = 1L
     private val calls = MutableLongObjectMap<Call>()
+    private var leases = 0
     private var daemonStdioClosing = false
     private var daemonStdioEofReported = false
     private val logScope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
@@ -79,6 +81,30 @@ object DaemonController {
 
     class SessionCall(val id: Long, val events: Flow<EventFrame>) {
         suspend fun close() = closeEventCall(id)
+    }
+
+    /**
+     * Keeps one daemon transport generation alive even while no request is in flight.
+     * Closing is idempotent and may suspend while the final transport is drained.
+     */
+    class Lease internal constructor() {
+        private val closed = AtomicBoolean()
+
+        suspend fun close() {
+            if (closed.compareAndSet(false, true)) releaseLease()
+        }
+    }
+
+    suspend fun acquireLease(): Lease = lock.withLock {
+        ensureDaemonLocked()
+        leases += 1
+        Lease()
+    }
+
+    private suspend fun releaseLease() = lock.withLock {
+        check(leases > 0) { "root daemon lease underflow" }
+        leases -= 1
+        maybeShutdownLocked()
     }
 
     suspend fun startSession(config: SessionConfig): SessionCall {
@@ -395,15 +421,11 @@ object DaemonController {
     }
 
     private fun ReplyFrame.requireAck() {
-        if (ack == null) {
-            throw IOException("Unexpected daemon reply $this")
-        }
+        if (ack == null) throw IOException("Unexpected daemon reply $this")
     }
 
     private fun EventFrame.requireAck() {
-        if (ack == null) {
-            throw IOException("Unexpected daemon event $this")
-        }
+        if (ack == null) throw IOException("Unexpected daemon event $this")
     }
 
     private fun completeCallsLocked(e: Throwable) {
@@ -431,7 +453,7 @@ object DaemonController {
     }
 
     private suspend fun maybeShutdownLocked() {
-        if (output == null || calls.isNotEmpty()) return
+        if (output == null || calls.isNotEmpty() || leases > 0) return
         closeConnectionLocked()
     }
 
@@ -494,9 +516,16 @@ object DaemonController {
                             line.clear()
                         }
                         lock.withLock {
-                            if (!daemonStdioClosing && calls.isNotEmpty() && !daemonStdioEofReported) {
+                            if (!daemonStdioClosing &&
+                                (calls.isNotEmpty() || leases > 0) &&
+                                !daemonStdioEofReported
+                            ) {
                                 daemonStdioEofReported = true
-                                Timber.w(DaemonStdioEofException("$BINARY_NAME $stream EOF calls=${calls.size}"))
+                                Timber.w(
+                                    DaemonStdioEofException(
+                                        "$BINARY_NAME $stream EOF calls=${calls.size} leases=$leases",
+                                    ),
+                                )
                             }
                         }
                     } catch (e: ErrnoException) {
