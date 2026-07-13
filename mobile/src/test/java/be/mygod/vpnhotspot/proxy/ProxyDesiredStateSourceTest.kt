@@ -1,6 +1,7 @@
 package be.mygod.vpnhotspot.proxy
 
 import java.util.UUID
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.first
@@ -66,9 +67,7 @@ class ProxyDesiredStateSourceTest {
             MutableStateFlow(emptyList()),
         ).states()
 
-        val next = kotlinx.coroutines.async {
-            source.drop(1).first()
-        }
+        val next = async { source.drop(1).first() }
         settings.value = settings.value.copy(enabled = true)
 
         assertEquals(true, next.await().settings.enabled)
