@@ -14,6 +14,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
 import be.mygod.vpnhotspot.MainActivity
 import be.mygod.vpnhotspot.R
+import be.mygod.vpnhotspot.root.daemon.DaemonController
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineName
@@ -94,6 +95,7 @@ class ProxyOnlyService : Service() {
     private lateinit var serviceClient: AndroidProxyServiceClient
     private var workerJob: Job? = null
     private var bootstrapJob: Job? = null
+    private var daemonLease: DaemonController.Lease? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -158,9 +160,16 @@ class ProxyOnlyService : Service() {
         workerJob = controller.start(composition.desiredStates(desired))
         bootstrapJob = serviceScope.launch {
             while (isActive) {
-                if (settings.value.enabled && !composition.daemonState.value.healthy) {
-                    runCatching { composition.bootstrap() }.onFailure {
-                        Timber.tag("ProxyOnly").w(it, "Root daemon bootstrap failed")
+                if (settings.value.enabled) {
+                    if (daemonLease == null) {
+                        daemonLease = runCatching { DaemonController.acquireLease() }
+                            .onFailure { Timber.tag("ProxyOnly").w(it, "Root daemon lease failed") }
+                            .getOrNull()
+                    }
+                    if (daemonLease != null && !composition.daemonState.value.healthy) {
+                        runCatching { composition.bootstrap() }.onFailure {
+                            Timber.tag("ProxyOnly").w(it, "Root daemon bootstrap failed")
+                        }
                     }
                 }
                 delay(if (composition.daemonState.value.healthy) 15_000L else 3_000L)
@@ -208,6 +217,8 @@ class ProxyOnlyService : Service() {
                 bootstrapJob?.cancelAndJoin()
                 workerJob?.cancelAndJoin()
                 cleanupOwner.close()
+                daemonLease?.close()
+                daemonLease = null
             }
         }
         serviceScope.cancel()
