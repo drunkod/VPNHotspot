@@ -16,7 +16,6 @@ import be.mygod.vpnhotspot.MainActivity
 import be.mygod.vpnhotspot.R
 import be.mygod.vpnhotspot.root.daemon.DaemonController
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -168,23 +167,6 @@ class ProxyOnlyService : Service() {
             cleanupSupervisor = cleanupOwner.cleanupSupervisor,
         )
         workerJob = controller.start(composition.desiredStates(desired))
-        bootstrapJob = serviceScope.launch {
-            while (isActive) {
-                if (settings.value.enabled && foreground.get()) {
-                    if (daemonLease == null) {
-                        daemonLease = runCatching { DaemonController.acquireLease() }
-                            .onFailure { Timber.tag("ProxyOnly").w(it, "Root daemon lease failed") }
-                            .getOrNull()
-                    }
-                    if (daemonLease != null && !composition.daemonState.value.healthy) {
-                        runCatching { composition.bootstrap() }.onFailure {
-                            Timber.tag("ProxyOnly").w(it, "Root daemon bootstrap failed")
-                        }
-                    }
-                }
-                delay(if (composition.daemonState.value.healthy) 15_000L else 3_000L)
-            }
-        }
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
@@ -223,11 +205,9 @@ class ProxyOnlyService : Service() {
     override fun onDestroy() {
         runBlocking {
             withContext(NonCancellable) {
-                bootstrapJob?.cancelAndJoin()
                 workerJob?.cancelAndJoin()
                 cleanupOwner.close()
-                daemonLease?.close()
-                daemonLease = null
+                releaseDaemonResources()
             }
         }
         activated.value = false
@@ -253,6 +233,7 @@ class ProxyOnlyService : Service() {
             } else startForeground(NOTIFICATION_ID, notification)
             foreground.set(true)
             activated.value = true
+            startDaemonBootstrap()
             true
         } catch (failure: RuntimeException) {
             if (Build.VERSION.SDK_INT >= 31 && failure.javaClass.name == FGS_NOT_ALLOWED_CLASS) {
@@ -273,6 +254,33 @@ class ProxyOnlyService : Service() {
         activated.value = false
         if (foreground.getAndSet(false)) stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    internal suspend fun releaseDaemonResources() {
+        bootstrapJob?.cancelAndJoin()
+        bootstrapJob = null
+        daemonLease?.close()
+        daemonLease = null
+        composition.transportDisconnected()
+    }
+
+    private fun startDaemonBootstrap() {
+        if (bootstrapJob?.isActive == true) return
+        bootstrapJob = serviceScope.launch {
+            while (isActive && settings.value.enabled && foreground.get()) {
+                if (daemonLease == null) {
+                    daemonLease = runCatching { DaemonController.acquireLease() }
+                        .onFailure { Timber.tag("ProxyOnly").w(it, "Root daemon lease failed") }
+                        .getOrNull()
+                }
+                if (daemonLease != null && !composition.daemonState.value.healthy) {
+                    runCatching { composition.bootstrap() }.onFailure {
+                        Timber.tag("ProxyOnly").w(it, "Root daemon bootstrap failed")
+                    }
+                }
+                delay(if (composition.daemonState.value.healthy) 15_000L else 3_000L)
+            }
+        }
     }
 
     private fun containmentConfig(): ProxyFirewallConfig {
@@ -436,6 +444,7 @@ private class AndroidProxyServiceClient(
         val report = closeCurrentBackend("feature stop: $reason")
         if (!report.hasCriticalFailure) {
             featureActive = false
+            owner.releaseDaemonResources()
             withContext(Dispatchers.Main.immediate) { owner.stopForegroundAndSelf() }
         }
         report
