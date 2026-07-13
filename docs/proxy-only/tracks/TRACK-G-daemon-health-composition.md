@@ -4,7 +4,7 @@ Status: **complete and verified**
 
 Verified clean source head: `81d902c60ec05b068c86cb4a51e8f341ed01007a`
 
-Documentation commits may follow that source head without changing executable code.
+Documentation commits follow that source head without changing executable code.
 
 ## Goal
 
@@ -36,8 +36,8 @@ Partial and zero identities are rejected.
 
 ### Deny-first bootstrap
 
-The controller intentionally refuses sanitation until a daemon generation is observable, so
-an acknowledgement-only tracker needs an explicit bootstrap before the controller worker starts.
+The controller refuses sanitation until a daemon generation is observable, so an
+acknowledgement-only tracker needs an explicit bootstrap before the controller worker starts.
 `ProxyDaemonComposition.bootstrap()` uses the existing deny-first sanitation command:
 
 1. the daemon installs containment;
