@@ -114,6 +114,15 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Keep DNS servers alive while tethering services are active" />
         </service>
+        <service
+            android:name=".proxy.ProxyOnlyService"
+            android:directBootAware="false"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keep a user-enabled authenticated SOCKS5 proxy bound to the selected VPN active" />
+        </service>
 
         <service
             android:name=".manage.RepeaterTileService"
