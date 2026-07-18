@@ -6,15 +6,55 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: dependency-review-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   dependency-review:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Verify dependency graph availability
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          response_file="${RUNNER_TEMP}/dependency-graph-response.json"
+          status=$(curl --silent --show-error \
+            --output "${response_file}" \
+            --write-out '%{http_code}' \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/dependency-graph/compare/${BASE_SHA}...${HEAD_SHA}")
+          echo "Dependency graph compare API HTTP status: ${status}"
+          if [ "${status}" = "200" ]; then
+            exit 0
+          fi
+
+          echo 'Dependency graph compare response:'
+          head --bytes=4000 "${response_file}" || true
+
+          if [ "${status}" = "403" ]; then
+            echo '::error title=Dependency graph forbidden::The dependency graph compare API returned HTTP 403. Enable Dependency graph under Settings > Code security and analysis, verify repository access, then re-run this workflow. The vulnerability threshold remains moderate.'
+          else
+            echo "::error title=Dependency graph API failure::The dependency graph compare API returned HTTP ${status}. Inspect the response above for invalid refs, transient API errors, or repository configuration problems."
+          fi
+          exit 1
+
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          show-progress: false
 
       - name: Dependency Review
         uses: actions/dependency-review-action@v5
         with:
           fail-on-severity: moderate
+          # Gradle snapshots are submitted by dependency-submission.yml on push.
+          # A PR run can start before that push workflow finishes, so wait rather
+          # than treating the temporary snapshot warning as a policy failure.
+          retry-on-snapshot-warnings: true
+          retry-on-snapshot-warnings-timeout: 600

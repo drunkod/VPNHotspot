@@ -5,6 +5,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -36,23 +40,33 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
 
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-
       - name: Check Rust daemon
         working-directory: mobile/src/main/rust/vpnhotspotd
         run: cargo check --locked --all-targets
 
+      - name: Test Rust daemon library
+        working-directory: mobile/src/main/rust/vpnhotspotd
+        run: cargo test --locked --lib
+
       - name: Run Rust daemon clippy
         working-directory: mobile/src/main/rust/vpnhotspotd
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: |
+          mkdir -p ../../../../build/reports
+          cargo clippy --locked --all-targets -- -D warnings 2>&1 | tee ../../../../build/reports/clippy.log
+          test "${PIPESTATUS[0]}" -eq 0
+
+      - name: Run build and tests
+        run: |
+          mkdir -p mobile/build/reports
+          ./gradlew assembleDebug check --no-daemon 2>&1 | tee mobile/build/reports/gradle.log
+          test "${PIPESTATUS[0]}" -eq 0
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
 
       - name: Audit Rust daemon dependencies
         working-directory: mobile/src/main/rust/vpnhotspotd
         run: cargo audit
-
-      - name: Run build and tests
-        run: ./gradlew assembleDebug check --no-daemon
 
       - name: Verify release R8 coroutine debug
         run: ./gradlew :mobile:verifyReleaseCoroutineDebugR8 --no-daemon

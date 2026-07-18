@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="title_proxy">Proxy</string>
+    <string name="notification_channel_proxy">VPN-bound proxy</string>
+    <string name="notification_proxy_title">SOCKS5 proxy</string>
+
+    <string name="proxy_enable">Enable proxy sharing</string>
+    <string name="proxy_enable_summary">Share an authenticated SOCKS5 endpoint to tethered clients. Internet traffic is bound to the selected Android VPN and fails closed when the VPN or root firewall is unavailable.</string>
+    <string name="proxy_resume">Resume</string>
+    <string name="proxy_configuration">Configuration</string>
+    <string name="proxy_tcp_port">TCP port</string>
+    <string name="proxy_udp_enable">Enable UDP ASSOCIATE</string>
+    <string name="proxy_udp_enable_summary">Relay SOCKS5 UDP traffic through sockets bound to the selected VPN.</string>
+    <string name="proxy_udp_start">UDP range start</string>
+    <string name="proxy_udp_end">UDP range end</string>
+    <string name="proxy_invalid_ports">Enter valid ports between 1 and 65535.</string>
+    <string name="proxy_settings_saved">Proxy settings saved.</string>
+    <string name="proxy_endpoints">Available endpoints</string>
+
+    <string name="proxy_credentials">Authentication</string>
+    <string name="proxy_credentials_unavailable">Credentials are unavailable until the service starts.</string>
+    <string name="proxy_copy_credentials">Copy</string>
+    <string name="proxy_rotate_credentials">Rotate</string>
+
+    <string name="proxy_state_disabled">Disabled</string>
+    <string name="proxy_state_activation_required">User action required</string>
+    <string name="proxy_state_starting">Starting foreground service…</string>
+    <string name="proxy_state_waiting_tethering">Waiting for a tethering interface…</string>
+    <string name="proxy_state_waiting_vpn">Waiting for one usable VPN…</string>
+    <string name="proxy_state_multiple_vpn">Multiple VPNs detected</string>
+    <string name="proxy_state_vpn_denied">This app is excluded from the VPN</string>
+    <string name="proxy_state_starting_backend">Starting and probing the proxy…</string>
+    <string name="proxy_state_running">Running</string>
+    <string name="proxy_state_fail_closed">Stopped for safety</string>
+    <string name="proxy_state_cleanup">Cleanup retry in progress</string>
+    <string name="proxy_multiple_vpn_detail">%d usable VPN networks were found. Keep exactly one active.</string>
+    <string name="proxy_cleanup_detail">%1$d resources unresolved; retry attempt %2$d.</string>
+    <string name="proxy_reason_daemon">The root firewall daemon is unavailable.</string>
+    <string name="proxy_reason_downstream_address">No reachable IPv4 address exists on the active tethering interface.</string>
+</resources>

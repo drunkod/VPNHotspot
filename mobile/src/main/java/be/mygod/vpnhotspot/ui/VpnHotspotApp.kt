@@ -84,6 +84,7 @@ import be.mygod.vpnhotspot.RepeaterService
 import be.mygod.vpnhotspot.TetheringService
 import be.mygod.vpnhotspot.client.ClientViewModel
 import be.mygod.vpnhotspot.net.wifi.SoftApConfigurationCompat
+import be.mygod.vpnhotspot.proxy.ProxyOnlyService
 import be.mygod.vpnhotspot.ui.apconfiguration.ApConfigurationScreen
 import be.mygod.vpnhotspot.ui.apconfiguration.ApConfigurationSaveFab
 import be.mygod.vpnhotspot.ui.apconfiguration.ApConfigurationSession
@@ -105,6 +106,7 @@ private enum class RootDestination(
     @param:DrawableRes val icon: Int,
 ) {
     Tethering("tethering", R.string.title_tethering, R.drawable.ic_wifi_tethering),
+    Proxy("proxy", R.string.title_proxy, R.drawable.ic_proxy),
     Clients("clients", R.string.title_clients, R.drawable.ic_devices),
     Settings("settings", R.string.title_settings, R.drawable.ic_settings),
 }
@@ -141,6 +143,9 @@ fun VpnHotspotApp(clientViewModel: ClientViewModel) {
     val tetheringDestinationVisible = rootDestination == RootDestination.Tethering || visibleEntries.any { entry ->
         entry.destination.hierarchy.any { it.route == RootDestination.Tethering.route }
     }
+    val proxyDestinationVisible = rootDestination == RootDestination.Proxy || visibleEntries.any { entry ->
+        entry.destination.hierarchy.any { it.route == RootDestination.Proxy.route }
+    }
     val bindRepeaterService = tetheringDestinationVisible ||
             savedApSession?.target == ApConfigurationTarget.Repeater
     val repeaterBinderState = rememberServiceBinder<RepeaterService.Binder>(
@@ -158,6 +163,14 @@ fun VpnHotspotApp(clientViewModel: ClientViewModel) {
         TetheringService::class.java,
     )
     val tetheringBinder by tetheringBinderState
+    val proxyBinderState = rememberServiceBinder<ProxyOnlyService.Binder>(
+        proxyDestinationVisible,
+        ProxyOnlyService::class.java,
+    )
+    val proxyBinder by proxyBinderState
+    LaunchedEffect(appContext) {
+        ProxyOnlyService.startIfEnabled(appContext)
+    }
     val validClientCount by clientViewModel.validClientCount.collectAsStateWithLifecycle()
     val tetherStates by clientViewModel.tetherStates.collectAsStateWithLifecycle()
     val tetheringServiceState = run {
@@ -298,6 +311,19 @@ fun VpnHotspotApp(clientViewModel: ClientViewModel) {
                         onStopTemporaryHotspot = { localOnlyBinderState.value?.stop() },
                         onStartRepeaterWps = { repeaterBinderState.value?.startWps(it) },
                     )
+                }
+            }
+            composable(RootDestination.Proxy.route) {
+                RootDestinationScaffold(
+                    title = R.string.app_name,
+                    selectedDestination = RootDestination.Proxy,
+                    navController = navController,
+                    validClientCount = validClientCount,
+                    activeSnackbarPadding = route == RootDestination.Proxy.route,
+                    onSnackbarStartPaddingChanged = { snackbarStartPadding = it },
+                    onSnackbarBottomPaddingChanged = { snackbarBottomPadding = it },
+                ) {
+                    ProxyScreen(proxyBinder, snackbarHostState)
                 }
             }
             composable(RootDestination.Clients.route) {

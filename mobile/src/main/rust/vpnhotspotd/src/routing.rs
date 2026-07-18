@@ -281,7 +281,7 @@ pub(crate) async fn clean(
     )
     .await?;
     clean_ip(connection, command).await?;
-    firewall_cleanup::clean().await;
+    firewall_cleanup::clean().await?;
     Ok(())
 }
 

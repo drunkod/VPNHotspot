@@ -17,6 +17,13 @@ pub(crate) enum IptablesTarget {
 }
 
 impl IptablesTarget {
+    pub(crate) fn binary(self) -> &'static str {
+        match self {
+            Self::Ipv4 => "/system/bin/iptables",
+            Self::Ipv6 => "/system/bin/ip6tables",
+        }
+    }
+
     pub(crate) fn restore_binary(self) -> &'static str {
         match self {
             Self::Ipv4 => "/system/bin/iptables-restore",
@@ -28,6 +35,35 @@ impl IptablesTarget {
 enum RestoreOutput {
     Status,
     Capture,
+}
+
+pub(crate) async fn rule_exists(
+    target: IptablesTarget,
+    table: &str,
+    chain: &str,
+    args: &[&str],
+) -> io::Result<bool> {
+    let mut command = Command::new(target.binary());
+    command
+        .args(["-w", "-t", table, "-C", chain])
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    Ok(command
+        .status()
+        .await
+        .with_report_context_details(
+            "firewall.rule_exists",
+            [
+                ("binary", target.binary().to_owned()),
+                ("table", table.to_owned()),
+                ("chain", chain.to_owned()),
+                ("args", args.join(" ")),
+            ],
+        )?
+        .success())
 }
 
 pub(crate) async fn restore(target: IptablesTarget, input: &str) -> io::Result<()> {

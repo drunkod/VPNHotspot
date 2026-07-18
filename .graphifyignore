@@ -1,0 +1,36 @@
+# Keep Graphify extraction local/offline by excluding non-code inputs that
+# require semantic extraction or transcription.
+*.md
+*.txt
+*.rst
+LICENSE
+docs/
+.github/
+
+# Android/Gradle/generated outputs
+.gradle/
+build/
+mobile/build/
+**/build/
+.cxx/
+.externalNativeBuild/
+
+# VCS and vendored/generated caches
+.git/
+.cargo/
+graphify-out/
+
+# Binary/media/document assets
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.svg
+*.pdf
+*.doc
+*.docx
+*.mp3
+*.mp4
+*.wav
+*.mov
