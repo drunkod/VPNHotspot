@@ -184,7 +184,7 @@ adb shell su -c \
 
 - Startup requires the foreground user action; persisted configuration alone is not sufficient.
 - The service has a persistent foreground notification while enabled.
-- The listener is present only after root sanitation and required probes complete.
+- The listener may bind while probes run, but deny-first containment keeps it unreachable until every required probe succeeds and the exact allow transition is acknowledged.
 - IPv4 admission rules require downstream interface, client IPv4, and client MAC.
 - Per-downstream/global rejects and explicit IPv6 rejects are present.
 - No broad allow from the VPN or physical uplink interface exists.

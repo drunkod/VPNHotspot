@@ -297,8 +297,17 @@ class KotlinSocks5Backend(
         if (input.readUnsignedByte() != AUTH_VERSION) return false
         val username = ByteArray(input.readUnsignedByte()).also(input::readFully)
         val password = ByteArray(input.readUnsignedByte()).also(input::readFully)
-        val success = MessageDigest.isEqual(username, credentials.username.toByteArray(StandardCharsets.UTF_8)) &&
-            MessageDigest.isEqual(password, credentials.password.toByteArray(StandardCharsets.UTF_8))
+        val expectedUsername = credentials.username.toByteArray(StandardCharsets.UTF_8)
+        val expectedPassword = credentials.password.toByteArray(StandardCharsets.UTF_8)
+        val success = try {
+            MessageDigest.isEqual(username, expectedUsername) &&
+                MessageDigest.isEqual(password, expectedPassword)
+        } finally {
+            username.fill(0)
+            password.fill(0)
+            expectedUsername.fill(0)
+            expectedPassword.fill(0)
+        }
         output.write(byteArrayOf(AUTH_VERSION.toByte(), if (success) 0 else 1))
         output.flush()
         return success
@@ -336,40 +345,50 @@ class KotlinSocks5Backend(
         val outbound = Socket()
         runtime.closeables += outbound
         try {
-            val address = resolveTarget(runtime.network, request.target)
-            runtime.network.bindSocket(outbound)
-            outbound.connect(InetSocketAddress(address, request.port), CONNECT_TIMEOUT_MS)
-            sendReply(clientOutput, REPLY_SUCCEEDED, outbound.localAddress, outbound.localPort)
-            client.soTimeout = 0
-            outbound.soTimeout = 0
-            runtime.activeTcp.incrementAndGet()
-            try {
-                coroutineScope {
-                    val clientToRemote = launch(Dispatchers.IO) {
-                        try {
-                            clientInput.copyTo(outbound.getOutputStream())
-                        } finally {
-                            runCatching { outbound.shutdownOutput() }
-                        }
+            establishSocksConnectThenRelay(
+                establish = {
+                    val address = resolveTarget(runtime.network, request.target)
+                    runtime.network.bindSocket(outbound)
+                    outbound.connect(InetSocketAddress(address, request.port), CONNECT_TIMEOUT_MS)
+                },
+                onSetupFailure = { failure ->
+                    when (failure) {
+                        is UnsupportedAddressException -> sendReply(clientOutput, REPLY_ADDRESS_NOT_SUPPORTED)
+                        is ConnectException -> sendReply(clientOutput, REPLY_CONNECTION_REFUSED)
+                        is IOException -> sendReply(clientOutput, REPLY_HOST_UNREACHABLE)
+                        else -> throw failure
                     }
-                    val remoteToClient = launch(Dispatchers.IO) {
-                        try {
-                            outbound.getInputStream().copyToAndFlush(clientOutput)
-                        } finally {
-                            runCatching { client.shutdownOutput() }
+                },
+                onEstablished = {
+                    sendReply(clientOutput, REPLY_SUCCEEDED, outbound.localAddress, outbound.localPort)
+                    client.soTimeout = 0
+                    outbound.soTimeout = 0
+                },
+                relay = {
+                    runtime.activeTcp.incrementAndGet()
+                    try {
+                        coroutineScope {
+                            val clientToRemote = launch(Dispatchers.IO) {
+                                try {
+                                    clientInput.copyTo(outbound.getOutputStream())
+                                } finally {
+                                    runCatching { outbound.shutdownOutput() }
+                                }
+                            }
+                            val remoteToClient = launch(Dispatchers.IO) {
+                                try {
+                                    outbound.getInputStream().copyToAndFlush(clientOutput)
+                                } finally {
+                                    runCatching { client.shutdownOutput() }
+                                }
+                            }
+                            joinAll(clientToRemote, remoteToClient)
                         }
+                    } finally {
+                        runtime.activeTcp.decrementAndGet()
                     }
-                    joinAll(clientToRemote, remoteToClient)
-                }
-            } finally {
-                runtime.activeTcp.decrementAndGet()
-            }
-        } catch (e: UnsupportedAddressException) {
-            sendReply(clientOutput, REPLY_ADDRESS_NOT_SUPPORTED)
-        } catch (e: ConnectException) {
-            sendReply(clientOutput, REPLY_CONNECTION_REFUSED)
-        } catch (e: IOException) {
-            sendReply(clientOutput, REPLY_HOST_UNREACHABLE)
+                },
+            )
         } finally {
             runtime.closeables.remove(outbound)
             runCatching { outbound.close() }

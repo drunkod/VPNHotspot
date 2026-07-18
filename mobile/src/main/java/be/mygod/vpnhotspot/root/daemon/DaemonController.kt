@@ -39,6 +39,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ClosedReceiveChannelException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.isActive
@@ -67,6 +68,8 @@ object DaemonController {
     private val stdoutLog = DaemonLog("stdout") { Timber.tag(BINARY_NAME).i(it) }
     private val stderrLog = DaemonLog("stderr") { Timber.tag(BINARY_NAME).e(it) }
     private var daemonCommandAbiChecked = false
+    private val transportClosureSignal = DaemonTransportClosureSignal()
+    val unexpectedTransportClosureEpoch: StateFlow<Long> get() = transportClosureSignal.epoch
 
     /**
      * Android 10 bionic supports direct linker execution of uncompressed, page-aligned zip entries:
@@ -472,6 +475,11 @@ object DaemonController {
 
     private suspend fun closeConnectionLocked(cancelReader: Boolean = true) = withContext(NonCancellable) {
         val wasConnected = socket != null || input != null || output != null || readerJob != null
+        transportClosureSignal.connectionClosed(
+            wasConnected = wasConnected,
+            activeLeases = leases,
+            closingAlready = daemonStdioClosing,
+        )
         if (wasConnected) Timber.d("Stopping $BINARY_NAME")
         daemonStdioClosing = true
         completeCallsLocked(IOException("$BINARY_NAME connection closed"))

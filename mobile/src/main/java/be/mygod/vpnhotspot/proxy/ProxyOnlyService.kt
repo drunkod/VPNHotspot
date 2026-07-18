@@ -280,19 +280,51 @@ class ProxyOnlyService : Service() {
 
     private fun startDaemonBootstrap() {
         if (bootstrapJob?.isActive == true) return
+        val initialClosureEpoch = DaemonController.unexpectedTransportClosureEpoch.value
         bootstrapJob = serviceScope.launch {
-            while (isActive && settings.value.enabled && foreground.get()) {
-                if (daemonLease == null) {
-                    daemonLease = runCatching { DaemonController.acquireLease() }
-                        .onFailure { Timber.tag("ProxyOnly").w(it, "Root daemon lease failed") }
-                        .getOrNull()
-                }
-                if (daemonLease != null && !composition.daemonState.value.healthy) {
-                    runCatching { composition.bootstrap() }.onFailure {
-                        Timber.tag("ProxyOnly").w(it, "Root daemon bootstrap failed")
+            val disconnectBridge = ProxyDaemonTransportBridge(
+                composition = composition,
+                containBackend = { serviceClient.containDaemonDisconnect() },
+                rebootstrap = {
+                    if (daemonLease != null && settings.value.enabled && foreground.get() &&
+                        !composition.daemonState.value.healthy
+                    ) {
+                        composition.bootstrap()
                     }
+                },
+                reportContainmentFailure = { report ->
+                    Timber.tag("ProxyOnly").w(
+                        "Root daemon disconnect containment failed: %s",
+                        report.failures.map { it.key },
+                    )
+                },
+                reportBootstrapFailure = { failure ->
+                    Timber.tag("ProxyOnly").w(failure, "Root daemon reconnect bootstrap failed")
+                },
+            )
+            val disconnectJob = launch {
+                disconnectBridge.collect(
+                    closures = DaemonController.unexpectedTransportClosureEpoch,
+                    initialEpoch = initialClosureEpoch,
+                    leaseActive = { daemonLease != null },
+                )
+            }
+            try {
+                while (isActive && settings.value.enabled && foreground.get()) {
+                    if (daemonLease == null) {
+                        daemonLease = runCatching { DaemonController.acquireLease() }
+                            .onFailure { Timber.tag("ProxyOnly").w(it, "Root daemon lease failed") }
+                            .getOrNull()
+                    }
+                    if (daemonLease != null && !composition.daemonState.value.healthy) {
+                        runCatching { composition.bootstrap() }.onFailure {
+                            Timber.tag("ProxyOnly").w(it, "Root daemon bootstrap failed")
+                        }
+                    }
+                    delay(if (composition.daemonState.value.healthy) 15_000L else 3_000L)
                 }
-                delay(if (composition.daemonState.value.healthy) 15_000L else 3_000L)
+            } finally {
+                disconnectJob.cancelAndJoin()
             }
         }
     }
@@ -451,6 +483,13 @@ private class AndroidProxyServiceClient(
             attempt = 0,
         ) else null
         CleanupOutcome(report, debt)
+    }
+
+    suspend fun containDaemonDisconnect(): CleanupReport = lock.withLock {
+        if (!featureActive) return@withLock CleanupReport.noOp("service inactive")
+        val current = backendHandle ?: return@withLock CleanupReport.noOp("backend absent")
+        backend.emergencyCloseListener(current, "root daemon transport disconnected")
+            .withContext("ProxyOnlyService.daemonTransportDisconnected")
     }
 
     override suspend fun stopFeature(reason: String): CleanupReport = lock.withLock {
