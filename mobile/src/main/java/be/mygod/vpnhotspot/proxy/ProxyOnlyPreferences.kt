@@ -117,8 +117,13 @@ object ProxyCredentialStore : ProxyCredentialProvider {
         return credentials
     }
 
-    private fun randomBytes(size: Int): String = ByteArray(size).also(random::nextBytes).let {
-        Base64.encodeToString(it, Base64.NO_WRAP or Base64.URL_SAFE or Base64.NO_PADDING)
+    private fun randomBytes(size: Int): String {
+        val bytes = ByteArray(size).also(random::nextBytes)
+        return try {
+            Base64.encodeToString(bytes, Base64.NO_WRAP or Base64.URL_SAFE or Base64.NO_PADDING)
+        } finally {
+            bytes.fill(0)
+        }
     }
 
     private fun encrypt(value: String): String {
